@@ -38,7 +38,7 @@ from datetime import datetime
 # ── Pfade ─────────────────────────────────────────────────
 # Datenpfad: via Env-Variable überschreibbar (für Docker)
 DATA_DIR       = os.environ.get("E2PROXY_DATA_DIR", "/var/lib/e2proxy")
-VERSION        = "3.1.0+429beac6"   # Versions-ID — wird bei jeder Änderung neu generiert
+VERSION        = "3.4.0+ed4abaf0"   # Versions-ID — wird bei jeder Änderung neu generiert
 CONFIG_FILE    = f"{DATA_DIR}/config.json"
 FAVORITES_FILE = f"{DATA_DIR}/favorites.json"
 
@@ -1451,7 +1451,7 @@ def tvdb_find_episode(series_id, episode_title, air_date=None):
     return ep_data
 
 # ── Metadaten-Anreicherung & Klassifikation ────────────────────────────────────
-def classify_recording(title, episode_title=None, force_movie=False, force_series=False):
+def classify_recording(title, episode_title=None, force_movie=False, force_series=False, season_override=None, episode_override=None, year_override=None):
     """Klassifiziert eine Aufnahme als Film oder Serie.
     
     Returns: dict mit {
@@ -1464,7 +1464,17 @@ def classify_recording(title, episode_title=None, force_movie=False, force_serie
     }
     """
     if force_movie:
-        return {"kind": "movie"}
+        return {"kind": "movie", "year": year_override or datetime.now().year}
+    
+    # Caller-supplied S/E has priority over TVDB lookup
+    if season_override is not None and episode_override is not None:
+        return {
+            "kind": "series",
+            "season": int(season_override),
+            "episode": int(episode_override),
+            "episode_title": episode_title or "",
+            "synthetic": False,
+        }
     
     result = {"kind": "series", "synthetic": True}
     
@@ -1511,7 +1521,7 @@ def build_recording_path(base_dir, title, classification, ext="ts"):
     kind = classification.get("kind", "series")
     
     if kind == "movie":
-        year = datetime.now().year
+        year = classification.get("year", datetime.now().year)
         folder = f"{safe_title} ({year})"
         return os.path.join(base_dir, "Movies", folder, f"{folder}.{ext}")
     
@@ -2077,6 +2087,29 @@ const I18N = {
     "help.settings_desc": "<b>Configuration:</b> Receivers, transcode profiles, device profiles, TMDB API key, e2recorder URL.<br><b>Maintenance:</b> Live logs, log level, service restart, logo update.<br><b>EPG:</b> Manual run, schedule, run history as bar chart, outlier detection.<br><b>Recordings:</b> Path, profile, Plex integration, tuner status, quick record.",
     "help.plex_desc": "HDHomeRun emulation (SSDP UDP multicast). Plex automatically discovers e2proxy as a DVR device. No Threadfin needed.",
     "help.docker_desc": "<code>python:3.11-slim</code> + ffmpeg. Persistent data in <code>/data</code>. <code>network_mode: host</code> required for SSDP and LAN access to receivers.",
+    "comp.title": "Compression",
+    "comp.desc": "Compresses .ts recordings to .mkv to save disk space. Runs during off-hours so it doesn't compete with live streaming for CPU.",
+    "comp.enabled": "Enabled", "comp.profile": "Profile",
+    "comp.window": "Time Window", "comp.window_hint": "When compression may run",
+    "comp.delete_orig": "Delete original .ts after success",
+    "comp.audio_bitrate": "Audio Bitrate",
+    "comp.status": "Status", "comp.pending": "Pending",
+    "comp.current": "Currently compressing", "comp.history": "Recent Runs",
+    "comp.run_now": "▶ Convert now", "comp.in_window": "In window",
+    "comp.select_all": "Select all", "comp.convert_selected": "▶ Convert selected",
+    "comp.select_hint": "Select at least one recording first.",
+    "comp.pause": "Pause", "comp.resume": "Resume", "comp.cancel": "Cancel",
+    "comp.paused": "Paused", "comp.eta": "ETA", "comp.cancelled": "Conversion cancelled",
+    "comp.cancel_confirm": "Cancel the running conversion? The partial file will be discarded and the recording stays pending.",
+    "comp.cpu_limit": "CPU limit", "comp.cpu_hint": "0 = unlimited · lower = gentler background load",
+    "comp.background": "Run anytime", "comp.background_hint": "Ignore the time window (use with a CPU limit)",
+    "comp.out_window": "Outside window", "comp.backlog_warn": "⚠ Backlog forming — compression isn't keeping up",
+    "comp.no_pending": "No files pending compression.",
+    "comp.no_history": "No compression runs yet.",
+    "comp.started": "Compression started",
+    "comp.profile_fast": "Fast (H.264 veryfast, ~40% smaller)",
+    "comp.profile_balanced": "Balanced (H.264 medium, ~55% smaller)",
+    "comp.profile_quality": "Quality (H.265 medium, ~65% smaller)",
   },
   de: {
     "nav.home": "Startseite", "nav.back": "← Startseite", "nav.settings": "Einstellungen",
@@ -2185,6 +2218,29 @@ const I18N = {
     "help.settings_desc": "<b>Konfiguration:</b> Receiver, Transcode-Profile, Device-Profile, TMDB API-Key, e2recorder URL.<br><b>Wartung:</b> Live-Logs, Log-Level, Service-Neustart, Logo-Update.<br><b>EPG:</b> Manueller Run, Zeitplan, Run-Historie als Balkengrafik, Ausreißer-Erkennung.<br><b>Aufnahmen:</b> Pfad, Profil, Plex-Integration, Tuner-Status, Schnell-Aufnahme.",
     "help.plex_desc": "HDHomeRun-Emulation (SSDP UDP Multicast). Plex erkennt e2proxy automatisch als DVR-Gerät. Kein Threadfin nötig.",
     "help.docker_desc": "<code>python:3.11-slim</code> + ffmpeg. Persistente Daten in <code>/data</code>. <code>network_mode: host</code> nötig für SSDP und LAN-Zugriff auf Receiver.",
+    "comp.title": "Komprimierung",
+    "comp.desc": "Komprimiert .ts Aufnahmen zu .mkv um Speicherplatz zu sparen. Läuft in Off-Hours damit kein CPU-Konflikt mit Live-Streaming entsteht.",
+    "comp.enabled": "Aktiviert", "comp.profile": "Profil",
+    "comp.window": "Zeitfenster", "comp.window_hint": "Wann darf komprimiert werden",
+    "comp.delete_orig": "Original .ts nach Erfolg löschen",
+    "comp.audio_bitrate": "Audio-Bitrate",
+    "comp.status": "Status", "comp.pending": "Wartend",
+    "comp.current": "Wird gerade komprimiert", "comp.history": "Letzte Läufe",
+    "comp.run_now": "▶ Jetzt konvertieren", "comp.in_window": "Im Zeitfenster",
+    "comp.select_all": "Alle auswählen", "comp.convert_selected": "▶ Auswahl konvertieren",
+    "comp.select_hint": "Bitte zuerst mindestens eine Aufnahme auswählen.",
+    "comp.pause": "Pause", "comp.resume": "Fortsetzen", "comp.cancel": "Abbrechen",
+    "comp.paused": "Pausiert", "comp.eta": "Restzeit", "comp.cancelled": "Konvertierung abgebrochen",
+    "comp.cancel_confirm": "Laufende Konvertierung abbrechen? Die Teildatei wird verworfen und die Aufnahme bleibt wartend.",
+    "comp.cpu_limit": "CPU-Limit", "comp.cpu_hint": "0 = unbegrenzt · niedriger = sanftere Hintergrundlast",
+    "comp.background": "Jederzeit ausführen", "comp.background_hint": "Zeitfenster ignorieren (mit CPU-Limit verwenden)",
+    "comp.out_window": "Außerhalb des Zeitfensters", "comp.backlog_warn": "⚠ Rückstand bildet sich — Komprimierung kommt nicht hinterher",
+    "comp.no_pending": "Keine Dateien zur Komprimierung.",
+    "comp.no_history": "Noch keine Komprimierungsläufe.",
+    "comp.started": "Komprimierung gestartet",
+    "comp.profile_fast": "Schnell (H.264 veryfast, ~40% kleiner)",
+    "comp.profile_balanced": "Ausgewogen (H.264 medium, ~55% kleiner)",
+    "comp.profile_quality": "Qualität (H.265 medium, ~65% kleiner)",
   }
 };
 
@@ -2413,7 +2469,513 @@ def _plex_refresh(rcfg):
         with _ur.urlopen(req, timeout=5) as r:
             log.info(f"Plex library refresh: {r.status}")
     except Exception as e:
-        log.warning(f"Plex Refresh fehlgeschlagen: {e}")
+        log.warning(f"Plex Refresh failed: {e}")
+
+# ── Compression Module ──────────────────────────────────────────────────────
+# Compresses .ts recordings to .mkv to save disk space.
+# Runs during configured off-hours, processes pending files sequentially.
+# Tracks history of completed runs for backlog detection.
+
+COMPRESSION_PROFILES = {
+    "fast":     {"label": "Fast (H.264 veryfast)",  "vcodec": "libx264", "preset": "veryfast", "crf": 23, "expected_ratio": 0.60},
+    "balanced": {"label": "Balanced (H.264 medium)", "vcodec": "libx264", "preset": "medium",   "crf": 22, "expected_ratio": 0.45},
+    "quality":  {"label": "Quality (H.265 medium)",  "vcodec": "libx265", "preset": "medium",   "crf": 24, "expected_ratio": 0.35},
+}
+
+COMPRESSION_HISTORY_FILE = f"{DATA_DIR}/compression_history.json"
+_compression_lock = threading.Lock()
+_compression_state = {
+    "current": None,           # {file, started, profile, pid, progress, eta_sec, speed, paused, ...}
+    "scheduled": False,        # is scheduler thread running
+}
+_compression_proc = None       # subprocess.Popen of the running ffmpeg, for pause/resume/cancel
+_compression_cancel = False    # set True to request cancellation of the running job
+
+def get_compression_config():
+    cfg = get_config()
+    return {
+        "enabled":      cfg.get("compression_enabled", False),
+        "profile":      cfg.get("compression_profile", "balanced"),
+        "window_start": cfg.get("compression_window_start", "01:00"),
+        "window_end":   cfg.get("compression_window_end", "06:00"),
+        "delete_original": cfg.get("compression_delete_original", True),
+        "audio_bitrate":   cfg.get("compression_audio_bitrate", "192k"),
+        "cpu_limit":       int(cfg.get("compression_cpu_limit", 0)),       # 0 = unlimited; else % of cores
+        "ignore_window":   cfg.get("compression_ignore_window", False),    # run anytime (background mode)
+    }
+
+def _probe_duration(path):
+    """Returns media duration in seconds via ffprobe, or 0 on failure."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+        )
+        return float(out.stdout.decode("utf-8", errors="replace").strip())
+    except Exception:
+        return 0.0
+
+def _load_compression_history():
+    try:
+        if os.path.exists(COMPRESSION_HISTORY_FILE):
+            with open(COMPRESSION_HISTORY_FILE) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
+def _save_compression_history(hist):
+    try:
+        # Keep only last 100 entries
+        if len(hist) > 100:
+            hist = hist[-100:]
+        with open(COMPRESSION_HISTORY_FILE, "w") as f:
+            json.dump(hist, f, ensure_ascii=False, indent=1)
+    except Exception as e:
+        log.debug(f"Compression history save: {e}")
+
+def _add_compression_history(entry):
+    """Adds an entry to compression history. Thread-safe."""
+    with _compression_lock:
+        hist = _load_compression_history()
+        hist.append(entry)
+        _save_compression_history(hist)
+
+def find_pending_compressions():
+    """Returns list of .ts files in recordings_path that have no .mkv sibling.
+    Excludes files currently being recorded (in _active_recordings).
+    Returns sorted list (oldest first) of (filepath, size_bytes) tuples."""
+    rcfg = get_recordings_config()
+    rec_root = rcfg["path"]
+    if not os.path.isdir(rec_root):
+        return []
+    
+    # Active recording paths to exclude
+    active_paths = set()
+    with _active_recordings_lock:
+        for rec in _active_recordings.values():
+            p = rec.get("filepath")
+            if p:
+                active_paths.add(p)
+    # Also exclude the file currently being compressed
+    with _compression_lock:
+        cur = _compression_state["current"]
+        if cur and cur.get("file"):
+            active_paths.add(cur["file"])
+    
+    pending = []
+    for dirpath, dirnames, filenames in os.walk(rec_root):
+        for fn in filenames:
+            if not fn.endswith(".ts"):
+                continue
+            full = os.path.join(dirpath, fn)
+            if full in active_paths:
+                continue
+            mkv_sibling = full[:-3] + ".mkv"
+            if os.path.exists(mkv_sibling):
+                continue
+            try:
+                stat = os.stat(full)
+                # Skip files smaller than 10MB (likely broken/incomplete)
+                if stat.st_size < 10 * 1024 * 1024:
+                    continue
+                pending.append((full, stat.st_size, stat.st_mtime))
+            except OSError:
+                continue
+    
+    # Sort by mtime (oldest first)
+    pending.sort(key=lambda x: x[2])
+    return [(p, s) for p, s, m in pending]
+
+def _is_in_window(now=None):
+    """Check if current time is within the compression window."""
+    cfg = get_compression_config()
+    if not cfg["enabled"]:
+        return False
+    now = now or datetime.now()
+    cur_min = now.hour * 60 + now.minute
+    try:
+        sh, sm = map(int, cfg["window_start"].split(":"))
+        eh, em = map(int, cfg["window_end"].split(":"))
+    except Exception:
+        return False
+    start_min = sh * 60 + sm
+    end_min = eh * 60 + em
+    if start_min < end_min:
+        return start_min <= cur_min < end_min
+    else:
+        # Window crosses midnight (e.g. 22:00 - 06:00)
+        return cur_min >= start_min or cur_min < end_min
+
+def compress_file(ts_path, profile_name=None, manual=False):
+    """Compresses a single .ts file to .mkv. Blocking call.
+    Returns dict with result info. Writes to a .part temp file and renames on
+    success so an interrupted run never leaves a half-finished .mkv behind."""
+    global _compression_proc, _compression_cancel
+    cfg = get_compression_config()
+    profile_name = profile_name or cfg["profile"]
+    profile = COMPRESSION_PROFILES.get(profile_name, COMPRESSION_PROFILES["balanced"])
+
+    mkv_path = ts_path[:-3] + ".mkv"
+    mkv_tmp  = mkv_path + ".part"
+    started = time.time()
+    started_iso = datetime.now().isoformat()
+
+    try:
+        orig_size = os.path.getsize(ts_path)
+    except OSError as e:
+        return {"ok": False, "error": f"Source not readable: {e}", "ts_path": ts_path}
+
+    duration_sec = _probe_duration(ts_path)
+
+    # CPU limit → encoder thread count + nice priority
+    cpu_limit = cfg["cpu_limit"]
+    ncpu = os.cpu_count() or 1
+    thread_args, nice_prefix = [], []
+    if cpu_limit and 0 < cpu_limit < 100:
+        nthreads = max(1, round(ncpu * cpu_limit / 100))
+        thread_args = ["-threads", str(nthreads)]
+        nice_level = max(1, min(19, round(19 - (cpu_limit / 100) * 18)))
+        import shutil as _sh
+        if _sh.which("nice"):
+            nice_prefix = ["nice", "-n", str(nice_level)]
+
+    # Mark as in progress
+    with _compression_lock:
+        _compression_state["current"] = {
+            "file": ts_path,
+            "started": started_iso,
+            "profile": profile_name,
+            "orig_size": orig_size,
+            "manual": manual,
+            "duration_sec": round(duration_sec, 1),
+            "progress": 0.0,
+            "out_time_sec": 0.0,
+            "eta_sec": None,
+            "speed": None,
+            "paused": False,
+            "cpu_limit": cpu_limit,
+        }
+    _compression_cancel = False
+
+    cmd = nice_prefix + [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning", "-nostats",
+        "-progress", "pipe:1",
+        "-i", ts_path,
+        "-c:v", profile["vcodec"],
+        "-preset", profile["preset"],
+        "-crf", str(profile["crf"]),
+        "-c:a", "aac", "-b:a", cfg["audio_bitrate"],
+        "-c:s", "copy",  # keep subtitles
+        "-map", "0",     # all streams
+        "-map", "-0:d?", # drop data streams (cause problems)
+    ] + thread_args + [
+        "-f", "matroska",
+        mkv_tmp,
+    ]
+
+    cpu_note = f", cpu≤{cpu_limit}%" if cpu_limit else ""
+    log.info(f"Compression START [{profile_name}{cpu_note}]: {os.path.basename(ts_path)} ({orig_size/(1024**2):.1f} MB)")
+
+    def _parse_progress(proc):
+        """Reads ffmpeg -progress key=value lines from stdout, updates state."""
+        try:
+            for raw in proc.stdout:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                with _compression_lock:
+                    cur = _compression_state["current"]
+                    if not cur:
+                        continue
+                    if key in ("out_time_us", "out_time_ms"):
+                        try:
+                            out_s = int(val) / 1_000_000.0
+                            cur["out_time_sec"] = round(out_s, 1)
+                            if duration_sec > 0:
+                                cur["progress"] = max(0.0, min(1.0, out_s / duration_sec))
+                        except ValueError:
+                            pass
+                    elif key == "speed":
+                        try:
+                            sp = float(val.replace("x", "").strip())
+                            cur["speed"] = sp
+                            if sp > 0 and duration_sec > 0:
+                                remaining = max(0.0, duration_sec - cur.get("out_time_sec", 0.0))
+                                cur["eta_sec"] = int(remaining / sp)
+                        except ValueError:
+                            pass
+        except Exception:
+            pass
+
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        _compression_proc = proc
+        with _compression_lock:
+            if _compression_state["current"]:
+                _compression_state["current"]["pid"] = proc.pid
+
+        # Drain stderr in a thread (avoid pipe-buffer deadlock)
+        stderr_chunks = []
+        def _drain_stderr():
+            try:
+                for line in proc.stderr:
+                    stderr_chunks.append(line)
+            except Exception:
+                pass
+        t_err = threading.Thread(target=_drain_stderr, daemon=True)
+        t_prog = threading.Thread(target=_parse_progress, args=(proc,), daemon=True)
+        t_err.start(); t_prog.start()
+
+        proc.wait()
+        t_err.join(timeout=5); t_prog.join(timeout=5)
+        stderr = b"".join(stderr_chunks)
+        elapsed = time.time() - started
+        cancelled = _compression_cancel
+
+        if cancelled or proc.returncode != 0:
+            if os.path.exists(mkv_tmp):
+                try: os.remove(mkv_tmp)
+                except OSError: pass
+            if cancelled:
+                log.info(f"Compression CANCELLED: {os.path.basename(ts_path)}")
+                entry = {
+                    "ts_path": ts_path, "profile": profile_name, "started": started_iso,
+                    "elapsed": int(elapsed), "ok": False, "cancelled": True,
+                    "error": "cancelled by user", "orig_size": orig_size, "manual": manual,
+                }
+            else:
+                err_msg = stderr.decode("utf-8", errors="replace")[-500:]
+                log.warning(f"Compression FAILED: {os.path.basename(ts_path)} — {err_msg.strip()[:200]}")
+                entry = {
+                    "ts_path": ts_path, "profile": profile_name, "started": started_iso,
+                    "elapsed": int(elapsed), "ok": False, "error": err_msg.strip()[:300],
+                    "orig_size": orig_size, "manual": manual,
+                }
+            _add_compression_history(entry)
+            return entry
+
+        # Success — atomically promote .part to final .mkv
+        os.replace(mkv_tmp, mkv_path)
+        new_size = os.path.getsize(mkv_path)
+        ratio = new_size / orig_size if orig_size else 0
+        log.info(f"Compression OK: {os.path.basename(ts_path)} → {new_size/(1024**2):.1f} MB ({ratio*100:.0f}%, {elapsed:.0f}s)")
+
+        # Copy NFO sibling if exists (so Plex picks up the .mkv)
+        nfo_src = ts_path[:-3] + ".nfo"
+        nfo_dst = mkv_path[:-4] + ".nfo"
+        if os.path.exists(nfo_src) and not os.path.exists(nfo_dst):
+            try:
+                import shutil
+                shutil.copy2(nfo_src, nfo_dst)
+            except Exception as e:
+                log.debug(f"NFO copy: {e}")
+
+        # Delete original
+        if cfg["delete_original"]:
+            try:
+                os.remove(ts_path)
+                # Also remove the .ts.nfo if it exists (we copied to .mkv.nfo above)
+                if os.path.exists(nfo_src):
+                    os.remove(nfo_src)
+                log.info(f"Original deleted: {os.path.basename(ts_path)}")
+            except OSError as e:
+                log.warning(f"Failed to delete original: {e}")
+
+        # Trigger Plex refresh
+        rcfg = get_recordings_config()
+        if rcfg.get("plex_url") and rcfg.get("plex_token"):
+            threading.Thread(target=_plex_refresh, args=(rcfg,), daemon=True).start()
+
+        entry = {
+            "ts_path": ts_path,
+            "mkv_path": mkv_path,
+            "profile": profile_name,
+            "started": started_iso,
+            "elapsed": int(elapsed),
+            "ok": True,
+            "orig_size": orig_size,
+            "new_size": new_size,
+            "ratio": round(ratio, 3),
+            "manual": manual,
+        }
+        _add_compression_history(entry)
+        return entry
+
+    except Exception as e:
+        log.error(f"Compression exception: {e}")
+        if os.path.exists(mkv_tmp):
+            try: os.remove(mkv_tmp)
+            except OSError: pass
+        entry = {
+            "ts_path": ts_path,
+            "profile": profile_name,
+            "started": started_iso,
+            "elapsed": int(time.time() - started),
+            "ok": False,
+            "error": str(e),
+            "manual": manual,
+        }
+        _add_compression_history(entry)
+        return entry
+    finally:
+        _compression_proc = None
+        _compression_cancel = False
+        with _compression_lock:
+            _compression_state["current"] = None
+
+def compress_next_pending(manual=False):
+    """Picks the oldest pending file and compresses it. Returns result or None."""
+    pending = find_pending_compressions()
+    if not pending:
+        return None
+    ts_path = pending[0][0]
+    return compress_file(ts_path, manual=manual)
+
+def compress_selected(paths, profile_name=None, manual=True):
+    """Compresses a specific list of .ts files sequentially. Blocking call.
+    Validates each path is under recordings_path, is a .ts file, exists and
+    has no .mkv sibling. Returns list of result dicts."""
+    rcfg = get_recordings_config()
+    base = os.path.abspath(rcfg["path"])
+    results = []
+    for ts_path in paths:
+        try:
+            full = os.path.abspath(ts_path)
+            # Security: only files under recordings root
+            if not full.startswith(base + os.sep) and full != base:
+                results.append({"ok": False, "error": "Invalid path", "ts_path": ts_path})
+                continue
+            if not full.endswith(".ts") or not os.path.exists(full):
+                results.append({"ok": False, "error": "Not a valid .ts file", "ts_path": ts_path})
+                continue
+            if os.path.exists(full[:-3] + ".mkv"):
+                results.append({"ok": False, "error": "Already converted", "ts_path": ts_path})
+                continue
+            results.append(compress_file(full, profile_name=profile_name, manual=manual))
+        except Exception as e:
+            results.append({"ok": False, "error": str(e), "ts_path": ts_path})
+    return results
+
+def _compression_scheduler_loop():
+    """Background thread: every minute, check if there's work and we may run.
+    Runs inside the time window, or anytime when background mode is enabled."""
+    log.info("Compression scheduler started")
+    while True:
+        try:
+            cfg = get_compression_config()
+            may_run = cfg["enabled"] and (cfg["ignore_window"] or _is_in_window())
+            if may_run:
+                with _compression_lock:
+                    busy = _compression_state["current"] is not None
+                if not busy:
+                    pending = find_pending_compressions()
+                    if pending:
+                        compress_next_pending(manual=False)
+                        continue
+        except Exception as e:
+            log.warning(f"Compression scheduler: {e}")
+        time.sleep(60)
+
+def pause_compression():
+    """Suspends the running ffmpeg process (SIGSTOP) — frees CPU instantly."""
+    global _compression_proc
+    proc = _compression_proc
+    if not proc or proc.poll() is not None:
+        return False
+    try:
+        proc.send_signal(signal.SIGSTOP)
+        with _compression_lock:
+            if _compression_state["current"]:
+                _compression_state["current"]["paused"] = True
+        log.info("Compression paused")
+        return True
+    except Exception as e:
+        log.warning(f"Pause failed: {e}")
+        return False
+
+def resume_compression():
+    """Resumes a paused ffmpeg process (SIGCONT)."""
+    global _compression_proc
+    proc = _compression_proc
+    if not proc or proc.poll() is not None:
+        return False
+    try:
+        proc.send_signal(signal.SIGCONT)
+        with _compression_lock:
+            if _compression_state["current"]:
+                _compression_state["current"]["paused"] = False
+        log.info("Compression resumed")
+        return True
+    except Exception as e:
+        log.warning(f"Resume failed: {e}")
+        return False
+
+def cancel_compression():
+    """Cancels the running job. Resumes first if paused so it can receive the kill."""
+    global _compression_proc, _compression_cancel
+    proc = _compression_proc
+    if not proc or proc.poll() is not None:
+        return False
+    _compression_cancel = True
+    try:
+        # If paused, resume so the process can act on the terminate signal
+        try: proc.send_signal(signal.SIGCONT)
+        except Exception: pass
+        proc.terminate()
+        log.info("Compression cancel requested")
+        return True
+    except Exception as e:
+        log.warning(f"Cancel failed: {e}")
+        return False
+
+def cleanup_orphaned_compressions():
+    """On startup: remove leftover *.mkv.part temp files from an interrupted run.
+    The matching .ts stays in place and is picked up again as pending."""
+    rcfg = get_recordings_config()
+    rec_root = rcfg.get("path", "")
+    if not rec_root or not os.path.isdir(rec_root):
+        return
+    removed = 0
+    for dirpath, dirnames, filenames in os.walk(rec_root):
+        for fn in filenames:
+            if fn.endswith(".mkv.part"):
+                try:
+                    os.remove(os.path.join(dirpath, fn))
+                    removed += 1
+                except OSError:
+                    pass
+    if removed:
+        log.info(f"Cleaned up {removed} orphaned compression temp file(s)")
+
+def start_compression_scheduler():
+    """Idempotent — starts the scheduler thread once."""
+    with _compression_lock:
+        if _compression_state["scheduled"]:
+            return
+        _compression_state["scheduled"] = True
+    cleanup_orphaned_compressions()
+    t = threading.Thread(target=_compression_scheduler_loop, daemon=True, name="compression")
+    t.start()
+
+def has_compression_backlog():
+    """Returns True if more than 10 pending files OR oldest is >7 days old."""
+    pending = find_pending_compressions()
+    if len(pending) > 10:
+        return True
+    if pending:
+        oldest_path = pending[0][0]
+        try:
+            age_days = (time.time() - os.path.getmtime(oldest_path)) / 86400
+            if age_days > 7:
+                return True
+        except OSError:
+            pass
+    return False
+
+
 
 def _write_nfo(path, title, description="", image_url="", channel_name="", channel_logo=""):
     """Schreibt Plex-kompatible .nfo Metadaten-Datei.
@@ -2446,7 +3008,7 @@ def _write_nfo(path, title, description="", image_url="", channel_name="", chann
 
 def start_recording(service_ref, title, duration=None, profile=None,
                     path=None, description="", image_url="", client_ip="system",
-                    kind=None, episode_title=None):
+                    kind=None, episode_title=None, season=None, episode=None, year=None):
     """Startet eine Aufnahme. Gibt recording_id zurück oder wirft Exception.
     
     kind: "movie" | "series" | None (auto-detect via TVDB)
@@ -2498,12 +3060,15 @@ def start_recording(service_ref, title, duration=None, profile=None,
         port = get_proxy_port()
         stream_url = f"http://{host}:{port}/stream?ref={ref_enc}&profile={rec_profile}&preacquired={rid}"
 
-    # Klassifikation: Movie oder Serie? TVDB-Lookup für echte S/E.
+    # Klassifikation: Movie oder Serie? Caller-Override hat Vorrang vor TVDB.
     classification = classify_recording(
-        title or "Aufnahme",
+        title or "Recording",
         episode_title=episode_title,
         force_movie=(kind == "movie"),
         force_series=(kind == "series"),
+        season_override=season,
+        episode_override=episode,
+        year_override=year,
     )
     log.info(
         f"Klassifikation: {classification.get('kind')}" +
@@ -2600,7 +3165,7 @@ def start_recording(service_ref, title, duration=None, profile=None,
     build_nfo(filepath, title or "Aufnahme", classification, description=description,
               image_url=image_url, duration_sec=max_dur)
 
-    return rec_id, filepath, rid, shared_tuner
+    return rec_id, filepath, rid, shared_tuner, classification
 
 def stop_recording(rec_id):
     """Stoppt eine laufende Aufnahme."""
@@ -2707,18 +3272,35 @@ def build_web_ui(channels):
         online = is_receiver_online(r["id"])
         if state is None:
             color = "#22c55e" if online else "#ef4444"
-            status = "frei"
+            status = "free"
             kill_btn = ""
         else:
-            color = "#f59e0b"
-            ch = state.get("channel_name", "?")
-            client = state.get("client_ip", "?")
-            since = state.get("started", "?")
-            status = f"{ch} · {client} · {since}"
-            kill_btn = f'<button class="rx-kill" onclick="killReceiver(\'{r["id"]}\')" title="Stream abbrechen">✕</button>'
+            # Check if this receiver has an active recording
+            is_rec = False
+            with _active_recordings_lock:
+                for rec in _active_recordings.values():
+                    if rec.get("receiver") == r["id"]:
+                        is_rec = True
+                        rec_title = rec.get("title", "")
+                        break
+            if is_rec:
+                color = "#ef4444"
+                dot_class = "rx-dot recording"
+                ch = state.get("channel_name", "?")
+                client = state.get("client_ip", "?")
+                since = state.get("started", "?")
+                status = f'🔴 REC {rec_title} · {ch} · {client} · {since}'
+            else:
+                color = "#f59e0b"
+                dot_class = "rx-dot"
+                ch = state.get("channel_name", "?")
+                client = state.get("client_ip", "?")
+                since = state.get("started", "?")
+                status = f"{ch} · {client} · {since}"
+            kill_btn = f'<button class="rx-kill" onclick="killReceiver(\'{r["id"]}\')" title="Stop stream">✕</button>'
         rx_items.append(
             f'<div class="rx-item">'
-            f'<span class="rx-dot" id="rx-dot-{r["id"]}" style="background:{color}"></span>'
+            f'<span class="{dot_class if state else "rx-dot"}" id="rx-dot-{r["id"]}" style="background:{color}"></span>'
             f'<span>{r["name"]}</span>'
             f'<span class="rx-status" id="rx-status-{r["id"]}">{status}</span>'
             f'{kill_btn}'
@@ -2770,7 +3352,9 @@ def build_web_ui(channels):
     css = """
 .rx-bar{background:var(--surface);border-bottom:1px solid var(--border);padding:7px 24px;display:flex;gap:16px;font-size:11px;font-family:'JetBrains Mono',monospace;flex-wrap:wrap;align-items:center;}
 .rx-item{display:flex;align-items:center;gap:5px;}
-.rx-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;}
+.rx-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;transition:background 0.3s;}
+.rx-dot.recording{background:#ef4444 !important;animation:rec-blink 1s infinite;}
+@keyframes rec-blink{0%,100%{opacity:1;box-shadow:0 0 4px #ef4444}50%{opacity:0.3;box-shadow:none}}
 .rx-status{color:var(--muted);}
 .rx-kill{background:none;border:1px solid var(--red);color:var(--red);width:16px;height:16px;border-radius:3px;cursor:pointer;font-size:9px;display:inline-flex;align-items:center;justify-content:center;margin-left:2px;}
 .rx-kill:hover{background:var(--red);color:white;}
@@ -2985,7 +3569,7 @@ function filterChannels(q) {{
 function killReceiver(id) {{
   if (!confirm('Stream abbrechen?')) return;
   fetch('/kill?receiver=' + id).then(r=>r.json()).then(d => {{
-    showToast(d.message || 'Stream abgebrochen', d.ok ? 'success' : 'error');
+    showToast(d.message || 'Stream stopped', d.ok ? 'success' : 'error');
     refreshStatus();
   }});
 }}
@@ -2999,11 +3583,14 @@ function refreshStatus() {{
       // Kill-Button suchen (nächstes Geschwister-Element nach rx-status)
       const killBtn = st.nextElementSibling;
       if (rx.busy && rx.stream) {{
-        dot.style.background = '#f59e0b';
+        const isRec = !!rx.recording;
+        dot.style.background = isRec ? '#ef4444' : '#f59e0b';
+        dot.className = isRec ? 'rx-dot recording' : 'rx-dot';
         const ch = rx.stream.channel_name || '?';
         const cl = rx.stream.client_ip || '?';
         const since = rx.stream.started || '?';
-        st.textContent = ch + ' · ' + cl + ' · ' + since;
+        const recLabel = isRec ? '🔴 REC ' + (rx.recording.title||'') + ' · ' : '';
+        st.innerHTML = recLabel + ch + ' · ' + cl + ' · ' + since;
         // Kill-Button einblenden oder erstellen
         if (!killBtn || !killBtn.classList.contains('rx-kill')) {{
           const btn = document.createElement('button');
@@ -3016,7 +3603,8 @@ function refreshStatus() {{
         }}
       }} else {{
         dot.style.background = rx.online ? '#22c55e' : '#ef4444';
-        st.textContent = 'frei';
+        dot.className = 'rx-dot';
+        st.textContent = t('rec.tuner_free');
         // Kill-Button entfernen
         if (killBtn && killBtn.classList.contains('rx-kill')) {{
           killBtn.remove();
@@ -3246,66 +3834,87 @@ def build_help_ui():
       <div style="display:flex;flex-direction:column;gap:12px">
 
         <div style="border-left:3px solid var(--accent);padding-left:14px">
-          <b style="color:var(--accent);font-family:monospace;font-size:11px">v2.2.0</b>
+          <b style="color:var(--accent);font-family:monospace;font-size:11px">v3.4.0</b>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-06-16</span>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">Compression · Progress/ETA · Pause · CPU Limit</span>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Live progress bar with ETA and encode speed for the running conversion (ffmpeg <code>-progress</code> + ffprobe duration). Pause/Resume (SIGSTOP/SIGCONT — frees CPU instantly for streaming or a restart) and Cancel. CPU limit (% of cores → encoder threads + <code>nice</code>) plus a "run anytime" background mode that ignores the time window. Conversions now write to a <code>.mkv.part</code> temp file and are atomically renamed on success; leftover temp files from an interrupted run are cleaned up on startup so no half-finished <code>.mkv</code> is ever left behind.</div>
+        </div>
+
+        <div style="border-left:3px solid var(--border);padding-left:14px">
+          <b style="font-family:monospace;font-size:11px">v3.3.2</b>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-06-16</span>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">Compression · Selectable Convert List</span>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Fixed "Convert now" JSON error (empty POST body + endpoint was in the GET handler). Pending recordings are now shown as a checkbox list with a "Select all" option — pick individual recordings or all of them and convert on demand via <code>POST /api/compression/run</code> with a <code>paths</code> list. Selection is preserved across the 5s auto-refresh.</div>
+        </div>
+
+        <div style="border-left:3px solid var(--border);padding-left:14px">
+          <b style="font-family:monospace;font-size:11px">v3.1.0</b>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-06-14</span>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">i18n · First Stable Release</span>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Full English/German UI translation with client-side i18n engine (data-i18n attributes). Language selector in Settings. Browser language auto-detection (default: English). All log messages translated to English. Help page fully bilingual.</div>
+        </div>
+
+        <div style="border-left:3px solid var(--border);padding-left:14px">
+          <b style="font-family:monospace;font-size:11px">v2.2.0</b>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-06-12</span>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">Plex Library · TVDB · NFO</span>
-          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Plex-konforme Verzeichnisstruktur: <code>Movies/&lt;Titel&gt; (&lt;Jahr&gt;)/</code> und <code>TV/&lt;Serie&gt;/Season XX/</code>. TVDB Integration für echte Staffel/Episoden-Erkennung deutscher Serien. Daily-Show Fallback mit Tag-im-Jahr Nummerierung (S2026E163). NFO-Files für jede Aufnahme + tvshow.nfo für Serien. Film/Serie-Auswahl direkt im EPG-Browser pro Sendung (Buttons "Serie aufnehmen" / "Als Film aufnehmen").</div>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Plex-compliant directory structure: <code>Movies/&lt;Title&gt; (&lt;Year&gt;)/</code> and <code>TV/&lt;Series&gt;/Season XX/</code>. TVDB integration for real season/episode detection. Daily-show fallback with day-of-year numbering (S2026E163). NFO files for every recording + tvshow.nfo for series. Movie/series selection directly in EPG browser.</div>
         </div>
 
         <div style="border-left:3px solid var(--border);padding-left:14px">
           <b style="font-family:monospace;font-size:11px">v2.1.3</b>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-06-12</span>
-          <span style="color:var(--muted);font-size:10px;margin-left:8px">Parallele Aufnahmen · Logging · UI Fixes</span>
-          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Shared-Tuner Aufnahmen umgehen jetzt /stream und verbinden sich direkt mit dem Receiver (Port 8001) — keine 429-Abbrüche mehr bei aufeinanderfolgenden Sendungen auf demselben Sender. Receiver wird nur released wenn keine andere Aufnahme den Stream nutzt. Logging-System komplett überarbeitet: Live-Polling ab "jetzt", Reload aus File-Logs mit Zeitfenster-Auswahl (1h/6h/12h/1d/2d/5d/alle), API Access Log mit täglicher Rotation + Append-Schreiben, Retention Standard 5 Tage. Favoriten-Bugs gefixt (CSS min-width, Ref-Normalisierung bei POST).</div>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">Parallel Recordings · Logging · UI Fixes</span>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Shared-tuner recordings bypass /stream and connect directly to receiver (port 8001) — no more 429 rejections for back-to-back shows on the same channel. Receiver only released when no other recording uses the stream. Logging system rewrite: live polling, history loading from file logs with time window selector, API access log with daily rotation + append writing, retention default 5 days.</div>
         </div>
 
         <div style="border-left:3px solid var(--border);padding-left:14px">
           <b style="font-family:monospace;font-size:11px">v2.1.2</b>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-06-11</span>
-          <span style="color:var(--muted);font-size:10px;margin-left:8px">EPG Browser · Race-Condition · Logging</span>
-          <div style="font-size:11px;margin-top:4px;color:var(--muted)">EPG Browser Layout-Fix (flex:1 → min-width:max-content für Events bei x>1346px sichtbar), Receiver Race-Condition fix mit Pre-Acquire + preacquired Stream-URL Parameter, BrokenPipeError still ignoriert, Log-Timestamps lokale Zeit statt UTC, File-Logging mit TimedRotatingFileHandler, /api/version Endpoint, VERSION-Konstante mit Build-ID.</div>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">EPG Browser · Race Condition · Logging</span>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)">EPG browser layout fix (flex:1 → min-width:max-content for events beyond viewport). Receiver race condition fix with pre-acquire + preacquired stream URL parameter. BrokenPipeError silently ignored. Log timestamps local time instead of UTC. File logging with TimedRotatingFileHandler. /api/version endpoint with build ID.</div>
         </div>
 
         <div style="border-left:3px solid var(--border);padding-left:14px">
           <b style="font-family:monospace;font-size:11px">v2.1.1</b>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-06-06</span>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">Docker ffmpeg Fix</span>
-          <div style="font-size:11px;margin-top:4px;color:var(--muted)">ffmpeg in Docker Container eingebaut (python:3.11-alpine + apk add ffmpeg) — Streams und Aufnahmen funktionierten nicht weil python:3.11-slim kein ffmpeg enthält</div>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)">ffmpeg added to Docker container (python:3.11-slim + apt-get install ffmpeg) — streams and recordings failed because python:3.11-slim has no ffmpeg.</div>
         </div>
 
         <div style="border-left:3px solid var(--border);padding-left:14px">
           <b style="font-family:monospace;font-size:11px">v2.1.0</b>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-06-05</span>
-          <span style="color:var(--muted);font-size:10px;margin-left:8px">Docker · Hilfe · Plex Token/Sections · EPG-Grid · Health API</span>
-          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Docker-Migration (E2PROXY_DATA_DIR), Hilfe als eigene Seite, /api/health + Startup-Announce, Shared Tuner Detection, Plex Token/Sections Multi-Select, /recording/stream mit Range-Support, EPG-Grid Single-Scroll-Container</div>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">Docker · Help Page · Plex Token/Sections · Health API</span>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Docker migration (E2PROXY_DATA_DIR), help as standalone page, /api/health + startup announce, shared tuner detection, Plex token/sections multi-select, /recording/stream with range support, EPG grid single-scroll container.</div>
         </div>
 
         <div style="border-left:3px solid var(--border);padding-left:14px">
           <b style="font-family:monospace;font-size:11px">v2.0.0</b>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-05-30</span>
-          <span style="color:var(--muted);font-size:10px;margin-left:8px">Recording · TMDB · EPG Fixes · Log-Level</span>
-          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Recording System (ffmpeg, Serie/Staffel/Episode), TMDB Artwork + Ähnlichkeits-Check (45%), EPG Race-Condition Fix, Log Ring-Buffer + Level-Steuerung ohne Neustart, EPG Run-Historie Grafik, DVB Genre-IDs für Kodi</div>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">Recording · TMDB · EPG Fixes · Log Level</span>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Recording system (ffmpeg, series/season/episode), TMDB artwork + similarity check (45%), EPG race condition fix, log ring buffer + level control without restart, EPG run history chart, DVB genre IDs for Kodi.</div>
         </div>
 
         <div style="border-left:3px solid var(--border);padding-left:14px">
           <b style="font-family:monospace;font-size:11px">v1.2.0</b>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-05-20</span>
-          <span style="color:var(--muted);font-size:10px;margin-left:8px">Settings UI · EPG Browser · Favoriten</span>
-          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Settings UI mit Tabs (Konfig/Wartung/EPG/Aufnahmen), EPG Browser als Zeitstrahl-Grid, Favoriten mit Drag & Drop, Light/Dark Theme, EPG Disk-Persistenz + Scheduler, Sender-Logo Cache</div>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">Settings UI · EPG Browser · Favorites</span>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Settings UI with tabs (config/maintenance/EPG/recordings), EPG browser as timeline grid, favorites with drag & drop, light/dark theme, EPG disk persistence + scheduler, channel logo cache.</div>
         </div>
 
         <div style="border-left:3px solid var(--border);padding-left:14px">
           <b style="font-family:monospace;font-size:11px">v1.1.0</b>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-05-10</span>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">Plex DVR · HDHomeRun · XMLTV</span>
-          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Plex DVR ohne Threadfin, HDHomeRun-Emulation + SSDP UDP Multicast, XMLTV Multi-Source (beide Receiver + Zap-Reload), Transcode-Profile (remux-ac3, pass, webm)</div>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Plex DVR without Threadfin, HDHomeRun emulation + SSDP UDP multicast, XMLTV multi-source (both receivers + zap reload), transcode profiles (remux-ac3, pass, webm).</div>
         </div>
 
         <div style="border-left:3px solid var(--border);padding-left:14px">
           <b style="font-family:monospace;font-size:11px">v1.0.0</b>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-05-01</span>
-          <span style="color:var(--muted);font-size:10px;margin-left:8px">Erster stabiler Release</span>
-          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Enigma2 Streaming Proxy für 2 Receiver, Web-UI mit Kanal-Liste + Player, Jellyfin + Browser-Streaming (WebM VP8/VP9), M3U Playlist-Export, Tuner-Status im Header</div>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">Initial Release</span>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Enigma2 streaming proxy for 2 receivers, web UI with channel list + player, Jellyfin + browser streaming (WebM VP8/VP9), M3U playlist export, tuner status in header.</div>
         </div>
 
       </div>
@@ -3314,7 +3923,7 @@ def build_help_ui():
   </div>
 </div>
 """
-    return html_page("Hilfe", body, css)
+    return html_page("Help", body, css)
 
 
 def build_favorites_ui(channels):
@@ -3913,6 +4522,15 @@ def build_settings_ui():
     rec_plex_url = rcfg["plex_url"]
     rec_plex_token = rcfg["plex_token"]
     rec_plex_section = rcfg["plex_section"]
+    # Compression config
+    ccfg = get_compression_config()
+    comp_enabled_attr = "checked" if ccfg["enabled"] else ""
+    comp_delete_attr = "checked" if ccfg["delete_original"] else ""
+    comp_window_start = ccfg["window_start"]
+    comp_window_end = ccfg["window_end"]
+    comp_profile_current = ccfg["profile"]
+    comp_cpu_limit = ccfg["cpu_limit"]
+    comp_ignore_window_attr = "checked" if ccfg["ignore_window"] else ""
     # Section HTML — kommagetrennte IDs → Anzeige
     if rec_plex_section:
         _ids = [s.strip() for s in rec_plex_section.split(",") if s.strip()]
@@ -4209,7 +4827,109 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
       <div id="rec-quick-running" style="display:none;margin-top:10px">
         <span style="font-family:monospace;font-size:10px;color:var(--muted)">Recording ID: </span>
         <span id="rec-quick-id" style="font-family:monospace;font-size:10px;color:var(--accent2)"></span>
-        <button class="btn btn-danger" onclick="quickStop()" style="margin-left:10px;font-size:10px;padding:3px 8px">⏹ Stoppen</button>
+        <button class="btn btn-danger" onclick="quickStop()" style="margin-left:10px;font-size:10px;padding:3px 8px">⏹ Stop</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">🗜 <span data-i18n="comp.title">Compression</span></div>
+      <p class="card-desc" data-i18n="comp.desc">Compresses .ts recordings to .mkv to save disk space. Runs during off-hours so it doesn't compete with live streaming for CPU.</p>
+      <table class="table">
+        <tbody>
+          <tr>
+            <td style="color:var(--muted);width:160px"><span data-i18n="comp.enabled">Enabled</span></td>
+            <td>
+              <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">
+                <input type="checkbox" id="comp-enabled" {comp_enabled_attr}>
+                <span style="font-size:11px;color:var(--muted)" id="comp-window-status">—</span>
+              </label>
+            </td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted)"><span data-i18n="comp.profile">Profile</span></td>
+            <td>
+              <select class="select" id="comp-profile" style="font-size:12px;max-width:340px">
+                <option value="fast" data-i18n="comp.profile_fast">Fast (H.264 veryfast, ~40% smaller)</option>
+                <option value="balanced" data-i18n="comp.profile_balanced">Balanced (H.264 medium, ~55% smaller)</option>
+                <option value="quality" data-i18n="comp.profile_quality">Quality (H.265 medium, ~65% smaller)</option>
+              </select>
+            </td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted)"><span data-i18n="comp.window">Time Window</span></td>
+            <td>
+              <input class="input" id="comp-window-start" type="text" value="{comp_window_start}" placeholder="01:00" style="width:80px;font-family:monospace">
+              –
+              <input class="input" id="comp-window-end" type="text" value="{comp_window_end}" placeholder="06:00" style="width:80px;font-family:monospace">
+              <span style="font-size:10px;color:var(--muted);margin-left:8px" data-i18n="comp.window_hint">When compression may run</span>
+            </td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted)"><span data-i18n="comp.delete_orig">Delete original</span></td>
+            <td>
+              <input type="checkbox" id="comp-delete-orig" {comp_delete_attr}>
+            </td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted)"><span data-i18n="comp.cpu_limit">CPU limit</span></td>
+            <td>
+              <input class="input" id="comp-cpu-limit" type="number" min="0" max="100" step="5" value="{comp_cpu_limit}" style="width:80px;font-family:monospace">
+              <span style="font-size:10px;color:var(--muted);margin-left:6px">%</span>
+              <span style="font-size:10px;color:var(--muted);margin-left:8px" data-i18n="comp.cpu_hint">0 = unlimited · lower = gentler background load</span>
+            </td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted)"><span data-i18n="comp.background">Run anytime</span></td>
+            <td>
+              <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">
+                <input type="checkbox" id="comp-ignore-window" {comp_ignore_window_attr}>
+                <span style="font-size:10px;color:var(--muted)" data-i18n="comp.background_hint">Ignore the time window (use with a CPU limit)</span>
+              </label>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn btn-primary" onclick="saveCompressionConfig()">💾 <span data-i18n="common.save">Save</span></button>
+        <button class="btn" onclick="loadCompressionStatus()">↺ <span data-i18n="common.refresh">Refresh</span></button>
+      </div>
+
+      <!-- Backlog warning -->
+      <div id="comp-backlog" style="display:none;margin-top:12px;padding:8px 12px;background:rgba(239,68,68,0.1);border-left:3px solid #ef4444;border-radius:4px;font-size:11px;color:#ef4444" data-i18n="comp.backlog_warn">⚠ Backlog forming — compression isn't keeping up</div>
+
+      <!-- Current job -->
+      <div id="comp-current" style="display:none;margin-top:12px;padding:10px;background:var(--surface2);border-radius:4px">
+        <div style="font-size:10px;color:var(--muted);font-family:'JetBrains Mono',monospace;margin-bottom:4px"><span data-i18n="comp.current">Currently compressing</span></div>
+        <div id="comp-current-file" style="font-family:monospace;font-size:11px;color:var(--accent)"></div>
+        <div id="comp-current-meta" style="font-size:10px;color:var(--muted);margin-top:3px"></div>
+        <div style="background:var(--surface3);border-radius:4px;height:10px;margin-top:8px;overflow:hidden">
+          <div id="comp-current-bar" style="background:var(--accent);height:100%;width:0%;border-radius:4px;transition:width 0.5s"></div>
+        </div>
+        <div id="comp-current-eta" style="font-size:10px;color:var(--muted);margin-top:4px;font-family:monospace"></div>
+        <div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">
+          <button class="btn" id="comp-pause-btn" onclick="pauseCompression()" style="font-size:10px;padding:3px 10px">⏸ <span data-i18n="comp.pause">Pause</span></button>
+          <button class="btn" id="comp-resume-btn" onclick="resumeCompression()" style="font-size:10px;padding:3px 10px;display:none">▶ <span data-i18n="comp.resume">Resume</span></button>
+          <button class="btn btn-danger" id="comp-cancel-btn" onclick="cancelCompression()" style="font-size:10px;padding:3px 10px">⏹ <span data-i18n="comp.cancel">Cancel</span></button>
+        </div>
+      </div>
+
+      <!-- Pending list -->
+      <div style="margin-top:14px">
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:6px">
+          <div style="font-size:10px;color:var(--muted);font-family:'JetBrains Mono',monospace"><span data-i18n="comp.pending">Pending</span>: <span id="comp-pending-count">—</span> · <span id="comp-pending-size">—</span></div>
+          <label style="font-size:10px;color:var(--muted);display:inline-flex;align-items:center;gap:5px;cursor:pointer">
+            <input type="checkbox" id="comp-select-all" onchange="toggleSelectAllPending(this.checked)">
+            <span data-i18n="comp.select_all">Select all</span>
+          </label>
+          <button class="btn btn-primary" onclick="convertSelected()" style="font-size:10px;padding:3px 10px"><span data-i18n="comp.convert_selected">▶ Convert selected</span></button>
+        </div>
+        <div id="comp-pending-list" style="font-family:monospace;font-size:10px;max-height:180px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;padding:6px;background:var(--surface2)"></div>
+      </div>
+
+      <!-- History -->
+      <div style="margin-top:14px">
+        <div style="font-size:10px;color:var(--muted);font-family:'JetBrains Mono',monospace;margin-bottom:6px" data-i18n="comp.history">Recent Runs</div>
+        <div id="comp-history-list" style="font-family:monospace;font-size:10px;max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;padding:6px;background:var(--surface2)"></div>
       </div>
     </div>
 
@@ -4572,8 +5292,197 @@ function switchTab(name) {{
       if (d.running && !epgPollTimer) startEpgPolling();
     }});
   }}
-  if (name === 'recording') {{ loadTunerStatus(); loadRecordingStatus(); loadRecChannels(); }}
+  if (name === 'recording') {{ loadTunerStatus(); loadRecordingStatus(); loadRecChannels(); loadCompressionStatus(); }}
 }}
+
+// ── Compression UI ──────────────────────────────────────────────────────────
+function _fmtBytes(b) {{
+  if (b > 1024*1024*1024) return (b/(1024*1024*1024)).toFixed(2)+' GB';
+  if (b > 1024*1024) return (b/(1024*1024)).toFixed(1)+' MB';
+  if (b > 1024) return (b/1024).toFixed(1)+' KB';
+  return b+' B';
+}}
+function _fmtElapsed(s) {{
+  if (s < 60) return s+'s';
+  if (s < 3600) return Math.floor(s/60)+'m '+(s%60)+'s';
+  return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';
+}}
+
+function loadCompressionStatus() {{
+  fetch('/api/compression/status').then(r=>r.json()).then(d=>{{
+    if (!d.ok) return;
+    // Select profile
+    const sel = document.getElementById('comp-profile');
+    if (sel && d.config.profile) sel.value = d.config.profile;
+    // Window status indicator
+    const ws = document.getElementById('comp-window-status');
+    if (ws) {{
+      if (!d.config.enabled) ws.textContent = '(' + t('comp.window') + ': ' + d.config.window_start + '–' + d.config.window_end + ')';
+      else if (d.in_window) ws.innerHTML = '🟢 <span data-i18n="comp.in_window">In window</span>';
+      else ws.innerHTML = '⚪ <span data-i18n="comp.out_window">Outside window</span>';
+    }}
+    // Backlog warning
+    document.getElementById('comp-backlog').style.display = d.backlog ? 'block' : 'none';
+    // Current job
+    const cur = document.getElementById('comp-current');
+    if (d.current) {{
+      cur.style.display = 'block';
+      document.getElementById('comp-current-file').textContent = d.current.file.split('/').slice(-2).join('/');
+      const started = new Date(d.current.started);
+      const elapsed = Math.floor((Date.now() - started.getTime())/1000);
+      const paused = !!d.current.paused;
+      let meta = d.current.profile + ' · ' + _fmtBytes(d.current.orig_size||0) + ' · ' + _fmtElapsed(elapsed);
+      if (d.current.cpu_limit) meta += ' · CPU≤' + d.current.cpu_limit + '%';
+      if (paused) meta += ' · ⏸ ' + t('comp.paused');
+      document.getElementById('comp-current-meta').textContent = meta;
+      // Progress bar
+      const pct = Math.round((d.current.progress||0) * 100);
+      document.getElementById('comp-current-bar').style.width = pct + '%';
+      // ETA line
+      let eta = pct + '%';
+      if (d.current.speed) eta += ' · ' + d.current.speed.toFixed(2) + 'x';
+      if (!paused && d.current.eta_sec != null) eta += ' · ' + t('comp.eta') + ' ' + _fmtElapsed(d.current.eta_sec);
+      else if (paused) eta += ' · ⏸';
+      document.getElementById('comp-current-eta').textContent = eta;
+      // Pause/Resume toggle
+      document.getElementById('comp-pause-btn').style.display = paused ? 'none' : '';
+      document.getElementById('comp-resume-btn').style.display = paused ? '' : 'none';
+    }} else {{
+      cur.style.display = 'none';
+    }}
+    // Pending count + size
+    document.getElementById('comp-pending-count').textContent = d.pending_count;
+    document.getElementById('comp-pending-size').textContent = _fmtBytes(d.pending_size_bytes||0);
+    // Pending list (top 50)
+    const pl = document.getElementById('comp-pending-list');
+    // Preserve current selection across auto-refresh
+    const prevChecked = new Set(Array.from(document.querySelectorAll('.comp-pending-cb:checked')).map(cb => cb.value));
+    if (d.pending_files && d.pending_files.length) {{
+      pl.innerHTML = d.pending_files.map(f => {{
+        const name = f.path.split('/').slice(-2).join('/');
+        const enc = encodeURIComponent(f.path);
+        return '<label style="display:flex;align-items:center;gap:6px;padding:2px 0;color:var(--muted);cursor:pointer">'
+             + '<input type="checkbox" class="comp-pending-cb" value="' + enc + '" onchange="syncSelectAllPending()">'
+             + '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + name + '</span>'
+             + '<span style="color:var(--accent2);flex-shrink:0">' + _fmtBytes(f.size) + '</span></label>';
+      }}).join('');
+      // Restore previously checked items
+      document.querySelectorAll('.comp-pending-cb').forEach(cb => {{ if (prevChecked.has(cb.value)) cb.checked = true; }});
+      syncSelectAllPending();
+    }} else {{
+      pl.innerHTML = '<div style="color:var(--muted);padding:4px" data-i18n="comp.no_pending">No files pending compression.</div>';
+      const selAll = document.getElementById('comp-select-all');
+      if (selAll) selAll.checked = false;
+    }}
+    // History
+    const hl = document.getElementById('comp-history-list');
+    if (d.history && d.history.length) {{
+      hl.innerHTML = d.history.map(h => {{
+        const icon = h.ok ? '✓' : '✗';
+        const color = h.ok ? '#22c55e' : '#ef4444';
+        const name = (h.ts_path||'').split('/').slice(-2).join('/');
+        const when = (h.started||'').replace('T',' ').substring(0, 19);
+        const manual = h.manual ? ' [manual]' : '';
+        let info = '';
+        if (h.ok) {{
+          const ratio = h.ratio ? (h.ratio*100).toFixed(0) + '%' : '?';
+          info = _fmtBytes(h.orig_size||0) + ' → ' + _fmtBytes(h.new_size||0) + ' (' + ratio + ') · ' + _fmtElapsed(h.elapsed||0);
+        }} else {{
+          info = (h.error||'unknown error').substring(0, 80);
+        }}
+        return '<div style="padding:3px 0;border-bottom:1px solid var(--border)">'
+             + '<span style="color:' + color + '">' + icon + '</span> '
+             + '<span style="color:var(--muted)">' + when + manual + '</span> '
+             + name + '<br>'
+             + '<span style="margin-left:18px;color:var(--muted);font-size:9px">' + info + '</span></div>';
+      }}).join('');
+    }} else {{
+      hl.innerHTML = '<div style="color:var(--muted);padding:4px" data-i18n="comp.no_history">No compression runs yet.</div>';
+    }}
+    // Re-apply i18n to dynamically inserted elements
+    if (typeof applyI18n === 'function') applyI18n();
+  }}).catch(e => console.warn('comp status:', e));
+}}
+
+function saveCompressionConfig() {{
+  const cfg = {{
+    compression_enabled: document.getElementById('comp-enabled').checked,
+    compression_profile: document.getElementById('comp-profile').value,
+    compression_window_start: document.getElementById('comp-window-start').value,
+    compression_window_end: document.getElementById('comp-window-end').value,
+    compression_delete_original: document.getElementById('comp-delete-orig').checked,
+    compression_cpu_limit: parseInt(document.getElementById('comp-cpu-limit').value) || 0,
+    compression_ignore_window: document.getElementById('comp-ignore-window').checked,
+  }};
+  apiPost('/api/config-update', cfg).then(d => {{
+    if (d.ok) {{
+      showToast(t('toast.saved'), 'success');
+      loadCompressionStatus();
+    }} else {{
+      showToast(d.message || t('toast.error'), 'error');
+    }}
+  }});
+}}
+
+function pauseCompression() {{
+  apiPost('/api/compression/pause', {{}}).then(d=>{{
+    if (d.ok) showToast(t('comp.paused'), 'success');
+    setTimeout(loadCompressionStatus, 300);
+  }});
+}}
+
+function resumeCompression() {{
+  apiPost('/api/compression/resume', {{}}).then(d=>{{
+    setTimeout(loadCompressionStatus, 300);
+  }});
+}}
+
+function cancelCompression() {{
+  if (!confirm(t('comp.cancel_confirm'))) return;
+  apiPost('/api/compression/cancel', {{}}).then(d=>{{
+    if (d.ok) showToast(t('comp.cancelled'), 'success');
+    setTimeout(loadCompressionStatus, 500);
+  }});
+}}
+
+function toggleSelectAllPending(checked) {{
+  document.querySelectorAll('.comp-pending-cb').forEach(cb => cb.checked = checked);
+}}
+
+function syncSelectAllPending() {{
+  const all = Array.from(document.querySelectorAll('.comp-pending-cb'));
+  const selAll = document.getElementById('comp-select-all');
+  if (!selAll) return;
+  selAll.checked = all.length > 0 && all.every(cb => cb.checked);
+}}
+
+function convertSelected() {{
+  const checked = Array.from(document.querySelectorAll('.comp-pending-cb:checked'));
+  if (!checked.length) {{ showToast(t('comp.select_hint'), 'error'); return; }}
+  const paths = checked.map(cb => decodeURIComponent(cb.value));
+  apiPost('/api/compression/run', {{paths: paths}}).then(d=>{{
+    if (d.ok) {{
+      showToast(t('comp.started'), 'success');
+      setTimeout(loadCompressionStatus, 500);
+    }} else {{
+      showToast(d.message || t('toast.error'), 'error');
+    }}
+  }});
+}}
+
+// Auto-refresh compression status when on recording tab (faster while a job runs)
+let _compRefreshTick = 0;
+setInterval(() => {{
+  const panel = document.getElementById('tab-recording');
+  if (!panel || !panel.classList.contains('active')) return;
+  _compRefreshTick++;
+  // Poll every 2s while a job is active, otherwise every 6s
+  const active = document.getElementById('comp-current') &&
+                 document.getElementById('comp-current').style.display !== 'none';
+  if (active || _compRefreshTick % 3 === 0) {{
+    loadCompressionStatus();
+  }}
+}}, 2000);
 
 function saveConfig() {{
   let cfg;
@@ -5668,7 +6577,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         body_data = self.rfile.read(length)
 
         try:
-            data = json.loads(body_data.decode("utf-8"))
+            data = json.loads(body_data.decode("utf-8")) if body_data.strip() else {}
         except Exception as e:
             self.send_json({"ok": False, "message": f"JSON Fehler: {e}"})
             return
@@ -5749,14 +6658,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 image_url    = data.get("image_url", "")
                 kind         = data.get("kind")  # "movie" | "series" | None
                 episode_title= data.get("episode_title", "")
+                season_override = data.get("season")   # int|None — overrides TVDB
+                episode_override = data.get("episode") # int|None — overrides TVDB
+                year         = data.get("year")        # int|None — for movie titles
                 client_ip    = self.client_address[0]
                 if not service_ref:
                     self.send_json({"ok": False, "message": "ref fehlt"})
                     return
-                rec_id, filepath, receiver_id, shared = start_recording(
+                rec_id, filepath, receiver_id, shared, classification = start_recording(
                     service_ref, title, duration, profile,
                     path_override, description, image_url, client_ip,
                     kind=kind, episode_title=episode_title,
+                    season=season_override, episode=episode_override, year=year,
                 )
                 self.send_json({
                     "ok": True,
@@ -5764,6 +6677,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     "file": filepath,
                     "receiver": receiver_id,
                     "shared_tuner": shared,
+                    "classification": {
+                        "kind": classification.get("kind"),
+                        "season": classification.get("season"),
+                        "episode": classification.get("episode"),
+                        "synthetic": classification.get("synthetic", False),
+                    },
                 })
             except Exception as e:
                 self.send_json({"ok": False, "message": str(e)})
@@ -5801,6 +6720,42 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 time.sleep(1)
                 os.execv(sys.executable, [sys.executable] + sys.argv)
             threading.Thread(target=do_restart, daemon=True).start()
+            return
+
+        if parsed.path == "/api/compression/run":
+            # Manually trigger compression.
+            # Body: {} → next pending file; {"paths":[...]} → those files; {"all":true} → all pending
+            with _compression_lock:
+                if _compression_state["current"] is not None:
+                    self.send_json({"ok": False, "message": "Compression already running",
+                                    "current": _compression_state["current"]})
+                    return
+            paths = data.get("paths") if isinstance(data, dict) else None
+            do_all = bool(data.get("all")) if isinstance(data, dict) else False
+            if do_all:
+                paths = [p for p, _ in find_pending_compressions()]
+            if paths:
+                def _bg_sel():
+                    compress_selected(paths, manual=True)
+                threading.Thread(target=_bg_sel, daemon=True, name="manual-compress").start()
+                self.send_json({"ok": True, "message": "Compression started", "count": len(paths)})
+            else:
+                def _bg():
+                    compress_next_pending(manual=True)
+                threading.Thread(target=_bg, daemon=True, name="manual-compress").start()
+                self.send_json({"ok": True, "message": "Compression started", "count": 1})
+            return
+
+        if parsed.path == "/api/compression/pause":
+            self.send_json({"ok": pause_compression()})
+            return
+
+        if parsed.path == "/api/compression/resume":
+            self.send_json({"ok": resume_compression()})
+            return
+
+        if parsed.path == "/api/compression/cancel":
+            self.send_json({"ok": cancel_compression()})
             return
 
         self.send_json({"ok": False, "message": "Not found"}, 404)
@@ -6036,6 +6991,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/status":
             rx_status = []
+            # Check which receivers have active recordings
+            rec_by_receiver = {}
+            with _active_recordings_lock:
+                for rec in _active_recordings.values():
+                    rid = rec.get("receiver")
+                    if rid:
+                        rec_by_receiver[rid] = {
+                            "recording_id": rec.get("id", ""),
+                            "title": rec.get("title", ""),
+                            "started": rec.get("started", ""),
+                        }
             for r in get_receivers():
                 state = _receiver_state.get(r["id"])
                 rx_status.append({
@@ -6044,6 +7010,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     "busy": state is not None,
                     "online": is_receiver_online(r["id"]),
                     "stream": state,
+                    "recording": rec_by_receiver.get(r["id"]),
                 })
             self.send_json({"receivers": rx_status})
             return
@@ -6338,6 +7305,31 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"ok": True, "recordings": get_recording_status()})
             return
 
+        if path == "/api/compression/status":
+            # Returns current compression status, pending count, recent history, backlog warning
+            try:
+                cfg = get_compression_config()
+                pending = find_pending_compressions()
+                with _compression_lock:
+                    current = dict(_compression_state["current"]) if _compression_state["current"] else None
+                history = _load_compression_history()[-20:]  # last 20
+                history.reverse()  # newest first
+                self.send_json({
+                    "ok": True,
+                    "config": cfg,
+                    "profiles": COMPRESSION_PROFILES,
+                    "in_window": _is_in_window(),
+                    "current": current,
+                    "pending_count": len(pending),
+                    "pending_size_bytes": sum(s for _, s in pending),
+                    "pending_files": [{"path": p, "size": s} for p, s in pending[:50]],
+                    "backlog": has_compression_backlog(),
+                    "history": history,
+                })
+            except Exception as e:
+                self.send_json({"ok": False, "message": str(e)})
+            return
+        
         if path == "/api/recordings":
             # Liste aller Aufnahme-Dateien auf Disk (für e2recorder)
             try:
@@ -6725,6 +7717,7 @@ def run():
     threading.Thread(target=startup_sequence, daemon=True).start()
     threading.Thread(target=refresh_logo_cache, daemon=True).start()
     threading.Thread(target=epg_scheduler_loop, daemon=True).start()
+    start_compression_scheduler()
 
     proxy_host = get_proxy_host()
     proxy_port = get_proxy_port()
