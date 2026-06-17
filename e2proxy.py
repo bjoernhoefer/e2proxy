@@ -38,7 +38,7 @@ from datetime import datetime
 # ── Pfade ─────────────────────────────────────────────────
 # Datenpfad: via Env-Variable überschreibbar (für Docker)
 DATA_DIR       = os.environ.get("E2PROXY_DATA_DIR", "/var/lib/e2proxy")
-VERSION        = "3.4.0+ed4abaf0"   # Versions-ID — wird bei jeder Änderung neu generiert
+VERSION        = "3.5.2+savefeedback"   # Versions-ID — wird bei jeder Änderung neu generiert
 CONFIG_FILE    = f"{DATA_DIR}/config.json"
 FAVORITES_FILE = f"{DATA_DIR}/favorites.json"
 
@@ -2061,6 +2061,8 @@ const I18N = {
     "rec.max_duration": "Max Duration (Watchdog)", "rec.seconds": "seconds",
     "rec.plex_url": "Plex URL", "rec.plex_token": "Plex Token", "rec.plex_sections": "Plex Sections",
     "rec.via_login": "🔑 Generate via login", "rec.load_sections": "📁 Load sections",
+    "rec.plex_verify": "Verify in Plex",
+    "rec.plex_verify_hint": "After recording/conversion, check via Plex token whether the file was actually indexed (logs result)",
     "rec.select_channel": "— Select channel —", "rec.min": "min",
     "rec.no_active": "No active recordings.", "rec.duration_label": "Duration:",
     "epg.update_hint": "Fetches the program guide from both receivers, loads missing channels via zap and adds from the online source (Rytec). Runs daily automatically or manually.",
@@ -2192,6 +2194,8 @@ const I18N = {
     "rec.max_duration": "Max. Dauer (Watchdog)", "rec.seconds": "Sekunden",
     "rec.plex_url": "Plex URL", "rec.plex_token": "Plex Token", "rec.plex_sections": "Plex Sections",
     "rec.via_login": "🔑 Via Login generieren", "rec.load_sections": "📁 Sections laden",
+    "rec.plex_verify": "In Plex verifizieren",
+    "rec.plex_verify_hint": "Nach Aufnahme/Konvertierung per Plex-Token prüfen, ob die Datei tatsächlich indexiert wurde (Ergebnis im Log)",
     "rec.select_channel": "— Kanal wählen —", "rec.min": "Min",
     "rec.no_active": "Keine aktiven Aufnahmen.", "rec.duration_label": "Dauer:",
     "epg.update_hint": "Holt den Programmführer aus beiden Receivern, lädt fehlende Sender per Zap nach und ergänzt aus der Online-Quelle (Rytec). Läuft täglich automatisch oder manuell.",
@@ -2410,6 +2414,7 @@ def get_recordings_config():
         "plex_url":    cfg.get("recordings_plex_url", ""),
         "plex_token":  cfg.get("recordings_plex_token", ""),
         "plex_section":cfg.get("recordings_plex_section", ""),
+        "plex_verify": cfg.get("recordings_plex_verify", False),
     }
 
 def _safe_filename(title):
@@ -2451,25 +2456,126 @@ def _output_path(rec_path, title, subtitle="", started_ts=None):
         filename = f"{safe_title}_{ts}.ts"
         return os.path.join(show_dir, filename)
 
+def _plex_sections_list(rcfg):
+    """Konfigurierte Section-IDs als Liste (kommagetrennte Werte werden gesplittet)."""
+    raw = rcfg.get("plex_section", "") or ""
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
 def _plex_refresh(rcfg):
-    """Benachrichtigt Plex über neue Aufnahme."""
+    """Benachrichtigt Plex über neue/geänderte Aufnahme.
+
+    Triggert einen Library-Scan. Unterstützt mehrere (kommagetrennte) Section-IDs
+    — jede Section wird einzeln aktualisiert. Ohne Section wird die gesamte
+    Bibliothek gescannt.
+    """
     url = rcfg.get("plex_url", "").rstrip("/")
     token = rcfg.get("plex_token", "")
-    section = rcfg.get("plex_section", "")
     if not url or not token:
         return
+    import urllib.request as _ur
+    import urllib.parse as _up
+    sections = _plex_sections_list(rcfg)
+    targets = sections if sections else ["all"]
+    for section in targets:
+        try:
+            req_url = f"{url}/library/sections/{section}/refresh?X-Plex-Token={_up.quote(token)}"
+            req = _ur.Request(req_url, method="GET",
+                              headers={"User-Agent": "e2proxy/1.0"})
+            with _ur.urlopen(req, timeout=8) as r:
+                log.info(f"Plex refresh section={section}: {r.status}")
+        except Exception as e:
+            log.warning(f"Plex refresh section={section} failed: {e}")
+
+
+def _plex_find_file(rcfg, filepath):
+    """Prüft, ob eine Datei in Plex indexiert ist.
+
+    Vergleicht den absoluten Pfad bzw. – als Fallback – den Dateinamen mit den
+    Media-Parts der konfigurierten Sections (oder allen Sections, falls keine
+    konfiguriert ist). Liefert True bei einem Treffer.
+    """
+    url = rcfg.get("plex_url", "").rstrip("/")
+    token = rcfg.get("plex_token", "")
+    if not url or not token:
+        return False
+    import urllib.request as _ur
+    import urllib.parse as _up
+
+    def _get_json(req_url):
+        req = _ur.Request(req_url, headers={"Accept": "application/json",
+                                            "User-Agent": "e2proxy/1.0"})
+        with _ur.urlopen(req, timeout=12) as r:
+            return json.loads(r.read())
+
+    target_abs = os.path.abspath(filepath)
+    target_base = os.path.basename(filepath)
+
+    # Section-IDs + Typ ermitteln
+    wanted = set(_plex_sections_list(rcfg))
     try:
-        import urllib.request as _ur
-        if section:
-            req_url = f"{url}/library/sections/{section}/refresh?X-Plex-Token={token}"
-        else:
-            req_url = f"{url}/library/sections/all/refresh?X-Plex-Token={token}"
-        req = _ur.Request(req_url, method="GET",
-                         headers={"User-Agent": "e2proxy/1.0"})
-        with _ur.urlopen(req, timeout=5) as r:
-            log.info(f"Plex library refresh: {r.status}")
+        meta = _get_json(f"{url}/library/sections?X-Plex-Token={_up.quote(token)}")
+        directories = meta.get("MediaContainer", {}).get("Directory", [])
     except Exception as e:
-        log.warning(f"Plex Refresh failed: {e}")
+        log.debug(f"Plex sections list failed: {e}")
+        return False
+
+    for d in directories:
+        sid = str(d.get("key", ""))
+        if wanted and sid not in wanted:
+            continue
+        # Leaf-Typ je Library: movie=1, show→episode=4; sonst beide probieren
+        stype = d.get("type", "")
+        leaf_types = ["1"] if stype == "movie" else ["4"] if stype == "show" else ["1", "4"]
+        for lt in leaf_types:
+            try:
+                q = _up.urlencode({"X-Plex-Token": token, "type": lt})
+                data = _get_json(f"{url}/library/sections/{sid}/all?{q}")
+            except Exception as e:
+                log.debug(f"Plex find section={sid} type={lt}: {e}")
+                continue
+            for item in data.get("MediaContainer", {}).get("Metadata", []):
+                for media in item.get("Media", []):
+                    for part in media.get("Part", []):
+                        pf = part.get("file", "")
+                        if not pf:
+                            continue
+                        if os.path.abspath(pf) == target_abs or os.path.basename(pf) == target_base:
+                            return True
+    return False
+
+
+def _plex_notify(rcfg, filepath=None, label="Aufnahme"):
+    """Stößt einen Plex-Scan an und verifiziert optional, dass die Datei ankam.
+
+    Ist die Verifikation aktiviert (recordings_plex_verify) und ein filepath
+    gegeben, wird nach dem Refresh wiederholt geprüft, ob die Datei in Plex
+    auftaucht — inklusive erneutem Refresh-Versuch. Das Ergebnis wird geloggt.
+    """
+    if not (rcfg.get("plex_url") and rcfg.get("plex_token")):
+        return
+    _plex_refresh(rcfg)
+    if not rcfg.get("plex_verify") or not filepath:
+        return
+    base = os.path.basename(filepath)
+    deadline = time.time() + 120
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            if _plex_find_file(rcfg, filepath):
+                log.info(f"Plex verify OK ({label}): '{base}' indexiert (Versuch {attempt})")
+                return
+        except Exception as e:
+            log.debug(f"Plex verify attempt {attempt}: {e}")
+        time.sleep(8)
+        if attempt % 3 == 0:
+            # Scan erneut anstoßen, falls der erste nicht griff
+            _plex_refresh(rcfg)
+    log.warning(
+        f"Plex verify FAILED ({label}): '{base}' nach 120s nicht in Plex gefunden — "
+        f"Pfad-Mapping/Library prüfen (Plex muss denselben Pfad sehen)"
+    )
 
 # ── Compression Module ──────────────────────────────────────────────────────
 # Compresses .ts recordings to .mkv to save disk space.
@@ -2784,10 +2890,11 @@ def compress_file(ts_path, profile_name=None, manual=False):
             except OSError as e:
                 log.warning(f"Failed to delete original: {e}")
 
-        # Trigger Plex refresh
+        # Trigger Plex refresh (+ optionale Verifikation der konvertierten .mkv)
         rcfg = get_recordings_config()
         if rcfg.get("plex_url") and rcfg.get("plex_token"):
-            threading.Thread(target=_plex_refresh, args=(rcfg,), daemon=True).start()
+            threading.Thread(target=_plex_notify, args=(rcfg, mkv_path),
+                             kwargs={"label": "Konvertierung"}, daemon=True).start()
 
         entry = {
             "ts_path": ts_path,
@@ -3204,10 +3311,11 @@ def _finish_recording(rec_id):
             log.debug(f"kill_stream: {e}")
     elif still_shared:
         log.info(f"Receiver '{rid}' stays busy — another recording uses the same stream")
-    # Plex benachrichtigen
+    # Plex benachrichtigen (+ optionale Verifikation der Aufnahme-Datei)
     rcfg = get_recordings_config()
     if rcfg.get("plex_url") and rcfg.get("plex_token"):
-        threading.Thread(target=_plex_refresh, args=(rcfg,), daemon=True).start()
+        threading.Thread(target=_plex_notify, args=(rcfg, rec.get("filepath")),
+                         kwargs={"label": "Aufnahme"}, daemon=True).start()
 
 def get_recording_status():
     """Gibt Status aller aktiven Aufnahmen zurück."""
@@ -4522,6 +4630,7 @@ def build_settings_ui():
     rec_plex_url = rcfg["plex_url"]
     rec_plex_token = rcfg["plex_token"]
     rec_plex_section = rcfg["plex_section"]
+    rec_plex_verify_attr = "checked" if rcfg.get("plex_verify") else ""
     # Compression config
     ccfg = get_compression_config()
     comp_enabled_attr = "checked" if ccfg["enabled"] else ""
@@ -4785,10 +4894,20 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
               <input type="hidden" id="rec-plex-section" value="{rec_plex_section}">
             </td>
           </tr>
+          <tr>
+            <td style="color:var(--muted);vertical-align:top;padding-top:8px"><span data-i18n="rec.plex_verify">Verify in Plex</span></td>
+            <td>
+              <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text)">
+                <input type="checkbox" id="rec-plex-verify" {rec_plex_verify_attr}>
+                <span data-i18n="rec.plex_verify_hint">After recording/conversion, check via Plex token whether the file was actually indexed (logs result)</span>
+              </label>
+            </td>
+          </tr>
         </tbody>
       </table>
-      <div class="flex" style="margin-top:12px">
+      <div class="flex" style="margin-top:12px;align-items:center;gap:10px">
         <button class="btn btn-primary" onclick="saveRecordingSettings()">💾 <span data-i18n="common.save">Save</span></button>
+        <span id="rec-save-fb" style="font-size:12px;font-family:monospace;opacity:0;transition:opacity 0.2s"></span>
       </div>
     </div>
 
@@ -5944,7 +6063,8 @@ function fetchPlexSections() {{
   fetch('/api/plex/sections').then(r=>r.json()).then(d=>{{
     if (!d.ok) {{ wrap.innerHTML = `<span style="color:var(--red)">Fehler: ${{d.error}}</span>`; return; }}
     if (!d.sections.length) {{ wrap.innerHTML = '<span style="color:var(--muted)">Keine Sections</span>'; return; }}
-    wrap.innerHTML = d.sections.map(s => {{
+    const liveIds = new Set(d.sections.map(s => s.id));
+    let html = d.sections.map(s => {{
       const sel = _selectedSections.has(s.id);
       const icon = s.type === 'movie' ? '🎬' : s.type === 'show' ? '📺' : '📁';
       return `<div onclick="toggleSection('${{s.id}}')" id="sec-${{s.id}}"
@@ -5952,6 +6072,12 @@ function fetchPlexSections() {{
         background:${{sel?'var(--accent)':'var(--surface3)'}};color:${{sel?'white':'var(--text)'}};user-select:none">
         ${{icon}} [${{s.id}}] ${{s.title}}</div>`;
     }}).join('');
+    // Verwaiste Auswahl (Section existiert nicht mehr in Plex) entfernbar anzeigen
+    const orphans = Array.from(_selectedSections).filter(id => !liveIds.has(id));
+    html += orphans.map(id => `<div onclick="toggleSection('${{id}}')" id="sec-${{id}}" title="In Plex gelöscht — klicken zum Entfernen"
+      style="cursor:pointer;padding:4px 8px;border-radius:4px;margin:2px;display:inline-block;
+      background:var(--red);color:white;user-select:none">⚠ [${{id}}] gelöscht ✕</div>`).join('');
+    wrap.innerHTML = html;
   }}).catch(()=>{{ wrap.innerHTML='<span style="color:var(--red)">Verbindung fehlgeschlagen</span>'; }});
 }}
 
@@ -5960,13 +6086,22 @@ function toggleSection(id) {{
   else {{ _selectedSections.add(id); }}
   const el = document.getElementById('sec-' + id);
   if (el) {{
-    el.style.background = _selectedSections.has(id) ? 'var(--accent)' : 'var(--surface3)';
-    el.style.color = _selectedSections.has(id) ? 'white' : 'var(--text)';
+    const wasOrphan = el.textContent.includes('gelöscht');
+    if (wasOrphan && !_selectedSections.has(id)) {{
+      // Verwaiste, jetzt abgewählte Section ausblenden
+      el.remove();
+    }} else {{
+      el.style.background = _selectedSections.has(id) ? 'var(--accent)' : 'var(--surface3)';
+      el.style.color = _selectedSections.has(id) ? 'white' : 'var(--text)';
+    }}
   }}
   document.getElementById('rec-plex-section').value = Array.from(_selectedSections).join(',');
 }}
 
 function saveRecordingSettings() {{
+  const fb = document.getElementById('rec-save-fb');
+  const setFb = (msg, color) => {{ if (fb) {{ fb.textContent = msg; fb.style.color = color; fb.style.opacity = '1'; setTimeout(()=>{{ fb.style.opacity='0'; }}, 4000); }} }};
+  setFb('Speichere…', 'var(--muted)');
   fetch('/api/config').then(r=>r.json()).then(cfg=>{{
     cfg.recordings_path        = document.getElementById('rec-path').value.trim();
     cfg.recordings_profile     = document.getElementById('rec-profile').value;
@@ -5974,9 +6109,19 @@ function saveRecordingSettings() {{
     cfg.recordings_plex_url    = document.getElementById('rec-plex-url').value.trim();
     cfg.recordings_plex_token  = document.getElementById('rec-plex-token').value.trim();
     cfg.recordings_plex_section= document.getElementById('rec-plex-section').value.trim();
-    apiPost('/api/config', cfg).then(d=>{{
-      showToast(d.ok ? '✓ Aufnahme-Einstellungen gespeichert' : 'Fehler', d.ok ? 'success' : 'error');
-    }});
+    cfg.recordings_plex_verify = document.getElementById('rec-plex-verify').checked;
+    return apiPost('/api/config', cfg);
+  }}).then(d=>{{
+    if (d && d.ok) {{
+      showToast('✓ Aufnahme-Einstellungen gespeichert', 'success');
+      setFb('✓ Gespeichert', 'var(--green)');
+    }} else {{
+      showToast('Fehler beim Speichern', 'error');
+      setFb('✕ Fehler', 'var(--red)');
+    }}
+  }}).catch(e=>{{
+    showToast('Fehler beim Speichern', 'error');
+    setFb('✕ Fehler: ' + e, 'var(--red)');
   }});
 }}
 
