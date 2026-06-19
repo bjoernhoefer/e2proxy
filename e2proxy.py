@@ -38,7 +38,7 @@ from datetime import datetime
 # ── Pfade ─────────────────────────────────────────────────
 # Datenpfad: via Env-Variable überschreibbar (für Docker)
 DATA_DIR       = os.environ.get("E2PROXY_DATA_DIR", "/var/lib/e2proxy")
-VERSION        = "3.5.2+savefeedback"   # Versions-ID — wird bei jeder Änderung neu generiert
+VERSION        = "3.6"   # Versions-ID — wird bei jeder Änderung neu generiert
 CONFIG_FILE    = f"{DATA_DIR}/config.json"
 FAVORITES_FILE = f"{DATA_DIR}/favorites.json"
 
@@ -1464,7 +1464,22 @@ def classify_recording(title, episode_title=None, force_movie=False, force_serie
     }
     """
     if force_movie:
-        return {"kind": "movie", "year": year_override or datetime.now().year}
+        info = tmdb_get_movie_info(title)
+        if info.get("year"):
+            year, year_source = info["year"], "tmdb"
+        elif year_override:
+            year, year_source = int(year_override), "epg"
+        else:
+            year, year_source = datetime.now().year, "recording"
+        return {
+            "kind": "movie",
+            "year": year,
+            "year_source": year_source,          # tmdb | epg | recording
+            "tmdb_found": bool(info.get("found")),
+            "tmdb_poster": info.get("poster", ""),
+            "tmdb_overview": info.get("overview", ""),
+            "tmdb_title": info.get("title", ""),
+        }
     
     # Caller-supplied S/E has priority over TVDB lookup
     if season_override is not None and episode_override is not None:
@@ -1504,6 +1519,41 @@ def classify_recording(title, episode_title=None, force_movie=False, force_serie
     result["episode_title"] = episode_title or today.strftime("%Y-%m-%d")
     return result
 
+def verify_recording_metadata(title, description, classification):
+    """Prüft vor der Aufnahme via TMDB, ob die Metadaten vollständig sind und
+    ob die EPG-Informationen ausreichen. Ergebnis wird geloggt und als dict
+    zurückgegeben (blockiert die Aufnahme nicht).
+    """
+    result = {
+        "kind": classification.get("kind"),
+        "tmdb_found": classification.get("tmdb_found", False),
+        "year_source": classification.get("year_source"),
+        "has_description": bool(description and description.strip()),
+        "warnings": [],
+    }
+    kind = classification.get("kind")
+
+    if kind == "movie":
+        if not classification.get("tmdb_found"):
+            result["warnings"].append("TMDB: kein Treffer für Filmtitel")
+        if classification.get("year_source") == "recording":
+            result["warnings"].append("Jahr: nur Aufnahmejahr (kein TMDB/EPG)")
+        if not classification.get("tmdb_poster") and not classification.get("tmdb_overview"):
+            result["warnings"].append("TMDB: kein Poster/keine Beschreibung")
+    else:
+        if classification.get("synthetic"):
+            result["warnings"].append("Serie: keine TVDB-Episode (Datum-Nummerierung)")
+
+    if not result["has_description"]:
+        result["warnings"].append("EPG: keine Beschreibung vorhanden")
+
+    if result["warnings"]:
+        log.warning(f"Metadaten-Check '{title}': " + "; ".join(result["warnings"]))
+    else:
+        log.info(f"Metadaten-Check '{title}': vollständig (Quelle Jahr: {result['year_source']})")
+    return result
+
+
 def sanitize_filename(name):
     """Entfernt Sonderzeichen aus Dateinamen."""
     import re
@@ -1521,9 +1571,22 @@ def build_recording_path(base_dir, title, classification, ext="ts"):
     kind = classification.get("kind", "series")
     
     if kind == "movie":
-        year = classification.get("year", datetime.now().year)
-        folder = f"{safe_title} ({year})"
-        return os.path.join(base_dir, "Movies", folder, f"{folder}.{ext}")
+        year = classification.get("year")
+        movies_dir = os.path.join(base_dir, "Movies")
+        plain_folder = safe_title
+        year_folder = f"{safe_title} ({year})" if year else safe_title
+        plain_dir = os.path.join(movies_dir, plain_folder)
+        year_dir = os.path.join(movies_dir, year_folder)
+
+        # Standard: ohne Jahr. Jahr nur zur Auflösung von Duplikaten auf dem
+        # Dateisystem verwenden (z. B. Remakes mit identischem Titel).
+        if year and os.path.isdir(year_dir):
+            folder = year_folder           # bereits jahres-disambiguiert vorhanden
+        elif os.path.isdir(plain_dir) and year:
+            folder = year_folder           # jahresloser Ordner belegt → Jahr anhängen
+        else:
+            folder = plain_folder          # frei → ohne Jahr
+        return os.path.join(movies_dir, folder, f"{folder}.{ext}")
     
     season = classification.get("season", 1)
     episode = classification.get("episode", 1)
@@ -1550,15 +1613,18 @@ def build_nfo(filepath, title, classification, description="", image_url="", dur
         return (str(s) if s is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     
     if kind == "movie":
+        movie_year = classification.get("year") or datetime.now().year
+        movie_overview = description or classification.get("tmdb_overview", "")
+        movie_poster = image_url or classification.get("tmdb_poster", "")
         xml = f"""<?xml version="1.0" encoding="utf-8"?>
 <movie>
   <title>{x(title)}</title>
-  <plot>{x(description)}</plot>
-  <year>{datetime.now().year}</year>
+  <plot>{x(movie_overview)}</plot>
+  <year>{movie_year}</year>
   <premiered>{today}</premiered>
   <studio>e2proxy Recording</studio>
   <runtime>{int(duration_sec // 60)}</runtime>
-  <thumb aspect="poster">{x(image_url)}</thumb>
+  <thumb aspect="poster">{x(movie_poster)}</thumb>
   <fileinfo><streamdetails><video><durationinseconds>{int(duration_sec)}</durationinseconds></video></streamdetails></fileinfo>
 </movie>"""
     else:
@@ -1691,6 +1757,86 @@ def tmdb_get_poster(title, is_series=False):
     except Exception as e:
         log.debug(f"TMDB Fehler für '{title}': {e}")
         return ""
+
+
+def tmdb_get_movie_info(title):
+    """Holt umfassende Film-Metadaten von TMDB.
+
+    Returns dict: {
+        "found": bool,        # ob ein passender Treffer gefunden wurde
+        "year": int|None,     # Erscheinungsjahr (release_date)
+        "poster": str,        # Poster-URL ('' wenn keine)
+        "overview": str,      # Beschreibung ('' wenn keine)
+        "title": str,         # gefundener TMDB-Titel
+    }
+    Ergebnisse werden im TMDB-Cache gehalten (Key-Präfix 'mi:').
+    """
+    empty = {"found": False, "year": None, "poster": "", "overview": "", "title": ""}
+    cfg = get_config()
+    api_key = cfg.get("tmdb_api_key", "").strip()
+    if not api_key or not title:
+        return empty
+
+    cache = _load_tmdb_cache()
+    cache_key = f"mi:{title.lower().strip()}"
+    entry = cache.get(cache_key)
+    if entry and _tmdb_cache_fresh_info(entry):
+        return {
+            "found": bool(entry.get("found")),
+            "year": entry.get("year"),
+            "poster": entry.get("poster", ""),
+            "overview": entry.get("overview", ""),
+            "title": entry.get("title", ""),
+        }
+
+    try:
+        import urllib.request as _ur
+        url = (f"https://api.themoviedb.org/3/search/movie"
+               f"?api_key={api_key}&query={urllib.parse.quote(title)}&language=de-DE")
+        req = _ur.Request(url, headers={"User-Agent": "e2proxy/1.0"})
+        with _ur.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read())
+        results = data.get("results", [])
+        if results:
+            import difflib
+            best = results[0]
+            found_title = best.get("title") or best.get("name", "")
+            similarity = difflib.SequenceMatcher(
+                None, title.lower(), found_title.lower()
+            ).ratio()
+            if similarity >= 0.45:
+                release = best.get("release_date", "") or ""
+                year = None
+                if len(release) >= 4 and release[:4].isdigit():
+                    year = int(release[:4])
+                poster = (f"https://image.tmdb.org/t/p/w300{best['poster_path']}"
+                          if best.get("poster_path") else "")
+                info = {
+                    "found": True,
+                    "year": year,
+                    "poster": poster,
+                    "overview": best.get("overview", "") or "",
+                    "title": found_title,
+                }
+                with _tmdb_cache_lock:
+                    _tmdb_cache[cache_key] = {**info, "ts": time.time()}
+                log.debug(f"TMDB Film-Info: '{title}' → '{found_title}' ({year}) sim={similarity:.2f}")
+                return info
+        with _tmdb_cache_lock:
+            _tmdb_cache[cache_key] = {**empty, "ts": time.time()}
+        return empty
+    except Exception as e:
+        log.debug(f"TMDB Film-Info Fehler für '{title}': {e}")
+        return empty
+
+
+def _tmdb_cache_fresh_info(entry):
+    """Frische-Prüfung für 'mi:'-Film-Info-Einträge."""
+    if not isinstance(entry, dict):
+        return False
+    ts = entry.get("ts", 0)
+    ttl = TMDB_CACHE_TTL_FOUND if entry.get("found") else TMDB_CACHE_TTL_EMPTY
+    return (time.time() - ts) < ttl
 
 
 def build_merged_xmltv(all_channels, merged_events, rytec_progs, ref_to_name, fetch_tmdb=True):
@@ -1994,7 +2140,7 @@ const I18N = {
     "epg.recording": "RECORDING", "epg.record_series": "📺 Record series",
     "epg.record_movie": "🎬 Record as movie", "epg.starting": "Starting recording…",
     "epg.rec_series_hint": "Series: TVDB lookup for real S/E, daily-show fallback (S2026E<i>day</i>)",
-    "epg.rec_movie_hint": "Movie: Movies/<Title> (<Year>)/",
+    "epg.rec_movie_hint": "Movie: Movies/<Title>/ (year added only for duplicates)",
     "epg.search_tmdb": "🎬 Search on TMDB →", "epg.search_tvdb": "📺 Search on TVDB →",
     // Favoriten
     "fav.title": "Favorites", "fav.all_channels": "ALL CHANNELS", "fav.group": "— Group —",
@@ -2136,7 +2282,7 @@ const I18N = {
     "epg.recording": "AUFNAHME", "epg.record_series": "📺 Serie aufnehmen",
     "epg.record_movie": "🎬 Als Film aufnehmen", "epg.starting": "Starte Aufnahme…",
     "epg.rec_series_hint": "Serie: TVDB-Lookup für echte S/E, Daily-Show-Fallback (S2026E<i>tag</i>)",
-    "epg.rec_movie_hint": "Film: Movies/<Titel> (<Jahr>)/",
+    "epg.rec_movie_hint": "Film: Movies/<Titel>/ (Jahr nur bei Duplikaten)",
     "epg.search_tmdb": "🎬 Auf TMDB suchen →", "epg.search_tvdb": "📺 Auf TVDB suchen →",
     "fav.title": "Favoriten", "fav.all_channels": "ALLE SENDER", "fav.group": "— Gruppe —",
     "fav.category": "— Kategorie —", "fav.added": "Zu Favoriten hinzugefügt",
@@ -3179,11 +3325,19 @@ def start_recording(service_ref, title, duration=None, profile=None,
     )
     log.info(
         f"Klassifikation: {classification.get('kind')}" +
+        (f" ({classification.get('year')}, Quelle: {classification.get('year_source')})" if classification.get("kind") == "movie" else "") +
         (f" S{classification.get('season')}E{classification.get('episode')}" if classification.get("kind") == "series" else "") +
         (" (TVDB)" if classification.get("kind") == "series" and not classification.get("synthetic") else "") +
         (" (Daily-Show, Datum-Nummerierung)" if classification.get("synthetic") else "")
     )
-    
+
+    # TMDB/EPG-Metadaten-Check vor der Aufnahme
+    verify_recording_metadata(title or "Recording", description, classification)
+
+    # Fehlendes Artwork via TMDB-Poster auffüllen
+    if not image_url and classification.get("tmdb_poster"):
+        image_url = classification["tmdb_poster"]
+
     # Plex-konformen Pfad bauen: Movies/<Titel>/<Datei>.ts oder TV/<Show>/Season XX/<Datei>.ts
     filepath = build_recording_path(rec_path, title or "Aufnahme", classification, ext="ts")
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
