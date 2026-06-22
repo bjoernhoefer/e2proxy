@@ -2186,6 +2186,14 @@ const I18N = {
     "set.config_editor": "Config Editor", "set.advanced": "ADVANCED",
     "set.config_editor_hint": "Direct editing of the full configuration as JSON. For advanced settings.",
     "set.reset": "↺ Reset", "set.maint_actions": "Maintenance Actions",
+    "set.maint_notify": "Maintenance Notifications",
+    "set.maint_notify_hint": "Sends an HTTP call to another system at a scheduled time, e.g. to trigger maintenance tasks. Optionally only when idle (no recording running and nobody watching).",
+    "set.maint_notify_enable": "Enable maintenance notifications",
+    "set.maint_notify_url": "Target URL", "set.maint_notify_time": "Time",
+    "set.maint_notify_days": "Weekdays", "set.maint_notify_idle": "Trigger condition",
+    "set.maint_notify_idle_always": "Always at the scheduled time",
+    "set.maint_notify_idle_only": "Only when idle (no recording / nobody watching)",
+    "set.maint_notify_test": "Send test",
     "set.update_logos_card": "Update logos", "set.update_logos_hint": "Reloads all channel logos into the local cache.",
     "set.reload_channels": "Reload channel list", "set.reload_channels_hint": "Reloads all channels and bouquets from the receiver.",
     "set.restart_service": "Restart service", "set.restart_hint": "Restarts the e2proxy service. Active streams will be interrupted.",
@@ -2319,6 +2327,14 @@ const I18N = {
     "set.config_editor": "Config Editor", "set.advanced": "ERWEITERT",
     "set.config_editor_hint": "Direkte Bearbeitung der vollständigen Konfiguration als JSON. Für fortgeschrittene Einstellungen.",
     "set.reset": "↺ Zurücksetzen", "set.maint_actions": "Wartungs-Aktionen",
+    "set.maint_notify": "Wartungs-Benachrichtigungen",
+    "set.maint_notify_hint": "Sendet zu einem geplanten Zeitpunkt einen HTTP-Call an ein anderes System, z.B. um Wartungsarbeiten anzustoßen. Optional nur im Leerlauf (keine Aufnahme läuft und niemand schaut fern).",
+    "set.maint_notify_enable": "Wartungs-Benachrichtigungen aktivieren",
+    "set.maint_notify_url": "Ziel-URL", "set.maint_notify_time": "Uhrzeit",
+    "set.maint_notify_days": "Wochentage", "set.maint_notify_idle": "Auslöse-Bedingung",
+    "set.maint_notify_idle_always": "Immer zur geplanten Zeit",
+    "set.maint_notify_idle_only": "Nur im Leerlauf (keine Aufnahme / niemand schaut)",
+    "set.maint_notify_test": "Test senden",
     "set.update_logos_card": "Logos aktualisieren", "set.update_logos_hint": "Lädt alle Senderlogos neu in den lokalen Cache.",
     "set.reload_channels": "Senderliste neu laden", "set.reload_channels_hint": "Lädt alle Sender und Bouquets neu vom Receiver.",
     "set.restart_service": "Service neu starten", "set.restart_hint": "Startet den e2proxy Service neu. Aktive Streams werden unterbrochen.",
@@ -3516,6 +3532,109 @@ def get_tuner_status():
             "since": state.get("started", "") if state else "",
         })
     return {"total": total, "busy": busy, "free": total - busy, "receivers": result}
+
+
+# ── Maintenance Notifications ─────────────────────────────
+# Sendet zu konfigurierten Zeitpunkten einen HTTP-Call an externe Systeme
+# (z.B. um Wartungsarbeiten anzustoßen). Optional nur im Leerlauf.
+
+MAINT_NOTIFY_DEFAULT = {
+    "enabled": False,
+    "url": "",
+    "method": "POST",          # GET oder POST
+    "hour": 4,                  # 0-23
+    "minute": 0,               # 0-59
+    "days": [0, 1, 2, 3, 4, 5, 6],  # 0=Mo .. 6=So (datetime.weekday())
+    "idle_mode": "always",     # "always" | "idle_only"
+}
+
+def get_maint_notify_config():
+    cfg = get_config().get("maintenance_notifications", {})
+    merged = dict(MAINT_NOTIFY_DEFAULT)
+    if isinstance(cfg, dict):
+        merged.update(cfg)
+    # Defensive Normalisierung
+    try:
+        merged["hour"] = max(0, min(23, int(merged.get("hour", 0))))
+    except (TypeError, ValueError):
+        merged["hour"] = 0
+    try:
+        merged["minute"] = max(0, min(59, int(merged.get("minute", 0))))
+    except (TypeError, ValueError):
+        merged["minute"] = 0
+    merged["method"] = "GET" if str(merged.get("method", "POST")).upper() == "GET" else "POST"
+    if merged.get("idle_mode") not in ("always", "idle_only"):
+        merged["idle_mode"] = "always"
+    days = merged.get("days", [])
+    if not isinstance(days, list):
+        days = []
+    merged["days"] = sorted({int(d) for d in days if isinstance(d, (int, float)) and 0 <= int(d) <= 6})
+    merged["enabled"] = bool(merged.get("enabled", False))
+    merged["url"] = str(merged.get("url", "") or "")
+    return merged
+
+def is_system_idle():
+    """True, wenn aktuell keine Aufnahme läuft UND niemand fernsieht (kein Tuner belegt)."""
+    with _active_recordings_lock:
+        if _active_recordings:
+            return False
+    try:
+        if get_tuner_status().get("busy", 0) > 0:
+            return False
+    except Exception:
+        pass
+    return True
+
+def send_maintenance_notification(reason="scheduler"):
+    """Setzt den konfigurierten HTTP-Call ab. Gibt (ok, message) zurück."""
+    nc = get_maint_notify_config()
+    url = nc.get("url", "").strip()
+    if not url:
+        return False, "Keine URL konfiguriert"
+    method = nc.get("method", "POST")
+    try:
+        if method == "POST":
+            payload = json.dumps({
+                "event": "maintenance",
+                "reason": reason,
+                "timestamp": datetime.now().isoformat(),
+                "idle": is_system_idle(),
+            }).encode("utf-8")
+            req = urllib.request.Request(url, data=payload, method="POST",
+                                         headers={"Content-Type": "application/json",
+                                                  "User-Agent": "e2proxy"})
+        else:
+            req = urllib.request.Request(url, method="GET",
+                                         headers={"User-Agent": "e2proxy"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            status = resp.getcode()
+        log.info(f"Maintenance-Notification gesendet ({method} {url}) → HTTP {status} [{reason}]")
+        return True, f"HTTP {status}"
+    except Exception as e:
+        log.warning(f"Maintenance-Notification fehlgeschlagen ({method} {url}): {e}")
+        return False, str(e)
+
+def maintenance_notify_loop():
+    """Hintergrund-Thread: prüft jede Minute, ob ein Wartungs-Call fällig ist."""
+    last_fired_slot = None   # (date, hour, minute) verhindert Doppel-Auslösung
+    while True:
+        try:
+            nc = get_maint_notify_config()
+            if nc.get("enabled") and nc.get("url"):
+                now = datetime.now()
+                slot = (now.date(), now.hour, now.minute)
+                if (now.weekday() in nc.get("days", [])
+                        and now.hour == nc.get("hour")
+                        and now.minute == nc.get("minute")
+                        and last_fired_slot != slot):
+                    last_fired_slot = slot
+                    if nc.get("idle_mode") == "idle_only" and not is_system_idle():
+                        log.info("Maintenance-Notification übersprungen — System nicht im Leerlauf")
+                    else:
+                        send_maintenance_notification(reason="scheduler")
+        except Exception as e:
+            log.warning(f"Maintenance-Notify Scheduler Fehler: {e}")
+        time.sleep(20)
 
 
 def build_web_ui(channels):
@@ -5358,6 +5477,56 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
     </div>
 
     <div class="card">
+      <div class="card-title">📡 <span data-i18n="set.maint_notify">Maintenance Notifications</span></div>
+      <p class="card-desc" data-i18n="set.maint_notify_hint">Sends an HTTP call to another system at a scheduled time, e.g. to trigger maintenance tasks. Optionally only when idle (no recording running and nobody watching).</p>
+
+      <label style="display:flex;align-items:center;gap:8px;margin-bottom:14px;cursor:pointer">
+        <input type="checkbox" id="mn-enabled">
+        <span data-i18n="set.maint_notify_enable">Enable maintenance notifications</span>
+      </label>
+
+      <div class="field">
+        <label class="label" data-i18n="set.maint_notify_url">Target URL</label>
+        <div class="flex">
+          <select class="select" id="mn-method" style="width:90px">
+            <option value="POST">POST</option>
+            <option value="GET">GET</option>
+          </select>
+          <input type="text" class="input" id="mn-url" placeholder="https://example.com/hook" style="flex:1">
+        </div>
+      </div>
+
+      <div class="field" style="margin-top:12px">
+        <label class="label" data-i18n="set.maint_notify_time">Time</label>
+        <div class="flex" style="align-items:center">
+          <input type="number" min="0" max="23" class="input" id="mn-hour" style="width:70px;text-align:center" value="4">
+          <span style="font-family:'JetBrains Mono',monospace;color:var(--muted)">:</span>
+          <input type="number" min="0" max="59" class="input" id="mn-minute" style="width:70px;text-align:center" value="0">
+          <span style="font-family:'JetBrains Mono',monospace;color:var(--muted)" data-i18n="epg.oclock">h</span>
+        </div>
+      </div>
+
+      <div class="field" style="margin-top:12px">
+        <label class="label" data-i18n="set.maint_notify_days">Weekdays</label>
+        <div id="mn-days" style="display:flex;gap:6px;flex-wrap:wrap"></div>
+      </div>
+
+      <div class="field" style="margin-top:12px">
+        <label class="label" data-i18n="set.maint_notify_idle">Trigger condition</label>
+        <select class="select" id="mn-idle" style="max-width:340px">
+          <option value="always" data-i18n="set.maint_notify_idle_always">Always at the scheduled time</option>
+          <option value="idle_only" data-i18n="set.maint_notify_idle_only">Only when idle (no recording / nobody watching)</option>
+        </select>
+      </div>
+
+      <div class="flex" style="margin-top:16px">
+        <button class="btn btn-primary" onclick="saveMaintNotify()">💾 <span data-i18n="common.save">Save</span></button>
+        <button class="btn" onclick="testMaintNotify()">🚀 <span data-i18n="set.maint_notify_test">Send test</span></button>
+        <span class="action-feedback" id="mn-fb"></span>
+      </div>
+    </div>
+
+    <div class="card">
       <div class="card-title">📋 Live Logs
         <div style="margin-left:auto;display:flex;gap:6px;align-items:center">
           <select class="select" id="log-hours" style="font-size:10px;padding:2px 6px">
@@ -5552,7 +5721,7 @@ function switchTab(name) {{
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
   event.target.classList.add('active');
-  if (name === 'maintenance') {{ refreshLogs(); initApiLogToggle(); }}
+  if (name === 'maintenance') {{ refreshLogs(); initApiLogToggle(); initMaintNotify(); }}
   else {{
     if (_logPollTimer) {{ clearInterval(_logPollTimer); _logPollTimer = null; }}
     if (_apiLogPollTimer) {{ clearInterval(_apiLogPollTimer); _apiLogPollTimer = null; }}
@@ -6037,7 +6206,7 @@ function copyUrl(btn, url) {{
 }}
 
 // Logs beim Start laden wenn Maintenance-Tab aktiv
-if (document.getElementById('tab-maintenance').classList.contains('active')) {{ refreshLogs(); initApiLogToggle(); }}
+if (document.getElementById('tab-maintenance').classList.contains('active')) {{ refreshLogs(); initApiLogToggle(); initMaintNotify(); }}
 
 // ── Recording ─────────────────────────────────────────
 let _quickRecId = null;
@@ -6612,6 +6781,68 @@ function saveEpgSchedule() {{
   }});
 }}
 
+// ── Maintenance Notifications ──────────────────────────────
+let _mnInitDone = false;
+function mnBuildDays(selected) {{
+  const wrap = document.getElementById('mn-days');
+  if (!wrap) return;
+  const sel = new Set(selected || []);
+  const lang = (document.documentElement.lang || navigator.language || 'en');
+  // weekday() in Python: 0=Mon .. 6=Sun
+  const base = new Date(Date.UTC(2024, 0, 1)); // 2024-01-01 was a Monday
+  let html = '';
+  for (let i = 0; i < 7; i++) {{
+    const d = new Date(base.getTime() + i * 86400000);
+    const label = d.toLocaleDateString(lang, {{weekday: 'short'}});
+    const on = sel.has(i);
+    html += '<button type="button" class="btn mn-day' + (on ? ' btn-primary' : '') + '" data-day="' + i + '" onclick="mnToggleDay(' + i + ')" style="min-width:48px">' + label + '</button>';
+  }}
+  wrap.innerHTML = html;
+}}
+function mnToggleDay(i) {{
+  const btn = document.querySelector('.mn-day[data-day="' + i + '"]');
+  if (btn) btn.classList.toggle('btn-primary');
+}}
+function mnGetDays() {{
+  return Array.from(document.querySelectorAll('.mn-day.btn-primary')).map(b => parseInt(b.dataset.day));
+}}
+function initMaintNotify() {{
+  if (_mnInitDone) return;
+  _mnInitDone = true;
+  const nc = (ORIGINAL_CONFIG && ORIGINAL_CONFIG.maintenance_notifications) || {{}};
+  document.getElementById('mn-enabled').checked = !!nc.enabled;
+  document.getElementById('mn-url').value = nc.url || '';
+  document.getElementById('mn-method').value = (nc.method === 'GET') ? 'GET' : 'POST';
+  document.getElementById('mn-hour').value = (nc.hour != null) ? nc.hour : 4;
+  document.getElementById('mn-minute').value = (nc.minute != null) ? nc.minute : 0;
+  document.getElementById('mn-idle').value = (nc.idle_mode === 'idle_only') ? 'idle_only' : 'always';
+  mnBuildDays(Array.isArray(nc.days) ? nc.days : [0,1,2,3,4,5,6]);
+}}
+function saveMaintNotify() {{
+  const fb = document.getElementById('mn-fb');
+  fb.textContent = '…';
+  const payload = {{
+    enabled: document.getElementById('mn-enabled').checked,
+    url: document.getElementById('mn-url').value.trim(),
+    method: document.getElementById('mn-method').value,
+    hour: parseInt(document.getElementById('mn-hour').value) || 0,
+    minute: parseInt(document.getElementById('mn-minute').value) || 0,
+    days: mnGetDays(),
+    idle_mode: document.getElementById('mn-idle').value,
+  }};
+  apiPost('/api/maintenance/notify', payload).then(d => {{
+    fb.textContent = d.ok ? '✓ Gespeichert' : ('✗ ' + (d.message || 'Fehler'));
+    if (d.ok && d.config) ORIGINAL_CONFIG.maintenance_notifications = d.config;
+  }}).catch(() => {{ fb.textContent = '✗ Fehler'; }});
+}}
+function testMaintNotify() {{
+  const fb = document.getElementById('mn-fb');
+  fb.textContent = 'Test wird gesendet…';
+  apiPost('/api/maintenance/notify/test', {{}}).then(d => {{
+    fb.textContent = (d.ok ? '✓ ' : '✗ ') + (d.message || '');
+  }}).catch(() => {{ fb.textContent = '✗ Fehler'; }});
+}}
+
 function checkLogos() {{
   const fb = document.getElementById('logo-check-fb');
   fb.textContent = 'Prüfe Logos…';
@@ -6999,6 +7230,40 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "message": str(e)})
             except Exception as e:
                 self.send_json({"ok": False, "message": str(e)})
+            return
+
+        if parsed.path == "/api/maintenance/notify":
+            try:
+                nc = dict(MAINT_NOTIFY_DEFAULT)
+                existing = get_config().get("maintenance_notifications", {})
+                if isinstance(existing, dict):
+                    nc.update(existing)
+                if "enabled" in data:
+                    nc["enabled"] = bool(data.get("enabled"))
+                if "url" in data:
+                    nc["url"] = str(data.get("url") or "").strip()
+                if "method" in data:
+                    nc["method"] = "GET" if str(data.get("method")).upper() == "GET" else "POST"
+                if "hour" in data:
+                    nc["hour"] = max(0, min(23, int(data.get("hour"))))
+                if "minute" in data:
+                    nc["minute"] = max(0, min(59, int(data.get("minute"))))
+                if "days" in data:
+                    days = data.get("days") or []
+                    nc["days"] = sorted({int(d) for d in days if 0 <= int(d) <= 6})
+                if "idle_mode" in data:
+                    nc["idle_mode"] = "idle_only" if data.get("idle_mode") == "idle_only" else "always"
+                cfg = get_config()
+                cfg["maintenance_notifications"] = nc
+                ok = update_config(cfg)
+                self.send_json({"ok": ok, "config": get_maint_notify_config()})
+            except Exception as e:
+                self.send_json({"ok": False, "message": str(e)})
+            return
+
+        if parsed.path == "/api/maintenance/notify/test":
+            ok, msg = send_maintenance_notification(reason="test")
+            self.send_json({"ok": ok, "message": msg})
             return
 
         if parsed.path == "/api/epg/schedule":
@@ -8016,6 +8281,7 @@ def run():
     threading.Thread(target=startup_sequence, daemon=True).start()
     threading.Thread(target=refresh_logo_cache, daemon=True).start()
     threading.Thread(target=epg_scheduler_loop, daemon=True).start()
+    threading.Thread(target=maintenance_notify_loop, daemon=True).start()
     start_compression_scheduler()
 
     proxy_host = get_proxy_host()
