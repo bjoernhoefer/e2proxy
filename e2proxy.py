@@ -3548,6 +3548,11 @@ MAINT_NOTIFY_DEFAULT = {
     "idle_mode": "always",     # "always" | "idle_only"
 }
 
+# Verhindert, dass sich Maintenance-Notifications gegenseitig auslösen
+# (Amplification/Endlosschleife → fd-/Thread-Exhaustion). Es darf zu jedem
+# Zeitpunkt nur EINE Notification gleichzeitig laufen.
+_maint_notify_lock = threading.Lock()
+
 def get_maint_notify_config():
     cfg = get_config().get("maintenance_notifications", {})
     merged = dict(MAINT_NOTIFY_DEFAULT)
@@ -3585,12 +3590,72 @@ def is_system_idle():
         pass
     return True
 
+def _is_self_url(url):
+    """True, wenn die URL auf diese e2proxy-Instanz selbst zeigt.
+
+    Schützt vor einer Endlosschleife: zeigt die Maintenance-URL auf den eigenen
+    HTTP-Port (z.B. .../api/maintenance/notify/test), würde jeder Aufruf rekursiv
+    weitere Aufrufe auslösen, bis Threads/Dateideskriptoren erschöpft sind
+    ("Too many open files") und der Server hängt.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+        host = (parsed.hostname or "").strip().lower()
+        if not host:
+            return False
+        try:
+            proxy_port = int(get_proxy_port())
+        except Exception:
+            proxy_port = 8888
+        target_port = parsed.port if parsed.port is not None else (
+            443 if parsed.scheme == "https" else 80)
+
+        local_addrs = {"127.0.0.1", "::1", "localhost", "0.0.0.0"}
+        try:
+            hn = socket.gethostname()
+            local_addrs.add(hn.lower())
+            for info in socket.getaddrinfo(hn, None):
+                local_addrs.add(str(info[4][0]).lower())
+        except Exception:
+            pass
+        try:
+            ph = str(get_config().get("proxy_host", "")).strip().lower()
+            if ph:
+                local_addrs.add(ph)
+        except Exception:
+            pass
+
+        host_is_local = host in local_addrs
+        if not host_is_local:
+            try:
+                for info in socket.getaddrinfo(host, None):
+                    if str(info[4][0]).lower() in local_addrs:
+                        host_is_local = True
+                        break
+            except Exception:
+                pass
+
+        return host_is_local and target_port == proxy_port
+    except Exception:
+        return False
+
 def send_maintenance_notification(reason="scheduler"):
     """Setzt den konfigurierten HTTP-Call ab. Gibt (ok, message) zurück."""
     nc = get_maint_notify_config()
     url = nc.get("url", "").strip()
     if not url:
         return False, "Keine URL konfiguriert"
+    if _is_self_url(url):
+        msg = ("URL zeigt auf diese e2proxy-Instanz — abgebrochen "
+               "(Endlosschleife/fd-Exhaustion verhindert)")
+        log.warning(f"Maintenance-Notification abgebrochen ({url}): {msg}")
+        return False, msg
+    # Re-entrancy-Schutz: nie mehr als eine Notification gleichzeitig, damit ein
+    # eventueller Loop sich nicht selbst verstärken kann.
+    if not _maint_notify_lock.acquire(blocking=False):
+        msg = "Bereits eine Notification aktiv — übersprungen"
+        log.warning(f"Maintenance-Notification übersprungen ({url}): {msg}")
+        return False, msg
     method = nc.get("method", "POST")
     try:
         if method == "POST":
@@ -3613,6 +3678,8 @@ def send_maintenance_notification(reason="scheduler"):
     except Exception as e:
         log.warning(f"Maintenance-Notification fehlgeschlagen ({method} {url}): {e}")
         return False, str(e)
+    finally:
+        _maint_notify_lock.release()
 
 def maintenance_notify_loop():
     """Hintergrund-Thread: prüft jede Minute, ob ein Wartungs-Call fällig ist."""
@@ -8222,10 +8289,25 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
 _proxy_start_time = time.time()
 
+def _raise_open_files_limit(target=8192):
+    """Hebt das Soft-Limit für offene Dateien an (Defense-in-Depth gegen
+    fd-Exhaustion / "Too many open files"). Best-effort, schlägt nie hart fehl."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        desired = target if hard == resource.RLIM_INFINITY else min(target, hard)
+        if soft < desired:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (desired, hard))
+            log.info(f"Open-files Limit angehoben: {soft} → {desired} (hard {hard})")
+    except Exception as e:
+        log.warning(f"Open-files Limit konnte nicht angehoben werden: {e}")
+
+
 def run():
     global _proxy_start_time
     _proxy_start_time = time.time()
     os.makedirs(DATA_DIR, exist_ok=True)
+    _raise_open_files_limit()
     load_config()
     _setup_file_logging()   # nach load_config — damit retention aus Config kommt
     _init_receiver_state()
