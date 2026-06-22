@@ -180,15 +180,28 @@ def logo_local_url(name):
     fname = logo_cache_filename(name)
     return f"http://{host}:{port}/logos/{fname}"
 
-def download_logo(name):
+def download_logo(name, force=False):
     """Lädt Logo für einen Sender herunter — probiert alle URLs durch.
     Gibt True zurück wenn erfolgreich, False wenn alle URLs fehlschlagen.
+
+    Ist das Logo bereits lokal gecacht (und force=False), wird KEIN
+    Netzwerk-Request gemacht. Das verhindert, dass bei jedem Neustart 100+
+    HTTPS-Requests an einen externen Host (raw.githubusercontent.com) abgesetzt
+    und alle PNGs neu auf die SD-Karte geschrieben werden — ein Muster, das in
+    der Vergangenheit mit minutenlangen bis stundenlangen Hängern korrelierte
+    (Netzwerk-/DNS-Stall, da urlopen-timeout die DNS-Auflösung nicht begrenzt).
     """
     urls = get_channel_logo_urls(name)
     if not urls:
         return False
     os.makedirs(LOGO_CACHE_DIR, exist_ok=True)
     fname = os.path.join(LOGO_CACHE_DIR, logo_cache_filename(name))
+    if not force:
+        try:
+            if os.path.exists(fname) and os.path.getsize(fname) > 100:
+                return True
+        except OSError:
+            pass
     for url in urls:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "e2proxy/1.0"})
@@ -204,18 +217,32 @@ def download_logo(name):
     log.warning(f"Logo download failed: {name} (all URLs failed)")
     return False
 
-def refresh_logo_cache():
-    """Lädt alle konfigurierten Logos herunter und cached sie lokal.
+def refresh_logo_cache(force=False):
+    """Lädt konfigurierte Logos herunter und cached sie lokal.
     Läuft als Hintergrund-Thread.
+
+    force=False (Standard, z.B. beim Start): nur fehlende Logos werden geladen,
+    bereits gecachte werden übersprungen — kein Netzwerk-/SD-Sturm bei jedem
+    Neustart. force=True (manueller Refresh): alle Logos werden neu geladen.
     """
     with logo_cache_lock:
         os.makedirs(LOGO_CACHE_DIR, exist_ok=True)
         total = len(CHANNEL_LOGOS)
         ok = 0
+        downloaded = 0
         for name in CHANNEL_LOGOS:
-            if download_logo(name):
+            fname = os.path.join(LOGO_CACHE_DIR, logo_cache_filename(name))
+            already = False
+            try:
+                already = os.path.exists(fname) and os.path.getsize(fname) > 100
+            except OSError:
+                already = False
+            if download_logo(name, force=force):
                 ok += 1
-        log.info(f"Logo cache: {ok}/{total} logos downloaded")
+                if force or not already:
+                    downloaded += 1
+        log.info(f"Logo cache: {ok}/{total} logos available ({downloaded} downloaded, "
+                 f"{ok - downloaded} from cache, force={force})")
     return ok
 
 def get_logo_for_epg(name):
@@ -8049,7 +8076,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         # ── Logo Cache ────────────────────────────────────
         if path == "/logos/refresh":
-            threading.Thread(target=refresh_logo_cache, daemon=True).start()
+            threading.Thread(target=lambda: refresh_logo_cache(force=True), daemon=True).start()
             self.send_response(302)
             self.send_header("Location", "/settings")
             self.send_header("Connection", "close")
