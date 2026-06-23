@@ -20,6 +20,7 @@ Endpoints:
 import http.server
 import urllib.request
 import urllib.parse
+import urllib.error
 import socket
 import threading
 import subprocess
@@ -33,6 +34,10 @@ import signal
 import copy
 import struct
 import gzip
+import base64
+import hashlib
+import hmac
+import uuid
 from datetime import datetime
 
 # ── Pfade ─────────────────────────────────────────────────
@@ -3162,6 +3167,11 @@ def _compression_scheduler_loop():
     while True:
         try:
             cfg = get_compression_config()
+            # External transcoding owns the pending files when enabled — skip
+            # local compression so a recording isn't processed twice.
+            if get_external_transcode_config()["enabled"]:
+                time.sleep(60)
+                continue
             may_run = cfg["enabled"] and (cfg["ignore_window"] or _is_in_window())
             if may_run:
                 with _compression_lock:
@@ -3271,6 +3281,641 @@ def has_compression_backlog():
             pass
     return False
 
+
+# ── External Transcoding Module ─────────────────────────────────────────────
+# Offloads .ts → .mkv transcoding to an external worker (Azure VM on-demand or a
+# home PC). Transport is pluggable: `azure` (Blob + Storage Queue via REST+SAS,
+# stdlib only) or `filestore` (a shared directory — SMB mount or local; also used
+# for tests). e2proxy uploads the source + a job manifest and enqueues a job; a
+# worker transcodes and uploads the result + done.json, then calls a webhook.
+# e2proxy downloads the result, verifies sha256, cleans up remote + local files.
+#
+# e2proxy only ever PUSHES to the queue. Queue receive/lease/heartbeat lives in
+# the worker (where the Azure SDK does it robustly). Webhook is optional — the
+# scheduler also polls done.json so a missed notification never loses a job.
+
+EXT_STATE_FILE = f"{DATA_DIR}/external_transcode_state.json"
+_ext_lock = threading.Lock()              # guards state file + completion
+_ext_state_flag = {"scheduled": False}
+_ext_inflight = set()                     # ts_paths with an in-progress submit
+_ext_inflight_lock = threading.Lock()
+
+EXT_DEFAULTS = {
+    "enabled": False,
+    "provider": "azure",                  # "azure" | "filestore"
+    "profile": "quality",                 # key into COMPRESSION_PROFILES
+    "delete_original": True,
+    "max_active": 2,                      # concurrent jobs (queued/uploading/...)
+    "stuck_minutes": 120,                 # no completion within → stuck/retry
+    "max_attempts": 2,
+    "poll_interval": 30,                  # scheduler tick (seconds)
+    # azure provider
+    "blob_sas_url": "",                   # https://acct.blob.core.windows.net/container?<sas>
+    "queue_sas_url": "",                  # https://acct.queue.core.windows.net/queue?<sas>
+    # filestore provider
+    "filestore_path": "",                 # shared dir (SMB mount / local)
+    # notify (worker → e2proxy). Empty url ⇒ rely on poll. Secret is shared
+    # out-of-band (also configured on the worker) and never written to storage.
+    "notify_url": "",
+    "notify_type": "e2proxy",             # e2proxy | ha | other
+    "notify_secret": "",
+}
+
+
+def get_external_transcode_config():
+    cfg = get_config()
+    raw = cfg.get("external_transcode", {})
+    merged = dict(EXT_DEFAULTS)
+    if isinstance(raw, dict):
+        merged.update(raw)
+    merged["enabled"] = bool(merged.get("enabled", False))
+    merged["provider"] = "filestore" if str(merged.get("provider")) == "filestore" else "azure"
+    if merged.get("profile") not in COMPRESSION_PROFILES:
+        merged["profile"] = "quality" if "quality" in COMPRESSION_PROFILES else "balanced"
+    for k in ("max_active", "stuck_minutes", "max_attempts", "poll_interval"):
+        try:
+            merged[k] = max(1, int(merged.get(k, EXT_DEFAULTS[k])))
+        except (TypeError, ValueError):
+            merged[k] = EXT_DEFAULTS[k]
+    merged["delete_original"] = bool(merged.get("delete_original", True))
+    for k in ("blob_sas_url", "queue_sas_url", "filestore_path",
+              "notify_url", "notify_type", "notify_secret"):
+        merged[k] = str(merged.get(k, "") or "")
+    if merged["notify_type"] not in ("e2proxy", "ha", "other"):
+        merged["notify_type"] = "e2proxy"
+    return merged
+
+
+def _ext_profile_payload(name):
+    """Builds the transcode profile the worker should apply (reuses the local
+    COMPRESSION_PROFILES so cloud/local output stays consistent)."""
+    p = COMPRESSION_PROFILES.get(name, COMPRESSION_PROFILES["balanced"])
+    cc = get_compression_config()
+    return {
+        "name": name,
+        "vcodec": p["vcodec"],
+        "preset": p["preset"],
+        "crf": p["crf"],
+        "audio_bitrate": cc["audio_bitrate"],
+        "container": "matroska",
+        "ext": "mkv",
+    }
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ── Transport providers ─────────────────────────────────────────────────────
+
+class _TransportError(Exception):
+    pass
+
+
+class FilestoreTransport:
+    """Object store + queue backed by a shared directory (SMB mount / local).
+
+    Layout:  <base>/blobs/<key>            objects
+             <base>/queue/available/<id>.json   visible messages
+             <base>/queue/leased/<id>.json      claimed (atomic-rename lease)
+    Only the send() side is exercised by e2proxy; the worker implements the
+    receive/lease/delete side with the identical layout.
+    """
+
+    def __init__(self, base):
+        if not base:
+            raise _TransportError("filestore_path not configured")
+        self.base = base
+        self.blob_dir = os.path.join(base, "blobs")
+        self.q_avail = os.path.join(base, "queue", "available")
+        self.q_lease = os.path.join(base, "queue", "leased")
+        for d in (self.blob_dir, self.q_avail, self.q_lease):
+            os.makedirs(d, exist_ok=True)
+
+    def _p(self, key):
+        return os.path.join(self.blob_dir, key.replace("/", os.sep))
+
+    def put_object(self, key, local_path):
+        import shutil
+        dst = self._p(key)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        tmp = dst + ".part"
+        shutil.copyfile(local_path, tmp)
+        os.replace(tmp, dst)
+
+    def put_text(self, key, text):
+        dst = self._p(key)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        tmp = dst + ".part"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, dst)
+
+    def get_object(self, key, local_path):
+        import shutil
+        shutil.copyfile(self._p(key), local_path)
+
+    def get_text(self, key):
+        with open(self._p(key), encoding="utf-8") as f:
+            return f.read()
+
+    def object_exists(self, key):
+        return os.path.exists(self._p(key))
+
+    def delete_object(self, key):
+        try:
+            os.remove(self._p(key))
+        except OSError:
+            pass
+
+    def queue_send(self, message):
+        mid = uuid.uuid4().hex
+        env = {"id": mid, "body": message, "insert_time": datetime.now().isoformat(),
+               "dequeue_count": 0}
+        tmp = os.path.join(self.q_avail, f".{mid}.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(env, f)
+        os.replace(tmp, os.path.join(self.q_avail, f"{mid}.json"))
+        return mid
+
+
+def _split_sas(sas_url):
+    u = urllib.parse.urlparse(sas_url)
+    base = f"{u.scheme}://{u.netloc}{u.path}".rstrip("/")
+    return base, u.query
+
+
+class AzureRestTransport:
+    """Azure Blob + Storage Queue via REST using container/queue SAS URLs.
+
+    No account key and no SDK needed: the SAS query string already carries the
+    signature, so every request is a plain GET/PUT/POST/DELETE with urllib.
+    Single Put Blob handles sources up to ~5 GiB (block upload is a future
+    enhancement for larger files).
+    """
+
+    API_VERSION = "2021-08-06"
+
+    def __init__(self, blob_sas_url, queue_sas_url, timeout=600):
+        if not blob_sas_url or not queue_sas_url:
+            raise _TransportError("blob_sas_url and queue_sas_url must be set")
+        self.blob_base, self.blob_sas = _split_sas(blob_sas_url)
+        self.queue_base, self.queue_sas = _split_sas(queue_sas_url)
+        self.timeout = timeout
+
+    def _blob_url(self, key):
+        return f"{self.blob_base}/{urllib.parse.quote(key)}?{self.blob_sas}"
+
+    def _req(self, url, method, data=None, headers=None):
+        h = {"x-ms-version": self.API_VERSION}
+        if headers:
+            h.update(headers)
+        req = urllib.request.Request(url, data=data, method=method, headers=h)
+        return req
+
+    def put_object(self, key, local_path):
+        size = os.path.getsize(local_path)
+        with open(local_path, "rb") as f:
+            req = self._req(self._blob_url(key), "PUT", data=f, headers={
+                "x-ms-blob-type": "BlockBlob",
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(size),
+            })
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                return r.status
+
+    def put_text(self, key, text):
+        body = text.encode("utf-8")
+        req = self._req(self._blob_url(key), "PUT", data=body, headers={
+            "x-ms-blob-type": "BlockBlob",
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+        })
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            return r.status
+
+    def get_object(self, key, local_path):
+        import shutil
+        req = self._req(self._blob_url(key), "GET")
+        with urllib.request.urlopen(req, timeout=self.timeout) as r, \
+                open(local_path, "wb") as f:
+            shutil.copyfileobj(r, f, 1024 * 1024)
+
+    def get_text(self, key):
+        req = self._req(self._blob_url(key), "GET")
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            return r.read().decode("utf-8", errors="replace")
+
+    def object_exists(self, key):
+        req = self._req(self._blob_url(key), "HEAD")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status == 200
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return False
+            raise _TransportError(f"HEAD {key}: {e}")
+
+    def delete_object(self, key):
+        req = self._req(self._blob_url(key), "DELETE")
+        try:
+            with urllib.request.urlopen(req, timeout=60):
+                return True
+        except urllib.error.HTTPError as e:
+            if e.code in (404, 202, 200):
+                return True
+            raise _TransportError(f"DELETE {key}: {e}")
+
+    def queue_send(self, message, ttl_seconds=604800):
+        text = base64.b64encode(json.dumps(message).encode("utf-8")).decode("ascii")
+        xml = f"<QueueMessage><MessageText>{text}</MessageText></QueueMessage>"
+        body = xml.encode("utf-8")
+        sep = "&" if self.queue_sas else ""
+        url = f"{self.queue_base}/messages?{self.queue_sas}{sep}messagettl={ttl_seconds}"
+        req = self._req(url, "POST", data=body, headers={
+            "Content-Type": "application/xml",
+            "Content-Length": str(len(body)),
+        })
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.status
+
+
+def _ext_transport(cfg=None):
+    cfg = cfg or get_external_transcode_config()
+    if cfg["provider"] == "filestore":
+        return FilestoreTransport(cfg["filestore_path"])
+    return AzureRestTransport(cfg["blob_sas_url"], cfg["queue_sas_url"])
+
+
+def _ext_config_ready(cfg):
+    """True if the selected provider has the settings it needs."""
+    if cfg["provider"] == "filestore":
+        return bool(cfg["filestore_path"])
+    return bool(cfg["blob_sas_url"] and cfg["queue_sas_url"])
+
+
+# ── State persistence ───────────────────────────────────────────────────────
+
+def _ext_load_state():
+    try:
+        if os.path.exists(EXT_STATE_FILE):
+            with open(EXT_STATE_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+                return d if isinstance(d, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _ext_save_state(state):
+    try:
+        tmp = EXT_STATE_FILE + ".part"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, EXT_STATE_FILE)
+    except Exception as e:
+        log.debug(f"External-transcode state save: {e}")
+
+
+def _ext_update_job(job_id, **fields):
+    with _ext_lock:
+        st = _ext_load_state()
+        j = st.get(job_id, {})
+        j.update(fields)
+        j["job_id"] = job_id
+        j["updated"] = datetime.now().isoformat()
+        st[job_id] = j
+        _ext_save_state(st)
+        return dict(j)
+
+
+def _ext_get_job(job_id):
+    with _ext_lock:
+        return _ext_load_state().get(job_id)
+
+
+_EXT_ACTIVE = ("uploading", "queued", "transcoding", "downloading")
+
+
+def _ext_active_ts_paths():
+    paths = set()
+    for j in _ext_load_state().values():
+        if j.get("status") in _EXT_ACTIVE and j.get("ts_path"):
+            paths.add(os.path.abspath(j["ts_path"]))
+    return paths
+
+
+def _ext_count_active():
+    return sum(1 for j in _ext_load_state().values() if j.get("status") in _EXT_ACTIVE)
+
+
+def find_pending_external():
+    """Pending .ts files not already handled by an active external job."""
+    active = _ext_active_ts_paths()
+    with _ext_inflight_lock:
+        active |= {os.path.abspath(p) for p in _ext_inflight}
+    out = []
+    for p, s in find_pending_compressions():
+        if os.path.abspath(p) not in active:
+            out.append((p, s))
+    return out
+
+
+# ── Submit ──────────────────────────────────────────────────────────────────
+
+def external_transcode_submit(ts_path):
+    """Uploads a recording + manifest and enqueues a transcode job. Blocking
+    (the upload can take a while); run it in a thread."""
+    cfg = get_external_transcode_config()
+    transport = _ext_transport(cfg)
+    job_id = uuid.uuid4().hex
+    abs_ts = os.path.abspath(ts_path)
+    rcfg = get_recordings_config()
+    try:
+        rel = os.path.relpath(abs_ts, os.path.abspath(rcfg["path"]))
+    except Exception:
+        rel = os.path.basename(abs_ts)
+    orig_size = os.path.getsize(abs_ts)
+    profile = _ext_profile_payload(cfg["profile"])
+    prefix = f"jobs/{job_id}"
+    source_blob = f"{prefix}/source.ts"
+    output_blob = f"{prefix}/output.{profile['ext']}"
+    job_blob = f"{prefix}/job.json"
+    done_blob = f"{prefix}/done.json"
+
+    existing = _ext_get_job(job_id) or {}
+    attempts = int(existing.get("attempts", 0)) + 1
+    _ext_update_job(job_id, status="uploading", ts_path=abs_ts, rel_path=rel,
+                    created=datetime.now().isoformat(), source_blob=source_blob,
+                    output_blob=output_blob, job_blob=job_blob, done_blob=done_blob,
+                    profile=profile, orig_size=orig_size, attempts=attempts,
+                    provider=cfg["provider"])
+
+    log.info(f"External transcode SUBMIT [{cfg['provider']}/{profile['name']}]: "
+             f"{os.path.basename(abs_ts)} ({orig_size/(1024**2):.1f} MB) job={job_id[:8]}")
+    src_sha = _sha256_file(abs_ts)
+    transport.put_object(source_blob, abs_ts)
+
+    manifest = {
+        "job_id": job_id,
+        "created": datetime.now().isoformat(),
+        "source_blob": source_blob,
+        "source_size": orig_size,
+        "source_sha256": src_sha,
+        "output_blob": output_blob,
+        "done_blob": done_blob,
+        "profile": profile,
+        "orig_name": os.path.basename(abs_ts),
+        "rel_path": rel,
+        "notify": {"url": cfg["notify_url"], "type": cfg["notify_type"]},
+    }
+    transport.put_text(job_blob, json.dumps(manifest, ensure_ascii=False))
+    transport.queue_send({"job_id": job_id, "job_blob": job_blob})
+    _ext_update_job(job_id, status="queued", source_sha256=src_sha,
+                    queued_at=datetime.now().isoformat())
+    log.info(f"External transcode QUEUED: job={job_id[:8]} {os.path.basename(abs_ts)}")
+    return job_id
+
+
+def _ext_submit_async(ts_path):
+    abs_ts = os.path.abspath(ts_path)
+    with _ext_inflight_lock:
+        if abs_ts in _ext_inflight:
+            return
+        _ext_inflight.add(abs_ts)
+
+    def _run():
+        try:
+            external_transcode_submit(abs_ts)
+        except Exception as e:
+            log.warning(f"External transcode submit failed ({os.path.basename(abs_ts)}): {e}")
+        finally:
+            with _ext_inflight_lock:
+                _ext_inflight.discard(abs_ts)
+
+    threading.Thread(target=_run, daemon=True, name="ext-submit").start()
+
+
+# ── Completion (download + verify + cleanup) ────────────────────────────────
+
+def _ext_handle_completion(job_id, done, source="webhook"):
+    """Idempotent: download the transcoded output, verify sha256, place the
+    .mkv, delete remote blobs and (optionally) the local .ts."""
+    with _ext_lock:
+        st = _ext_load_state()
+        j = st.get(job_id)
+        if not j:
+            log.warning(f"External transcode completion for unknown job={job_id[:8]} ({source})")
+            return
+        if j.get("status") in ("completed", "cleaning"):
+            return  # already handled
+        j["status"] = "cleaning"
+        st[job_id] = j
+        _ext_save_state(st)
+
+    cfg = get_external_transcode_config()
+    ts_path = j.get("ts_path", "")
+    mkv_path = ts_path[:-3] + ".mkv" if ts_path.endswith(".ts") else ts_path + ".mkv"
+    tmp = mkv_path + ".part"
+
+    if str(done.get("status")) != "completed":
+        err = str(done.get("error") or "worker reported failure")
+        log.warning(f"External transcode FAILED ({source}): job={job_id[:8]} — {err[:200]}")
+        _ext_update_job(job_id, status="failed", error=err[:300])
+        return
+
+    output_blob = done.get("output_blob") or j.get("output_blob")
+    want_sha = str(done.get("output_sha256", ""))
+    want_size = int(done.get("output_size", 0) or 0)
+
+    try:
+        transport = _ext_transport(cfg)
+        _ext_update_job(job_id, status="downloading")
+        transport.get_object(output_blob, tmp)
+
+        got_size = os.path.getsize(tmp)
+        if want_size and got_size != want_size:
+            raise _TransportError(f"size mismatch: got {got_size}, want {want_size}")
+        if want_sha:
+            got_sha = _sha256_file(tmp)
+            if got_sha != want_sha:
+                raise _TransportError("sha256 mismatch on downloaded output")
+
+        os.replace(tmp, mkv_path)
+        new_size = os.path.getsize(mkv_path)
+
+        # NFO sibling so Plex picks up the .mkv
+        nfo_src = ts_path[:-3] + ".nfo" if ts_path.endswith(".ts") else ""
+        nfo_dst = mkv_path[:-4] + ".nfo"
+        if nfo_src and os.path.exists(nfo_src) and not os.path.exists(nfo_dst):
+            try:
+                import shutil
+                shutil.copy2(nfo_src, nfo_dst)
+            except Exception as e:
+                log.debug(f"NFO copy: {e}")
+
+        # Remote cleanup
+        for blob in (j.get("source_blob"), j.get("output_blob"),
+                     j.get("job_blob"), j.get("done_blob")):
+            if blob:
+                try:
+                    transport.delete_object(blob)
+                except Exception as e:
+                    log.debug(f"Remote cleanup {blob}: {e}")
+
+        # Local cleanup
+        if cfg["delete_original"] and ts_path and os.path.exists(ts_path):
+            try:
+                os.remove(ts_path)
+                if nfo_src and os.path.exists(nfo_src):
+                    os.remove(nfo_src)
+                log.info(f"Original deleted: {os.path.basename(ts_path)}")
+            except OSError as e:
+                log.warning(f"Failed to delete original: {e}")
+
+        orig_size = int(j.get("orig_size", 0) or 0)
+        ratio = (new_size / orig_size) if orig_size else 0
+        log.info(f"External transcode OK ({source}): {os.path.basename(mkv_path)} → "
+                 f"{new_size/(1024**2):.1f} MB ({ratio*100:.0f}%) job={job_id[:8]}")
+        _ext_update_job(job_id, status="completed", new_size=new_size,
+                        ratio=round(ratio, 3), mkv_path=mkv_path,
+                        finished=datetime.now().isoformat(),
+                        worker=str(done.get("worker", "")))
+
+        # Surface in the existing compression history/UI
+        try:
+            _add_compression_history({
+                "ts_path": ts_path, "mkv_path": mkv_path,
+                "profile": (j.get("profile") or {}).get("name", ""),
+                "started": j.get("queued_at", j.get("created")),
+                "elapsed": int(done.get("elapsed", 0) or 0),
+                "ok": True, "orig_size": orig_size, "new_size": new_size,
+                "ratio": round(ratio, 3), "manual": False, "source": "external",
+                "worker": str(done.get("worker", "")),
+            })
+        except Exception:
+            pass
+
+        # Plex refresh / verify
+        rcfg = get_recordings_config()
+        if rcfg.get("plex_url") and rcfg.get("plex_token"):
+            threading.Thread(target=_plex_notify, args=(rcfg, mkv_path),
+                             kwargs={"label": "External-Transcode"}, daemon=True).start()
+    except Exception as e:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        log.warning(f"External transcode completion error ({source}): job={job_id[:8]} — {e}")
+        _ext_update_job(job_id, status="failed", error=str(e)[:300])
+
+
+# ── Scheduler (submit + poll fallback + stuck detection) ────────────────────
+
+def _ext_poll_completions(cfg):
+    """Webhook-independent: check done.json for queued jobs."""
+    try:
+        transport = _ext_transport(cfg)
+    except Exception:
+        return
+    for job_id, j in list(_ext_load_state().items()):
+        if j.get("status") != "queued":
+            continue
+        done_blob = j.get("done_blob")
+        if not done_blob:
+            continue
+        try:
+            if transport.object_exists(done_blob):
+                done = json.loads(transport.get_text(done_blob))
+                _ext_handle_completion(job_id, done, source="poll")
+        except Exception as e:
+            log.debug(f"External transcode poll job={job_id[:8]}: {e}")
+
+
+def _ext_check_stuck(cfg):
+    now = time.time()
+    limit = cfg["stuck_minutes"] * 60
+    for job_id, j in list(_ext_load_state().items()):
+        if j.get("status") not in ("queued", "transcoding"):
+            continue
+        qa = j.get("queued_at") or j.get("created")
+        try:
+            age = now - datetime.fromisoformat(qa).timestamp()
+        except Exception:
+            continue
+        if age < limit:
+            continue
+        attempts = int(j.get("attempts", 1))
+        if attempts < cfg["max_attempts"]:
+            log.warning(f"External transcode STUCK → retry: job={job_id[:8]} "
+                        f"(attempt {attempts}/{cfg['max_attempts']})")
+            try:
+                _ext_transport(cfg).queue_send({"job_id": job_id, "job_blob": j.get("job_blob")})
+                _ext_update_job(job_id, status="queued", attempts=attempts + 1,
+                                queued_at=datetime.now().isoformat())
+            except Exception as e:
+                log.warning(f"External transcode re-enqueue failed job={job_id[:8]}: {e}")
+        else:
+            log.warning(f"External transcode STUCK (giving up): job={job_id[:8]}")
+            _ext_update_job(job_id, status="stuck")
+
+
+def _external_transcode_loop():
+    log.info("External transcode scheduler started")
+    while True:
+        cfg = get_external_transcode_config()
+        try:
+            if cfg["enabled"] and _ext_config_ready(cfg):
+                _ext_poll_completions(cfg)
+                _ext_check_stuck(cfg)
+                if _ext_count_active() < cfg["max_active"]:
+                    pend = find_pending_external()
+                    if pend:
+                        _ext_submit_async(pend[0][0])
+        except Exception as e:
+            log.warning(f"External transcode scheduler: {e}")
+        time.sleep(max(5, cfg["poll_interval"]))
+
+
+def start_external_transcode_scheduler():
+    with _ext_lock:
+        if _ext_state_flag["scheduled"]:
+            return
+        _ext_state_flag["scheduled"] = True
+    threading.Thread(target=_external_transcode_loop, daemon=True,
+                     name="ext-transcode").start()
+
+
+def external_transcode_status():
+    cfg = get_external_transcode_config()
+    jobs = []
+    for j in _ext_load_state().values():
+        jobs.append({
+            "job_id": j.get("job_id"),
+            "name": os.path.basename(j.get("ts_path", "")),
+            "status": j.get("status"),
+            "attempts": j.get("attempts"),
+            "orig_size": j.get("orig_size"),
+            "new_size": j.get("new_size"),
+            "ratio": j.get("ratio"),
+            "worker": j.get("worker"),
+            "created": j.get("created"),
+            "updated": j.get("updated"),
+            "error": j.get("error"),
+        })
+    jobs.sort(key=lambda x: x.get("updated") or "", reverse=True)
+    return {
+        "enabled": cfg["enabled"],
+        "provider": cfg["provider"],
+        "profile": cfg["profile"],
+        "active": _ext_count_active(),
+        "jobs": jobs[:100],
+    }
 
 
 def _write_nfo(path, title, description="", image_url="", channel_name="", channel_logo=""):
@@ -7220,6 +7865,29 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"ok": ok})
             return
 
+        if parsed.path == "/api/external-transcode/notify":
+            cfg = get_external_transcode_config()
+            if not cfg["enabled"]:
+                self.send_json({"ok": False, "message": "external transcode disabled"}, status=403)
+                return
+            secret = cfg["notify_secret"]
+            if secret:
+                sig = self.headers.get("X-E2P-Signature", "")
+                expected = "sha256=" + hmac.new(secret.encode("utf-8"), body_data,
+                                                 hashlib.sha256).hexdigest()
+                if not hmac.compare_digest(sig, expected):
+                    log.warning("External transcode notify: bad signature")
+                    self.send_json({"ok": False, "message": "bad signature"}, status=401)
+                    return
+            job_id = data.get("job_id")
+            if not job_id:
+                self.send_json({"ok": False, "message": "job_id missing"}, status=400)
+                return
+            threading.Thread(target=_ext_handle_completion,
+                             args=(job_id, data, "webhook"), daemon=True).start()
+            self.send_json({"ok": True})
+            return
+
         if parsed.path == "/api/favorites":
             if not isinstance(data, list):
                 self.send_json({"ok": False, "message": "Expected list"})
@@ -7498,6 +8166,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         # ── Static Pages ──────────────────────────────────
         if path in ("/", ""):
             self.send_html(build_web_ui(get_channels()))
+            return
+
+        if path == "/api/external-transcode/status":
+            self.send_json(external_transcode_status())
             return
 
         if path == "/help":
@@ -8392,6 +9064,7 @@ def run():
     threading.Thread(target=epg_scheduler_loop, daemon=True).start()
     threading.Thread(target=maintenance_notify_loop, daemon=True).start()
     start_compression_scheduler()
+    start_external_transcode_scheduler()
 
     proxy_host = get_proxy_host()
     proxy_port = get_proxy_port()

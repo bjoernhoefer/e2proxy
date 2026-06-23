@@ -1,0 +1,19 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "vmName": { "value": "e2t-worker" },
+    "vmSize": { "value": "Standard_D4s_v3" },
+    "adminUsername": { "value": "azureuser" },
+    "authenticationType": { "value": "sshPublicKey" },
+    "adminPasswordOrKey": { "value": "ssh-ed25519 AAAA...REPLACE_WITH_YOUR_PUBLIC_KEY... you@host" },
+    "containerName": { "value": "transcode" },
+    "queueName": { "value": "transcode-jobs" },
+    "notifyUrl": { "value": "" },
+    "notifySecret": { "value": "" },
+    "idleExitAfter": { "value": 600 },
+    "enableSelfDeallocateOnIdle": { "value": true },
+    "sshSourceAddressPrefix": { "value": "*" },
+    "osDiskSizeGB": { "value": 128 }
+  }
+}

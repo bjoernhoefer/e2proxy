@@ -1,0 +1,105 @@
+#cloud-config
+# ─────────────────────────────────────────────────────────────────────────────
+# e2proxy external transcoding worker — standalone cloud-init (reference)
+#
+# Use this to provision a worker on a plain Ubuntu VM or home PC WITHOUT the ARM
+# template. It installs ffmpeg + Python + the Azure SDK, fetches the worker and
+# runs it as a systemd service. Fill in /etc/e2t/e2t.env for your environment:
+#   * Azure via Managed Identity .... set E2T_BLOB_ACCOUNT_URL/E2T_QUEUE_ACCOUNT_URL
+#                                     + E2T_BLOB_CONTAINER/E2T_QUEUE_NAME
+#   * Azure via connection string ... set E2T_AZURE_CONNECTION_STRING + names
+#   * Azure via SAS URLs ............ set E2T_BLOB_CONTAINER_SAS_URL/E2T_QUEUE_SAS_URL
+#   * On-prem (SMB/local) ........... set E2T_PROVIDER=filestore + E2T_FILESTORE_PATH
+#
+# The ARM template (azuredeploy.json) generates a fully-populated version of this
+# automatically — prefer it for Azure deployments.
+# ─────────────────────────────────────────────────────────────────────────────
+package_update: true
+package_upgrade: false
+packages:
+  - ffmpeg
+  - python3
+  - python3-pip
+  - python3-venv
+  - curl
+
+write_files:
+  - path: /etc/e2t/e2t.env
+    permissions: '0600'
+    owner: root:root
+    content: |
+      # --- transport ---
+      E2T_PROVIDER=azure
+      # managed identity (recommended on Azure):
+      E2T_BLOB_ACCOUNT_URL=https://YOURACCOUNT.blob.core.windows.net
+      E2T_QUEUE_ACCOUNT_URL=https://YOURACCOUNT.queue.core.windows.net
+      E2T_BLOB_CONTAINER=transcode
+      E2T_QUEUE_NAME=transcode-jobs
+      # or connection string:
+      #E2T_AZURE_CONNECTION_STRING=
+      # or SAS URLs:
+      #E2T_BLOB_CONTAINER_SAS_URL=
+      #E2T_QUEUE_SAS_URL=
+      # or on-prem shared dir:
+      #E2T_PROVIDER=filestore
+      #E2T_FILESTORE_PATH=/mnt/nas/transcode
+      # --- notify (worker -> e2proxy / Home Assistant) ---
+      E2T_NOTIFY_URL=
+      E2T_NOTIFY_SECRET=
+      # --- worker behaviour ---
+      E2T_WORKER_ID=transcode-worker
+      E2T_VISIBILITY=900
+      E2T_HEARTBEAT=120
+      E2T_MAX_DEQUEUE=3
+      E2T_IDLE_EXIT_AFTER=0
+      E2T_SELF_DEALLOCATE=0
+      E2T_WORK_DIR=/var/lib/e2t/work
+
+  - path: /opt/e2t/run.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      set -a; source /etc/e2t/e2t.env 2>/dev/null; set +a
+      /opt/e2t/venv/bin/python /opt/e2t/external_transcode_worker.py
+      rc=$?
+      # On a clean idle-exit (rc=0) optionally deallocate this VM to stop billing.
+      if [ "${E2T_SELF_DEALLOCATE}" = "1" ] && [ "$rc" -eq 0 ]; then
+        rid=$(curl -s -H Metadata:true \
+          "http://169.254.169.254/metadata/instance/compute/resourceId?api-version=2021-02-01&format=text")
+        az login --identity >/dev/null 2>&1 && \
+          az vm deallocate --ids "$rid" --no-wait || \
+          echo "self-deallocate failed (need az CLI + VM Contributor on self)"
+      fi
+      exit $rc
+
+  - path: /etc/systemd/system/e2t-worker.service
+    permissions: '0644'
+    owner: root:root
+    content: |
+      [Unit]
+      Description=e2proxy external transcoding worker
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      EnvironmentFile=/etc/e2t/e2t.env
+      ExecStart=/opt/e2t/run.sh
+      # on-failure: crashes restart, a clean idle-exit (rc=0) stops the service
+      Restart=on-failure
+      RestartSec=15
+      User=root
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - mkdir -p /opt/e2t /var/lib/e2t/work
+  - python3 -m venv /opt/e2t/venv
+  - /opt/e2t/venv/bin/pip install --upgrade pip
+  - /opt/e2t/venv/bin/pip install azure-identity azure-storage-blob azure-storage-queue
+  - curl -fsSL "https://raw.githubusercontent.com/bjoernhoefer/e2proxy/main/workers/external_transcode_worker.py" -o /opt/e2t/external_transcode_worker.py
+  - curl -sL https://aka.ms/InstallAzureCLIDeb | bash || true
+  - systemctl daemon-reload
+  - systemctl enable --now e2t-worker.service
