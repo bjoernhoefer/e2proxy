@@ -759,6 +759,9 @@ def build_ffmpeg_cmd(rid, service_ref, tp):
 
     base = [
         "ffmpeg", "-loglevel", "warning",
+        # Stalled Receiver darf ffmpeg nicht ewig blockieren: nach 20s ohne Daten
+        # bricht der HTTP-Input ab → Prozess endet → Tuner/ref_lock werden freigegeben.
+        "-rw_timeout", "20000000",
         "-fflags", "+discardcorrupt+genpts",
         "-err_detect", "ignore_err",
         "-probesize", "1000000", "-analyzeduration", "1000000",
@@ -8203,6 +8206,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.send_text("Missing: ref", 400)
                 return
 
+            # Hängender Consumer (z.B. Aufnahme-ffmpeg mit Disk-Stall) darf den Handler
+            # nicht dauerhaft in wfile.write() blockieren — sonst bleibt der Tuner (und
+            # bei Live das ref_lock) für immer belegt. Socket-Timeout → write wirft nach
+            # 60s Stillstand → Handler räumt sauber auf.
+            try:
+                self.connection.settimeout(60)
+            except Exception:
+                pass
+
             service_ref = params["ref"][0].strip()
             profile_name = params.get("profile", [get_default_profile()])[0]
             # Channel-Name aus Cache nachschlagen (Plex übergibt keinen name Parameter)
@@ -8237,14 +8249,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     self.send_text("All receivers busy", 503)
                     return
 
-            # Verhindert doppelten Stream für denselben Sender (z.B. Jellyfin Probe + Stream)
-            ref_lock = get_ref_lock(service_ref)
-            if not ref_lock.acquire(blocking=False):
-                log.warning(f"Duplicate request for {service_ref} — rejected (429)")
-                self.send_text("Stream für diesen Sender läuft bereits", 429)
-                return
-
+            # Dedup-Lock NUR für Live-Anfragen (z.B. Jellyfin Probe + Stream, die fast
+            # gleichzeitig denselben Sender öffnen). Aufnahmen (preacquired) sind bereits
+            # über den Receiver koordiniert (jede belegt einen eigenen Tuner) und dürfen
+            # Live-Zuschauer desselben Senders NICHT blockieren — sonst sperrt jede
+            # laufende oder hängende VOX-Aufnahme das Live-Schauen von VOX (429).
+            ref_lock = None
             if not preacquired:
+                ref_lock = get_ref_lock(service_ref)
+                if not ref_lock.acquire(blocking=False):
+                    log.warning(f"Duplicate request for {service_ref} — rejected (429)")
+                    self.send_text("Stream für diesen Sender läuft bereits", 429)
+                    return
                 acquire_receiver(rid, client_ip, service_ref, channel_name)
 
             try:
@@ -8306,7 +8322,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 log.error(f"STREAM ERROR: {e}")
             finally:
                 release_receiver(rid)
-                ref_lock.release()
+                if ref_lock is not None:
+                    ref_lock.release()
             return
 
         self.send_text("Not found", 404)
