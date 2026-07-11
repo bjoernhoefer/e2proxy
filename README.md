@@ -12,6 +12,7 @@ Single Python file, runs in Docker, manages two SAT receivers with automatic tun
 - **Recording System** — ffmpeg-based with Plex-compliant directory structure (`TV/Show/Season XX/`)
 - **TVDB + TMDB** — Automatic series/episode detection, daily-show fallback numbering
 - **Shared Tuner** — Parallel recordings on the same channel without tuner conflicts
+- **Tuner Lock** — Temporarily lock a tuner in Settings so e2proxy won't use it (handy in exceptional situations)
 - **Favorites** — Drag & drop channel ordering with group/category assignments
 - **Bilingual UI** — English/German with browser language auto-detection
 - **Dark/Light Theme** — Switchable in settings
@@ -93,7 +94,7 @@ Open http://your-server:8888 and configure your receivers in Settings.
 
 First-time setup via the web UI at `http://your-server:8888/settings`:
 
-1. **Receivers** — Add your Enigma2 receiver IPs (port 80 for web, 8001 for streaming)
+1. **Receivers** — Add your Enigma2 receiver IPs (port 80 for web, 8001 for streaming). Each receiver can be locked to temporarily exclude its tuner from use.
 2. **Favorites** — Select channels for EPG and Plex DVR lineup
 3. **EPG Schedule** — Set the daily EPG update time (default: 3:00 AM)
 4. **TMDB API Key** — Optional, for poster artwork in EPG

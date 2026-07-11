@@ -444,6 +444,14 @@ def get_receiver_by_id(rid):
             return r
     return None
 
+def is_receiver_locked(r):
+    """True, wenn der Tuner in den Einstellungen gesperrt ist."""
+    return bool(r.get("locked", False))
+
+def is_receiver_usable(r):
+    """Receiver darf vom e2proxy verwendet werden: aktiviert und nicht gesperrt."""
+    return r.get("enabled", True) and not r.get("locked", False)
+
 def get_transcode_profile(name):
     return get_config().get("transcode_profiles", {}).get(name)
 
@@ -519,16 +527,16 @@ def get_free_receiver(preferred_id=None):
         if preferred_id and preferred_id != "auto":
             state = _receiver_state.get(preferred_id)
             for r in receivers:
-                if r["id"] == preferred_id and r.get("enabled", True) and state is None:
+                if r["id"] == preferred_id and is_receiver_usable(r) and state is None:
                     return preferred_id
         # Default Receiver
         for r in receivers:
-            if r.get("default") and r.get("enabled", True):
+            if r.get("default") and is_receiver_usable(r):
                 if _receiver_state.get(r["id"]) is None:
                     return r["id"]
         # Erster freier
         for r in receivers:
-            if r.get("enabled", True) and _receiver_state.get(r["id"]) is None:
+            if is_receiver_usable(r) and _receiver_state.get(r["id"]) is None:
                 return r["id"]
     return None
 
@@ -1263,7 +1271,7 @@ def run_epg_update(triggered_by="manual"):
         ref_to_name = {ch["ref"].rstrip("/"): ch["name"] for ch in all_channels}
         target_refs = {r.rstrip("/") for r in fav_refs}
 
-        receivers = [r for r in get_receivers() if r.get("enabled", True)]
+        receivers = [r for r in get_receivers() if is_receiver_usable(r)]
         if not receivers:
             _epg_log("Keine Receiver verfügbar")
             return False
@@ -3350,7 +3358,7 @@ def start_recording(service_ref, title, duration=None, profile=None,
     ref_clean = service_ref.rstrip("/")
     # Suche Receiver der bereits diesen Sender streamt
     for r in get_receivers():
-        if not r.get("enabled", True):
+        if not is_receiver_usable(r):
             continue
         state = _receiver_state.get(r["id"])
         if state and state.get("service_ref", "").rstrip("/") == ref_clean:
@@ -3690,15 +3698,17 @@ def get_tuner_status():
     for r in receivers:
         if not r.get("enabled", True):
             continue
+        locked = is_receiver_locked(r)
         total += 1
         state = _receiver_state.get(r["id"])
         is_busy = state is not None
-        if is_busy:
+        if is_busy or locked:
             busy += 1
         result.append({
             "id": r["id"],
             "name": r["name"],
             "busy": is_busy,
+            "locked": locked,
             "channel": state.get("channel_name", "") if state else "",
             "client_ip": state.get("client_ip", "") if state else "",
             "since": state.get("started", "") if state else "",
@@ -3890,6 +3900,19 @@ def build_web_ui(channels):
             continue
         state = _receiver_state.get(r["id"])
         online = is_receiver_online(r["id"])
+        if is_receiver_locked(r):
+            color = "#64748b"
+            status = "🔒 gesperrt"
+            kill_btn = ""
+            rx_items.append(
+                f'<div class="rx-item">'
+                f'<span class="rx-dot" id="rx-dot-{r["id"]}" style="background:{color}"></span>'
+                f'<span>{r["name"]}</span>'
+                f'<span class="rx-status" id="rx-status-{r["id"]}">{status}</span>'
+                f'{kill_btn}'
+                f'</div>'
+            )
+            continue
         if state is None:
             color = "#22c55e" if online else "#ef4444"
             status = "free"
@@ -5170,6 +5193,8 @@ def build_settings_ui():
     rx_rows = ""
     for r in receivers:
         enabled = '<span class="tag green">aktiv</span>' if r.get("enabled", True) else '<span class="tag muted">inaktiv</span>'
+        if is_receiver_locked(r):
+            enabled += ' <span class="tag red">🔒 gesperrt</span>'
         default = '<span class="tag amber">default</span>' if r.get("default") else ""
         r_json = json.dumps(r).replace('"', '&quot;')
         rx_rows += f'''<tr>
@@ -5301,6 +5326,7 @@ def build_settings_ui():
 .tag.green{border-color:var(--green);color:var(--green);}
 .tag.amber{border-color:var(--amber);color:var(--amber);}
 .tag.muted{color:var(--muted);}
+.tag.red{border-color:var(--red);color:var(--red);}
 
 /* ── Forms ───────────────────────────────────────────── */
 .input{width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:5px;font-size:12px;outline:none;font-family:monospace;}
@@ -6459,8 +6485,9 @@ function loadTunerStatus() {{
     const color = d.free > 0 ? 'var(--green)' : 'var(--red)';
     let html = `<div style="font-family:monospace;font-size:12px;margin-bottom:8px;color:${{color}}">${{d.free}} / ${{d.total}} Tuner</div>`;
     html += d.receivers.map(r => {{
-      const c = r.busy ? 'var(--amber)' : 'var(--green)';
-      return `<div style="display:flex;align-items:center;gap:8px;font-size:11px;margin:3px 0"><span style="width:8px;height:8px;border-radius:50%;background:${{c}};flex-shrink:0"></span><b>${{r.name}}</b><span style="color:var(--muted)">${{r.busy ? r.channel + ' · ' + r.client_ip : 'frei'}}</span></div>`;
+      const c = r.locked ? 'var(--red)' : (r.busy ? 'var(--amber)' : 'var(--green)');
+      const info = r.locked ? '🔒 gesperrt' : (r.busy ? r.channel + ' · ' + r.client_ip : 'frei');
+      return `<div style="display:flex;align-items:center;gap:8px;font-size:11px;margin:3px 0"><span style="width:8px;height:8px;border-radius:50%;background:${{c}};flex-shrink:0"></span><b>${{r.name}}</b><span style="color:var(--muted)">${{info}}</span></div>`;
     }}).join('');
     el.innerHTML = html;
   }}).catch(()=>{{ if(document.getElementById('tuner-status')) document.getElementById('tuner-status').textContent='Fehler.'; }});
@@ -6734,9 +6761,10 @@ function addReceiver() {{
     {{key:'port', label:'Web-Port', placeholder:'80', value:'80'}},
     {{key:'stream_port', label:'Stream-Port', placeholder:'8001', value:'8001'}},
     {{key:'enabled', label:'Aktiv', type:'checkbox', value:true}},
+    {{key:'locked', label:'Gesperrt (Tuner nicht verwenden)', type:'checkbox', value:false}},
     {{key:'default', label:'Default-Receiver', type:'checkbox', value:false}},
   ], async () => {{
-    const rx = {{id:getVal('id'),name:getVal('name'),ip:getVal('ip'),port:parseInt(getVal('port')),stream_port:parseInt(getVal('stream_port')),enabled:getVal('enabled',true),default:getVal('default',true)}};
+    const rx = {{id:getVal('id'),name:getVal('name'),ip:getVal('ip'),port:parseInt(getVal('port')),stream_port:parseInt(getVal('stream_port')),enabled:getVal('enabled',true),locked:getVal('locked',false),default:getVal('default',true)}};
     await patchConfig(cfg => cfg.receivers.push(rx));
   }});
 }}
@@ -6748,11 +6776,12 @@ function editReceiver(r) {{
     {{key:'port', label:'Web-Port', value:r.port||80}},
     {{key:'stream_port', label:'Stream-Port', value:r.stream_port||8001}},
     {{key:'enabled', label:'Aktiv', type:'checkbox', value:r.enabled!==false}},
+    {{key:'locked', label:'Gesperrt (Tuner nicht verwenden)', type:'checkbox', value:!!r.locked}},
     {{key:'default', label:'Default-Receiver', type:'checkbox', value:!!r.default}},
   ], async () => {{
     await patchConfig(cfg => {{
       const idx = cfg.receivers.findIndex(x=>x.id===r.id);
-      if (idx>=0) cfg.receivers[idx] = {{...cfg.receivers[idx], name:getVal('name'), ip:getVal('ip'), port:parseInt(getVal('port')), stream_port:parseInt(getVal('stream_port')), enabled:getVal('enabled',true), default:getVal('default',true)}};
+      if (idx>=0) cfg.receivers[idx] = {{...cfg.receivers[idx], name:getVal('name'), ip:getVal('ip'), port:parseInt(getVal('port')), stream_port:parseInt(getVal('stream_port')), enabled:getVal('enabled',true), locked:getVal('locked',false), default:getVal('default',true)}};
     }});
   }});
 }}
@@ -7110,7 +7139,7 @@ def build_hdhr_discover():
     host = get_proxy_host()
     port = get_proxy_port()
     base = f"http://{host}:{port}"
-    tuner_count = len([r for r in get_receivers() if r.get("enabled", True)])
+    tuner_count = len([r for r in get_receivers() if is_receiver_usable(r)])
     return {
         "FriendlyName":    "e2proxy (Enigma2)",
         "Manufacturer":    "e2proxy",
@@ -7775,12 +7804,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             for r in get_receivers():
                 if not r.get("enabled", True):
                     continue
+                locked = is_receiver_locked(r)
                 state = _receiver_state.get(r["id"])
                 receivers_health.append({
                     "id":     r["id"],
                     "name":   r["name"],
                     "online": True,
                     "busy":   state is not None,
+                    "locked": locked,
                     "channel": state.get("channel_name", "") if state else "",
                 })
             self.send_json({
@@ -7788,7 +7819,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "version":     "2.1.0",
                 "uptime_sec":  int(time.time() - _proxy_start_time),
                 "receivers":   receivers_health,
-                "tuners_free": sum(1 for r in receivers_health if not r["busy"]),
+                "tuners_free": sum(1 for r in receivers_health if not r["busy"] and not r["locked"]),
             })
             return
 
