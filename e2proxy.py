@@ -564,14 +564,35 @@ def release_receiver(rid):
     log.info(f"Receiver '{rid}' ({r['name'] if r else rid}) released")
 
 
+def kill_proc_robust(proc, label="", grace=5):
+    """Beendet einen Prozess zuverlässig: erst SIGTERM, nach `grace`s SIGKILL.
+
+    Ein netzwerk-blockiertes ffmpeg reagiert oft nicht auf SIGTERM und würde
+    sonst als Zombie weiterlaufen (Tuner-/Stream-Leak). Die SIGKILL-Eskalation
+    garantiert, dass der Prozess wirklich verschwindet.
+    """
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=grace)
+        return
+    except Exception:
+        pass
+    try:
+        proc.kill()
+        log.warning(f"{label or 'Prozess'}: reagiert nicht auf SIGTERM — SIGKILL gesendet")
+    except Exception:
+        pass
+
+
 def kill_stream(rid):
     with stream_processes_lock:
         proc = stream_processes.get(rid)
-        if proc:
-            try:
-                proc.terminate()
-            except:
-                pass
+    kill_proc_robust(proc, label=f"Stream '{rid}'")
     release_receiver(rid)
     log.info(f"Stream auf Receiver '{rid}' abgebrochen")
 
@@ -764,7 +785,10 @@ def build_ffmpeg_cmd(rid, service_ref, tp):
         "-rw_timeout", "20000000",
         "-fflags", "+discardcorrupt+genpts",
         "-err_detect", "ignore_err",
-        "-probesize", "1000000", "-analyzeduration", "1000000",
+        # Großzügiges Probe-Fenster: manche HD-Sender (z.B. VOX HD) liefern die
+        # Stream-Parameter erst spät. Zu kleine Werte → ffmpeg erkennt Video/Audio
+        # nicht ("unspecified size / unknown codec") und schreibt 0 Bytes.
+        "-probesize", "15000000", "-analyzeduration", "15000000",
         "-i", input_url,
         "-map", "0:v:0", "-map", "0:a:0",
     ]
@@ -3417,14 +3441,92 @@ def start_recording(service_ref, title, duration=None, profile=None,
     except FileNotFoundError:
         raise RuntimeError("ffmpeg nicht gefunden — bitte installieren: apt install ffmpeg")
 
-    # Watchdog-Thread: beendet Aufnahme nach max_dur
+    # Watchdog-Thread: überwacht Datenfluss (früher Abbruch bei 0-Byte/defektem
+    # Stream), erzwingt die maximale Laufzeit und garantiert das Aufräumen.
+    MIN_BYTES = 188 * 500          # ~94 KB: alles darunter = kein echter Stream
+    EARLY_GRACE = 30               # s bis erste Datenfluss-Prüfung
+    FATAL_PATTERNS = (
+        "server returned 4", "server returned 5", "error opening input",
+        "connection refused", "no route to host", "immediate exit requested",
+        "invalid data found", "404 not found", "403 forbidden",
+    )
+
     def watchdog():
+        stderr_tail = []
+        fatal = threading.Event()
+
+        def read_stderr():
+            try:
+                for line in iter(proc.stderr.readline, ''):
+                    line = line.rstrip()
+                    if not line:
+                        continue
+                    stderr_tail.append(line)
+                    if len(stderr_tail) > 20:
+                        stderr_tail.pop(0)
+                    low = line.lower()
+                    if any(p in low for p in FATAL_PATTERNS):
+                        fatal.set()
+            except Exception:
+                pass
+            finally:
+                try:
+                    proc.stderr.close()
+                except Exception:
+                    pass
+
+        threading.Thread(target=read_stderr, daemon=True).start()
+
         try:
-            proc.wait(timeout=max_dur + 30)
-        except _subprocess.TimeoutExpired:
-            log.warning(f"Recording {rec_id} Watchdog — terminating process")
-            proc.terminate()
+            # Phase 1 — Frühe Fehlererkennung (kanal-unabhängig):
+            # kein Datenfluss oder fataler Input-Fehler → sofort abbrechen,
+            # statt bis zu max_dur sinnlos weiterzulaufen und Prozesse zu leaken.
+            t0 = time.time()
+            early_fail = False
+            while time.time() - t0 < EARLY_GRACE:
+                if proc.poll() is not None:
+                    break            # ffmpeg bereits beendet
+                if fatal.is_set():
+                    early_fail = True
+                    break
+                time.sleep(2)
+            else:
+                try:
+                    size = os.path.getsize(filepath)
+                except OSError:
+                    size = 0
+                if size < MIN_BYTES:
+                    early_fail = True
+
+            if early_fail and proc.poll() is None:
+                try:
+                    size = os.path.getsize(filepath)
+                except OSError:
+                    size = 0
+                reason = stderr_tail[-1] if stderr_tail else f"kein Datenfluss ({size} Bytes)"
+                log.error(f"Recording {rec_id}: Abbruch nach {EARLY_GRACE}s — "
+                          f"leerer/defekter Stream ({size} Bytes) — {reason}")
+                kill_proc_robust(proc, label=f"Recording {rec_id}")
+
+            # Phase 2 — Normale Laufzeit abwarten, danach robust beenden.
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=max_dur + 30)
+                except _subprocess.TimeoutExpired:
+                    log.warning(f"Recording {rec_id} Watchdog — terminating process")
+                    kill_proc_robust(proc, label=f"Recording {rec_id}")
         finally:
+            try:
+                final_size = os.path.getsize(filepath)
+            except OSError:
+                final_size = 0
+            if final_size < MIN_BYTES:
+                with _active_recordings_lock:
+                    r = _active_recordings.get(rec_id)
+                    if r is not None:
+                        r["failed"] = True
+                log.error(f"Recording {rec_id} fehlgeschlagen: leere/zu kleine "
+                          f"Datei ({final_size} Bytes)")
             _finish_recording(rec_id)
 
     wt = threading.Thread(target=watchdog, daemon=True)
@@ -3482,7 +3584,7 @@ def stop_recording(rec_id):
         raise KeyError(f"Aufnahme {rec_id} nicht gefunden")
     proc = rec.get("proc")
     if proc and proc.poll() is None:
-        proc.terminate()
+        kill_proc_robust(proc, label=f"Recording {rec_id}")
         log.info(f"Aufnahme gestoppt: {rec_id} — {rec['title']}")
     _finish_recording(rec_id)
     return rec["filepath"]
@@ -3538,6 +3640,46 @@ def get_recording_status():
                 "profile": rec["profile"],
             })
     return result
+
+def recording_reaper_loop():
+    """Sicherheitsnetz gegen verwaiste Aufnahme-Prozesse.
+
+    Läuft periodisch und
+      1. räumt Einträge auf, deren ffmpeg bereits gestorben ist, aber noch in
+         _active_recordings hängt (falls ein Watchdog-Thread ausgefallen ist),
+      2. killt Aufnahmen, die deutlich über ihrer geplanten Laufzeit liegen
+         (Wall-Clock-Garantie, unabhängig vom unzuverlässigen ffmpeg -t).
+    """
+    while True:
+        try:
+            time.sleep(60)
+            now = datetime.now()
+            dead = []
+            overrun = []
+            with _active_recordings_lock:
+                for rec_id, rec in list(_active_recordings.items()):
+                    proc = rec.get("proc")
+                    if proc is None:
+                        continue
+                    if proc.poll() is not None:
+                        dead.append(rec_id)
+                        continue
+                    try:
+                        elapsed = (now - datetime.fromisoformat(rec["started"])).total_seconds()
+                    except Exception:
+                        elapsed = 0
+                    if elapsed > rec.get("duration", 0) + 120:
+                        overrun.append((rec_id, proc, elapsed))
+            for rec_id, proc, elapsed in overrun:
+                log.warning(f"Reaper: Aufnahme {rec_id} überschreitet Laufzeit "
+                            f"({int(elapsed)}s) — erzwinge Stopp")
+                kill_proc_robust(proc, label=f"Recording {rec_id}")
+            for rec_id in dead:
+                log.info(f"Reaper: verwaisten Aufnahme-Eintrag {rec_id} aufgeräumt")
+                _finish_recording(rec_id)
+        except Exception as e:
+            log.debug(f"recording_reaper_loop: {e}")
+
 
 def get_tuner_status():
     """Gibt Tuner-Belegung zurück."""
@@ -8408,6 +8550,7 @@ def run():
     threading.Thread(target=refresh_logo_cache, daemon=True).start()
     threading.Thread(target=epg_scheduler_loop, daemon=True).start()
     threading.Thread(target=maintenance_notify_loop, daemon=True).start()
+    threading.Thread(target=recording_reaper_loop, daemon=True, name="rec-reaper").start()
     start_compression_scheduler()
 
     proxy_host = get_proxy_host()
