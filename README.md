@@ -12,6 +12,7 @@ Single Python file, runs in Docker, manages two SAT receivers with automatic tun
 - **Recording System** — ffmpeg-based with Plex-compliant directory structure (`TV/Show/Season XX/`)
 - **TVDB + TMDB** — Automatic series/episode detection, daily-show fallback numbering
 - **Shared Tuner** — Parallel recordings on the same channel without tuner conflicts
+- **Fast Switching** — Per-channel switch tuning (NoLatency probing, configurable zap wait) with self-learning probesize and zap/start statistics
 - **Tuner Lock** — Temporarily lock a tuner in Settings so e2proxy won't use it (handy in exceptional situations)
 - **Favorites** — Drag & drop channel ordering with group/category assignments
 - **Bilingual UI** — English/German with browser language auto-detection
@@ -145,6 +146,9 @@ All configuration stored in `/data/config.json`.
 | `/api/status` | GET | Proxy status |
 | `/api/tuners` | GET | Tuner allocation |
 | `/api/config` | GET/POST | Configuration |
+| `/api/switch/stats` | GET | Switch-tuning stats (global + per-channel) |
+| `/api/switch/settings` | POST | Global defaults and/or per-channel override (`{global, ref, no_latency, zap_wait, probesize}`) |
+| `/api/switch/reset` | POST | Reset learned values/stats (`{ref}` or all) |
 | `/api/logs` | GET | Live logs (`?level=INFO&since=<unix>&n=100`) |
 | `/api/logs/history` | GET | Historical logs from disk (`?hours=6`) |
 
@@ -194,6 +198,7 @@ All configuration stored in `/data/config.json`.
 | `/data/e2proxy.log` | System log (daily rotation) |
 | `/data/api_access.log` | API access log |
 | `/data/epg_cache.xml` | EPG disk cache |
+| `/data/switch_stats.json` | Per-channel switch tuning + zap/start statistics |
 | `/data/tmdb_cache.json` | TMDB poster cache |
 | `/data/tvdb_cache.json` | TVDB series cache |
 | `/data/logos/` | Channel logo cache |
