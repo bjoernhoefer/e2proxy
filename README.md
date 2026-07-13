@@ -101,7 +101,7 @@ First-time setup via the web UI at `http://your-server:8888/settings`:
 3. **EPG Schedule** — Set the daily EPG update time (default: 3:00 AM)
 4. **TMDB API Key** — Optional, for poster artwork in EPG
 5. **TVDB API Key** — Optional, for series/episode detection in recordings
-6. **Plex Integration** — URL + token for automatic library refresh after recordings
+6. **Plex Integration** — URL + token for automatic library refresh after recordings, and optional DVR guide reload after each EPG run
 
 All configuration stored in `/data/config.json`.
 
