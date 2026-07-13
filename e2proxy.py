@@ -23,6 +23,7 @@ import urllib.parse
 import socket
 import threading
 import subprocess
+import select
 import time
 import logging
 import sys
@@ -38,7 +39,7 @@ from datetime import datetime
 # ── Pfade ─────────────────────────────────────────────────
 # Datenpfad: via Env-Variable überschreibbar (für Docker)
 DATA_DIR       = os.environ.get("E2PROXY_DATA_DIR", "/var/lib/e2proxy")
-VERSION        = "3.6"   # Versions-ID — wird bei jeder Änderung neu generiert
+VERSION        = "3.7"   # Versions-ID — wird bei jeder Änderung neu generiert
 CONFIG_FILE    = f"{DATA_DIR}/config.json"
 FAVORITES_FILE = f"{DATA_DIR}/favorites.json"
 
@@ -471,6 +472,192 @@ def get_default_profile():
     return get_config().get("default_device_profile", "Web-SD")
 
 
+# ── Umschalt-Tuning (Switch Time) ─────────────────────────
+# Globale Defaults für schnelles Umschalten. Pro-Sender-Overrides und
+# selbstlernende Werte liegen im SwitchStats-Store (switch_stats.json).
+
+SWITCH_STATS_FILE = f"{DATA_DIR}/switch_stats.json"
+
+# Harte Untergrenzen/Defaults, falls Config-Keys fehlen
+_PROBE_DEFAULT          = 15000000   # normaler Probesize/Analyzeduration
+_NOLAT_PROBE_DEFAULT    = 500000     # NoLatency: minimaler Probesize
+_SWITCH_MONITOR_DEFAULT = 10.0       # s First-Data-Fenster
+_SWITCH_RETRIES_DEFAULT = 2          # zusätzliche ffmpeg-Startversuche
+_NOLAT_FAIL_THRESHOLD   = 3          # ab so vielen Fehlern Probesize erhöhen
+_PROBE_MAX              = 15000000   # Obergrenze für gelernten Probesize
+
+def get_switch_global():
+    """Globale Umschalt-Defaults aus der Config (mit Fallbacks)."""
+    c = get_config()
+    return {
+        "no_latency":            bool(c.get("no_latency", False)),
+        "zap_wait":              float(c.get("zap_wait_sec", 1.0)),
+        "probe_default":         int(c.get("probe_default", _PROBE_DEFAULT)),
+        "nolat_probesize":       int(c.get("no_latency_probesize", _NOLAT_PROBE_DEFAULT)),
+        "nolat_analyzeduration": int(c.get("no_latency_analyzeduration", _NOLAT_PROBE_DEFAULT)),
+        "monitor_sec":           float(c.get("switch_monitor_sec", _SWITCH_MONITOR_DEFAULT)),
+        "max_retries":           int(c.get("switch_max_retries", _SWITCH_RETRIES_DEFAULT)),
+        "fail_threshold":        int(c.get("nolatency_fail_threshold", _NOLAT_FAIL_THRESHOLD)),
+    }
+
+
+_switch_stats_lock = threading.Lock()
+_switch_stats = None  # lazy-loaded dict: {ref: {...}}
+
+def _norm_ref(service_ref):
+    return (service_ref or "").rstrip("/")
+
+def _load_switch_stats():
+    global _switch_stats
+    if _switch_stats is not None:
+        return _switch_stats
+    try:
+        if os.path.exists(SWITCH_STATS_FILE):
+            with open(SWITCH_STATS_FILE) as f:
+                _switch_stats = json.load(f)
+        else:
+            _switch_stats = {}
+    except Exception as e:
+        log.warning(f"Switch-Stats laden fehlgeschlagen: {e}")
+        _switch_stats = {}
+    return _switch_stats
+
+def _save_switch_stats():
+    try:
+        os.makedirs(os.path.dirname(SWITCH_STATS_FILE), exist_ok=True)
+        tmp = SWITCH_STATS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(_switch_stats, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, SWITCH_STATS_FILE)
+    except Exception as e:
+        log.warning(f"Switch-Stats speichern fehlgeschlagen: {e}")
+
+def _switch_entry(ref):
+    """Liefert (und legt bei Bedarf an) den Store-Eintrag für einen Sender."""
+    stats = _load_switch_stats()
+    key = _norm_ref(ref)
+    e = stats.get(key)
+    if e is None:
+        e = {
+            "name": None,
+            "no_latency": None,          # None = globalen Default nutzen
+            "zap_wait": None,            # None = globalen Default nutzen
+            "probesize": None,           # None = kein gelernter Override
+            "nolatency_fail_streak": 0,
+            "nolatency_fail_total": 0,
+            "zap": {"ok": 0, "fail": 0, "last_ms": 0, "avg_ms": 0},
+            "start": {"ok": 0, "fail": 0, "retries": 0},
+            "last_update": None,
+        }
+        stats[key] = e
+    return e
+
+def get_switch_settings(service_ref):
+    """Effektive Umschalt-Parameter für einen Sender (global + Per-Sender-Override)."""
+    g = get_switch_global()
+    with _switch_stats_lock:
+        stats = _load_switch_stats()
+        e = stats.get(_norm_ref(service_ref)) or {}
+        no_latency = e.get("no_latency")
+        zap_wait   = e.get("zap_wait")
+        learned    = e.get("probesize")
+    no_latency = g["no_latency"] if no_latency is None else bool(no_latency)
+    zap_wait   = g["zap_wait"]   if zap_wait   is None else float(zap_wait)
+    if no_latency:
+        probesize = int(learned) if learned else g["nolat_probesize"]
+        analyzeduration = g["nolat_analyzeduration"]
+        if learned:
+            analyzeduration = max(analyzeduration, int(learned))
+    else:
+        probesize = g["probe_default"]
+        analyzeduration = g["probe_default"]
+    return {
+        "no_latency": no_latency,
+        "zap_wait": zap_wait,
+        "probesize": int(probesize),
+        "analyzeduration": int(analyzeduration),
+        "monitor_sec": g["monitor_sec"],
+        "max_retries": g["max_retries"],
+    }
+
+def record_zap_result(service_ref, ok, elapsed_ms, wait_used, channel_name=None):
+    """Zap-Ergebnis (Erfolg/Fehler) + Dauer in der Statistik festhalten."""
+    with _switch_stats_lock:
+        e = _switch_entry(service_ref)
+        if channel_name:
+            e["name"] = channel_name
+        z = e["zap"]
+        if ok:
+            z["ok"] = z.get("ok", 0) + 1
+        else:
+            z["fail"] = z.get("fail", 0) + 1
+        z["last_ms"] = int(elapsed_ms)
+        n = z["ok"] + z["fail"]
+        prev = z.get("avg_ms", 0)
+        z["avg_ms"] = int((prev * (n - 1) + elapsed_ms) / n) if n else int(elapsed_ms)
+        e["zap_wait_last"] = float(wait_used)
+        e["last_update"] = datetime.now().isoformat()
+        _save_switch_stats()
+
+def record_stream_start(service_ref, ok, attempts, no_latency, channel_name=None):
+    """ffmpeg-Startergebnis erfassen. Bei NoLatency-Fehlern lernt der Store
+    den Probesize für diesen Sender in kleinen Schritten hoch."""
+    g = get_switch_global()
+    with _switch_stats_lock:
+        e = _switch_entry(service_ref)
+        if channel_name:
+            e["name"] = channel_name
+        s = e["start"]
+        s["retries"] = s.get("retries", 0) + max(0, attempts - 1)
+        if ok:
+            s["ok"] = s.get("ok", 0) + 1
+            e["nolatency_fail_streak"] = 0
+        else:
+            s["fail"] = s.get("fail", 0) + 1
+            if no_latency:
+                e["nolatency_fail_streak"] = e.get("nolatency_fail_streak", 0) + 1
+                e["nolatency_fail_total"] = e.get("nolatency_fail_total", 0) + 1
+                # Schwelle überschritten → Probesize für diesen Sender anheben
+                if e["nolatency_fail_streak"] >= g["fail_threshold"]:
+                    cur = e.get("probesize") or g["nolat_probesize"]
+                    new = min(_PROBE_MAX, int(cur * 2))
+                    if new != cur:
+                        e["probesize"] = new
+                        log.info(f"Switch: Probesize für '{e.get('name') or service_ref[:30]}' "
+                                 f"erhöht {cur} → {new} (NoLatency-Fehler)")
+                    e["nolatency_fail_streak"] = 0
+        e["last_update"] = datetime.now().isoformat()
+        _save_switch_stats()
+
+def get_switch_stats_snapshot():
+    with _switch_stats_lock:
+        return copy.deepcopy(_load_switch_stats())
+
+def set_switch_override(service_ref, no_latency=None, zap_wait=None, probesize=None, channel_name=None):
+    """Manuellen Per-Sender-Override setzen. Wert None löscht den Override."""
+    with _switch_stats_lock:
+        e = _switch_entry(service_ref)
+        if channel_name:
+            e["name"] = channel_name
+        e["no_latency"] = no_latency
+        e["zap_wait"] = zap_wait
+        if probesize is not None:
+            e["probesize"] = int(probesize) if probesize else None
+        e["last_update"] = datetime.now().isoformat()
+        _save_switch_stats()
+
+def reset_switch_stats(service_ref=None):
+    """Setzt gelernte Werte/Statistik zurück (ein Sender oder alle)."""
+    global _switch_stats
+    with _switch_stats_lock:
+        stats = _load_switch_stats()
+        if service_ref is None:
+            _switch_stats = {}
+        else:
+            stats.pop(_norm_ref(service_ref), None)
+        _save_switch_stats()
+
+
 # ── Favorites Management ──────────────────────────────────
 
 favorites_lock = threading.Lock()
@@ -617,22 +804,29 @@ def is_receiver_online(rid):
         return False
 
 
-def do_zap(rid, service_ref):
+def do_zap(rid, service_ref, channel_name=None):
     r = get_receiver_by_id(rid)
     if not r:
         return False
     encoded = urllib.parse.quote(service_ref, safe=":@")
     url = f"http://{r['ip']}:{r['port']}/web/zap?sRef={encoded}"
+    t0 = time.time()
+    wait_used = get_switch_settings(service_ref)["zap_wait"]
     try:
         with urllib.request.urlopen(url, timeout=5) as resp:
             body = resp.read().decode("utf-8", errors="replace")
+            elapsed_ms = (time.time() - t0) * 1000
             if "<e2state>True</e2state>" in body:
-                log.info(f"ZAP OK → '{rid}' → {service_ref}")
+                log.info(f"ZAP OK → '{rid}' → {service_ref} ({elapsed_ms:.0f}ms)")
+                record_zap_result(service_ref, True, elapsed_ms, wait_used, channel_name)
                 return True
             log.warning(f"ZAP FAILED: {body[:100]}")
+            record_zap_result(service_ref, False, elapsed_ms, wait_used, channel_name)
             return False
     except Exception as e:
+        elapsed_ms = (time.time() - t0) * 1000
         log.error(f"ZAP ERROR: {e}")
+        record_zap_result(service_ref, False, elapsed_ms, wait_used, channel_name)
         return False
 
 
@@ -773,8 +967,11 @@ def stream_passthrough(rid, service_ref, wfile, use_chunked=False):
     return bytes_sent
 
 
-def build_ffmpeg_cmd(rid, service_ref, tp):
-    """Baut ffmpeg Kommando basierend auf Transcode-Profil."""
+def build_ffmpeg_cmd(rid, service_ref, tp, probesize=None, analyzeduration=None, low_latency=False):
+    """Baut ffmpeg Kommando basierend auf Transcode-Profil.
+
+    probesize/analyzeduration: optionale Overrides (Umschalt-Tuning). low_latency
+    setzt zusätzlich Input-Flags für minimales Buffering (schnelleres Umschalten)."""
     r = get_receiver_by_id(rid)
     encoded_ref = urllib.parse.quote(service_ref, safe=":@")
     input_url = f"http://{r['ip']}:{r['stream_port']}/{encoded_ref}"
@@ -786,17 +983,26 @@ def build_ffmpeg_cmd(rid, service_ref, tp):
     height = tp.get("height", 720)
     preset = tp.get("preset", "superfast")
 
+    ps = str(int(probesize)) if probesize else "15000000"
+    ad = str(int(analyzeduration)) if analyzeduration else "15000000"
+    fflags = "+discardcorrupt+genpts+nobuffer" if low_latency else "+discardcorrupt+genpts"
+
     base = [
         "ffmpeg", "-loglevel", "warning",
         # Stalled Receiver darf ffmpeg nicht ewig blockieren: nach 20s ohne Daten
         # bricht der HTTP-Input ab → Prozess endet → Tuner/ref_lock werden freigegeben.
         "-rw_timeout", "20000000",
-        "-fflags", "+discardcorrupt+genpts",
+        "-fflags", fflags,
         "-err_detect", "ignore_err",
-        # Großzügiges Probe-Fenster: manche HD-Sender (z.B. VOX HD) liefern die
-        # Stream-Parameter erst spät. Zu kleine Werte → ffmpeg erkennt Video/Audio
-        # nicht ("unspecified size / unknown codec") und schreibt 0 Bytes.
-        "-probesize", "15000000", "-analyzeduration", "15000000",
+    ]
+    if low_latency:
+        base += ["-flags", "low_delay"]
+    base += [
+        # Probe-Fenster: manche HD-Sender (z.B. VOX HD) liefern die Stream-Parameter
+        # erst spät. Zu kleine Werte → ffmpeg erkennt Video/Audio nicht
+        # ("unspecified size / unknown codec") und schreibt 0 Bytes. Im NoLatency-Modus
+        # bewusst klein für schnelles Umschalten; der Store lernt bei Fehlern hoch.
+        "-probesize", ps, "-analyzeduration", ad,
         "-i", input_url,
         "-map", "0:v:0", "-map", "0:a:0",
     ]
@@ -869,58 +1075,132 @@ def build_ffmpeg_cmd(rid, service_ref, tp):
     return base + video_args + audio_args + fmt + ["-"], content_type
 
 
-def stream_transcoded(rid, service_ref, tp, wfile, use_chunked=False):
-    cmd, content_type = build_ffmpeg_cmd(rid, service_ref, tp)
+def stream_transcoded(rid, service_ref, tp, wfile, use_chunked=False, channel_name=None):
     label = tp.get("label", "?")
-    log.info(f"ffmpeg START: {service_ref} [{label}]")
+    sw = get_switch_settings(service_ref)
+    monitor_sec = max(1.0, sw["monitor_sec"])
+    max_attempts = 1 + max(0, sw["max_retries"])
+    probesize = sw["probesize"]
+    analyzeduration = sw["analyzeduration"]
+    no_latency = sw["no_latency"]
 
     proc = None
     bytes_sent = 0
-    stderr_lines = []
+    attempts = 0
+    # content_type ist probe-unabhängig; sicherer Default bis erster Build
+    _, content_type = build_ffmpeg_cmd(rid, service_ref, tp)
 
-    def read_stderr(pipe):
+    def read_stderr(pipe, sink):
         try:
             for line in pipe:
                 l = line.decode("utf-8", errors="replace").strip()
                 if l:
-                    stderr_lines.append(l)
+                    sink.append(l)
                     if any(kw in l.lower() for kw in ["scrambled", "conditional access"]):
                         log.warning(f"SCRAMBLED: {l}")
-                    elif l:
+                    else:
                         log.debug(f"ffmpeg: {l}")
-        except:
+        except Exception:
             pass
 
+    def _kill(p):
+        try:
+            p.terminate()
+            p.wait(timeout=3)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
-        with stream_processes_lock:
-            stream_processes[rid] = proc
+        # ── Phase 1: ffmpeg starten und Fehlstart erkennen ───────────────
+        # Ziel: einen *fehlgeschlagenen* Start (Prozess stirbt / liefert nichts)
+        # erkennen und transparent mit größerem Probesize neu starten — solange
+        # noch nichts an den Client ging. Ein noch LAUFENDES ffmpeg, das nur
+        # langsam probed (großer Probesize bei hoher Bitrate), wird NICHT gekillt,
+        # sonst würde der Stream nie starten.
+        first_chunk = None
+        while attempts < max_attempts:
+            attempts += 1
+            cmd, content_type = build_ffmpeg_cmd(
+                rid, service_ref, tp,
+                probesize=probesize, analyzeduration=analyzeduration,
+                low_latency=no_latency,
+            )
+            log.info(f"ffmpeg START (try {attempts}/{max_attempts}, probe={probesize}): "
+                     f"{service_ref} [{label}]")
+            stderr_lines = []
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+            with stream_processes_lock:
+                stream_processes[rid] = proc
+            t = threading.Thread(target=read_stderr, args=(proc.stderr, stderr_lines), daemon=True)
+            t.start()
 
-        t = threading.Thread(target=read_stderr, args=(proc.stderr,), daemon=True)
-        t.start()
+            # Monitor-Fenster: auf erste Nutzdaten oder frühen Prozess-Tod warten
+            deadline = time.time() + monitor_sec
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    break  # ffmpeg vorzeitig beendet (Fehlstart)
+                remaining = max(0.0, deadline - time.time())
+                rlist, _, _ = select.select([proc.stdout], [], [], min(0.5, remaining))
+                if rlist:
+                    c = proc.stdout.read(CHUNK_SIZE)
+                    if c:
+                        first_chunk = c
+                        break
+                    break  # EOF ohne Daten → Prozess terminiert gleich
 
-        while True:
-            chunk = proc.stdout.read(CHUNK_SIZE)
-            if not chunk:
+            if first_chunk is not None:
+                break  # Erfolg: Daten fließen
+            if proc.poll() is None:
+                # Prozess lebt noch, probed nur langsam → beibehalten und unten
+                # per blockierendem Read auf die ersten Daten warten.
                 break
+
+            # Prozess ist ohne Daten gestorben → echter Fehlstart
+            t.join(timeout=1)
+            scrambled = any(
+                any(kw in l.lower() for kw in ["scrambled", "conditional access", "not authorized"])
+                for l in stderr_lines
+            )
+            _kill(proc)
+            with stream_processes_lock:
+                stream_processes.pop(rid, None)
+            proc = None
+            if scrambled:
+                record_stream_start(service_ref, False, attempts, no_latency, channel_name)
+                raise ScrambledStreamError("Channel is scrambled")
+            if attempts < max_attempts:
+                probesize = min(_PROBE_MAX, probesize * 2)
+                analyzeduration = min(_PROBE_MAX, max(analyzeduration, probesize))
+                log.warning(f"Switch: ffmpeg-Fehlstart (try {attempts}) — "
+                            f"Neustart mit Probesize {probesize}")
+
+        if proc is None:
+            # Alle Versuche gestorben
+            record_stream_start(service_ref, False, attempts, no_latency, channel_name)
+            raise ScrambledStreamError("Stream delivered no data (scrambled or unavailable)")
+
+        # Falls Prozess lebt aber noch keine Daten kamen (langsames Probing):
+        # blockierend auf den ersten Chunk warten (rw_timeout begrenzt das ffmpeg-seitig).
+        if first_chunk is None:
+            first_chunk = proc.stdout.read(CHUNK_SIZE)
+        if not first_chunk:
+            record_stream_start(service_ref, False, attempts, no_latency, channel_name)
+            raise ScrambledStreamError("Stream delivered no data (scrambled or unavailable)")
+
+        # ── Phase 2: Daten erhalten → Erfolg werten & normal streamen ────────
+        record_stream_start(service_ref, True, attempts, no_latency, channel_name)
+        chunk = first_chunk
+        while chunk:
             if use_chunked:
                 write_chunked(wfile, chunk)
             else:
                 wfile.write(chunk)
                 wfile.flush()
             bytes_sent += len(chunk)
-
-        # Check for scrambled after stream ends
-        if bytes_sent == 0:
-            t.join(timeout=2)
-            scrambled = any(
-                any(kw in l.lower() for kw in ["scrambled", "conditional access", "not authorized"])
-                for l in stderr_lines
-            )
-            if scrambled:
-                raise ScrambledStreamError("Channel is scrambled")
-            # Auch ohne explizite Scrambled-Meldung: 0 Bytes = Stream-Fehler
-            raise ScrambledStreamError("Stream delivered no data (scrambled or unavailable)")
+            chunk = proc.stdout.read(CHUNK_SIZE)
 
     except ScrambledStreamError:
         raise
@@ -930,14 +1210,7 @@ def stream_transcoded(rid, service_ref, tp, wfile, use_chunked=False):
         with stream_processes_lock:
             stream_processes.pop(rid, None)
         if proc:
-            try:
-                proc.terminate()
-                proc.wait(timeout=3)
-            except:
-                try:
-                    proc.kill()
-                except:
-                    pass
+            _kill(proc)
 
     log.info(f"ffmpeg END: {service_ref} — {bytes_sent/1024/1024:.1f} MB")
     return bytes_sent, content_type
@@ -2240,6 +2513,13 @@ const I18N = {
     "status.epg_updating": "EPG updating…",
     // Settings — Detail-Strings
     "set.rec_settings": "Recording Settings", "set.tuner_status": "Tuner Status",
+    "set.switch_tuning": "Switch Tuning", "set.switch_stats": "Per-Channel Statistics",
+    "set.switch_hint": "Speeds up channel switching (e.g. Plex). NoLatency starts ffmpeg with minimal probing; the zap wait is the pause after switching. Values act as global defaults — each channel is learned automatically (see table).",
+    "set.switch_nolatency": "NoLatency (global)",
+    "set.switch_nolatency_hint": "Start ffmpeg without heavy probing (faster, auto-raises on failures)",
+    "set.switch_zapwait": "Zap wait (s)", "set.switch_monitor": "Monitor window (s)",
+    "set.switch_retries": "Max restarts", "set.switch_nolat_probe": "NoLatency probesize",
+    "set.switch_fail_thresh": "Fail threshold (probesize↑)", "set.switch_reset_all": "Reset all",
     "set.active_recordings": "Active Recordings", "set.quick_rec": "Quick Record",
     "set.quick_rec_hint": "Select channel → current program shown → start recording.",
     "set.start_rec": "▶ Start recording", "set.receivers_card": "Receivers",
@@ -2381,6 +2661,13 @@ const I18N = {
     "status.online": "Online", "status.offline": "Offline",
     "status.epg_updating": "EPG wird aktualisiert…",
     "set.rec_settings": "Aufnahme-Einstellungen", "set.tuner_status": "Tuner-Status",
+    "set.switch_tuning": "Umschalt-Tuning", "set.switch_stats": "Per-Sender-Statistik",
+    "set.switch_hint": "Beschleunigt das Umschalten (z.B. Plex). NoLatency startet ffmpeg mit minimalem Probing; die Zap-Wartezeit ist die Pause nach dem Umschalten. Werte gelten global als Default — pro Sender wird automatisch gelernt (siehe Tabelle).",
+    "set.switch_nolatency": "NoLatency (global)",
+    "set.switch_nolatency_hint": "ffmpeg ohne großes Probing starten (schneller, lernt bei Fehlern automatisch hoch)",
+    "set.switch_zapwait": "Zap-Wartezeit (s)", "set.switch_monitor": "Monitor-Fenster (s)",
+    "set.switch_retries": "Max. Neustarts", "set.switch_nolat_probe": "NoLatency Probesize",
+    "set.switch_fail_thresh": "Fehler-Schwelle (Probesize↑)", "set.switch_reset_all": "Reset alle",
     "set.active_recordings": "Aktive Aufnahmen", "set.quick_rec": "Schnell-Aufnahme",
     "set.quick_rec_hint": "Kanal wählen → aktuelle Sendung wird angezeigt → Aufnahme starten.",
     "set.start_rec": "▶ Aufnahme starten", "set.receivers_card": "Receiver",
@@ -4467,7 +4754,7 @@ def build_help_ui():
         </div>
         <div>
           <b style="color:var(--accent2)">System &amp; Plex</b><br>
-          GET  /api/status<br>GET  /api/config<br>POST /api/config<br>GET  /api/logs?level=INFO<br>POST /api/log/level<br>GET  /api/plex/token<br>GET  /api/plex/sections<br>GET  /epg.xml<br>GET  /playlist.m3u
+          GET  /api/status<br>GET  /api/config<br>POST /api/config<br>GET  /api/switch/stats<br>POST /api/switch/settings<br>GET  /api/logs?level=INFO<br>POST /api/log/level<br>GET  /api/plex/token<br>GET  /api/plex/sections<br>GET  /epg.xml<br>GET  /playlist.m3u
         </div>
       </div>
     </div>
@@ -4477,7 +4764,14 @@ def build_help_ui():
       <div style="display:flex;flex-direction:column;gap:12px">
 
         <div style="border-left:3px solid var(--accent);padding-left:14px">
-          <b style="color:var(--accent);font-family:monospace;font-size:11px">v3.4.0</b>
+          <b style="color:var(--accent);font-family:monospace;font-size:11px">v3.7.0</b>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-07-12</span>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">Switch Tuning · NoLatency · Self-Learning</span>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Faster channel switching (esp. Plex): per-channel <b>NoLatency</b> mode starts ffmpeg with minimal probing + low-delay input flags, and the post-zap wait is now configurable (was a hardcoded 1s). ffmpeg is monitored during the first seconds — if no data flows the stream is transparently restarted with a larger probesize. Self-learning: repeated NoLatency failures raise a channel's probesize in small steps automatically. New per-channel statistics (zap ok/fail + avg ms, stream start ok/fail + retries) in Settings, plus <code>/api/switch/stats</code>, <code>/api/switch/settings</code> and <code>/api/switch/reset</code>.</div>
+        </div>
+
+        <div style="border-left:3px solid var(--border);padding-left:14px">
+          <b style="font-family:monospace;font-size:11px">v3.4.0</b>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-06-16</span>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">Compression · Progress/ETA · Pause · CPU Limit</span>
           <div style="font-size:11px;margin-top:4px;color:var(--muted)">Live progress bar with ETA and encode speed for the running conversion (ffmpeg <code>-progress</code> + ffprobe duration). Pause/Resume (SIGSTOP/SIGCONT — frees CPU instantly for streaming or a restart) and Cancel. CPU limit (% of cores → encoder threads + <code>nice</code>) plus a "run anytime" background mode that ignores the time window. Conversions now write to a <code>.mkv.part</code> temp file and are atomically renamed on success; leftover temp files from an interrupted run are cleaned up on startup so no half-finished <code>.mkv</code> is ever left behind.</div>
@@ -5450,6 +5744,57 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
     </div>
 
     <div class="card">
+      <div class="card-title">⚡ <span data-i18n="set.switch_tuning">Umschalt-Tuning</span></div>
+      <p class="card-desc" data-i18n="set.switch_hint">Beschleunigt das Umschalten (z.B. Plex). NoLatency startet ffmpeg mit minimalem Probing; die Zap-Wartezeit ist die Pause nach dem Umschalten. Werte gelten global als Default — pro Sender wird automatisch gelernt (siehe Tabelle).</p>
+      <table style="font-size:12px;border-collapse:collapse">
+        <tbody>
+          <tr>
+            <td style="color:var(--muted);padding:6px 12px 6px 0"><span data-i18n="set.switch_nolatency">NoLatency (global)</span></td>
+            <td>
+              <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text)">
+                <input type="checkbox" id="sw-no-latency">
+                <span data-i18n="set.switch_nolatency_hint">ffmpeg ohne großes Probing starten (schneller, lernt bei Fehlern automatisch hoch)</span>
+              </label>
+            </td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);padding:6px 12px 6px 0"><span data-i18n="set.switch_zapwait">Zap-Wartezeit (s)</span></td>
+            <td><input class="input" id="sw-zap-wait" type="number" step="0.1" min="0" style="width:100px"></td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);padding:6px 12px 6px 0"><span data-i18n="set.switch_monitor">Monitor-Fenster (s)</span></td>
+            <td><input class="input" id="sw-monitor" type="number" step="0.5" min="1" style="width:100px"></td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);padding:6px 12px 6px 0"><span data-i18n="set.switch_retries">Max. Neustarts</span></td>
+            <td><input class="input" id="sw-retries" type="number" step="1" min="0" style="width:100px"></td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);padding:6px 12px 6px 0"><span data-i18n="set.switch_nolat_probe">NoLatency Probesize</span></td>
+            <td><input class="input" id="sw-nolat-probe" type="number" step="100000" min="32" style="width:140px"></td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);padding:6px 12px 6px 0"><span data-i18n="set.switch_fail_thresh">Fehler-Schwelle (Probesize↑)</span></td>
+            <td><input class="input" id="sw-fail-thresh" type="number" step="1" min="1" style="width:100px"></td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="flex" style="margin-top:12px;align-items:center;gap:10px">
+        <button class="btn btn-primary" onclick="saveSwitchGlobal()">💾 <span data-i18n="common.save">Save</span></button>
+        <span id="sw-save-fb" style="font-size:12px;font-family:monospace;opacity:0;transition:opacity 0.2s"></span>
+      </div>
+
+      <div style="margin-top:18px;display:flex;align-items:center;justify-content:space-between;gap:10px">
+        <div class="card-title" style="margin:0;font-size:13px">📊 <span data-i18n="set.switch_stats">Per-Sender-Statistik</span></div>
+        <div style="display:flex;gap:8px">
+          <button class="btn" onclick="loadSwitchStats()">↺ <span data-i18n="common.refresh">Refresh</span></button>
+          <button class="btn" onclick="resetSwitch(null)">🗑 <span data-i18n="set.switch_reset_all">Reset alle</span></button>
+        </div>
+      </div>
+      <div id="sw-stats" style="margin-top:10px;overflow-x:auto">Lade…</div>
+    </div>
+
+    <div class="card">
       <div class="card-title">📡 <span data-i18n="set.tuner_status">Tuner Status</span></div>
       <div id="tuner-status">Lade…</div>
       <button class="btn" onclick="loadTunerStatus()" style="margin-top:10px">↺ <span data-i18n="common.refresh">Refresh</span></button>
@@ -5999,7 +6344,7 @@ function switchTab(name) {{
       if (d.running && !epgPollTimer) startEpgPolling();
     }});
   }}
-  if (name === 'recording') {{ loadTunerStatus(); loadRecordingStatus(); loadRecChannels(); loadCompressionStatus(); }}
+  if (name === 'recording') {{ loadTunerStatus(); loadRecordingStatus(); loadRecChannels(); loadCompressionStatus(); loadSwitchStats(); }}
 }}
 
 // ── Compression UI ──────────────────────────────────────────────────────────
@@ -6714,6 +7059,73 @@ function saveRecordingSettings() {{
   }});
 }}
 
+// ── Umschalt-Tuning ───────────────────────────────────
+function loadSwitchStats() {{
+  fetch('/api/switch/stats').then(r=>r.json()).then(d=>{{
+    const g = d.global || {{}};
+    const set = (id,v)=>{{ const el=document.getElementById(id); if(el){{ if(el.type==='checkbox') el.checked=!!v; else el.value=v; }} }};
+    set('sw-no-latency', g.no_latency);
+    set('sw-zap-wait', g.zap_wait);
+    set('sw-monitor', g.monitor_sec);
+    set('sw-retries', g.max_retries);
+    set('sw-nolat-probe', g.nolat_probesize);
+    set('sw-fail-thresh', g.fail_threshold);
+    const rows = d.senders || [];
+    const box = document.getElementById('sw-stats');
+    if (!rows.length) {{ box.innerHTML = '<div style="color:var(--muted);font-size:12px">Noch keine Daten — nach dem ersten Umschalten erscheinen hier Statistiken.</div>'; return; }}
+    let html = '<table style="width:100%;border-collapse:collapse;font-size:11px;font-family:monospace">'
+      + '<thead><tr style="text-align:left;color:var(--muted);border-bottom:1px solid var(--border)">'
+      + '<th style="padding:4px 8px 4px 0">Sender</th><th style="padding:4px 8px">Zap ok/fail</th><th style="padding:4px 8px">⌀ms</th>'
+      + '<th style="padding:4px 8px">Start ok/fail</th><th style="padding:4px 8px">Retries</th>'
+      + '<th style="padding:4px 8px">NoLat-Fails</th><th style="padding:4px 8px">Probesize</th><th style="padding:4px 8px">NoLat</th><th></th></tr></thead><tbody>';
+    for (const r of rows) {{
+      const nl = r.no_latency===null||r.no_latency===undefined ? '—' : (r.no_latency?'an':'aus');
+      const ps = r.probesize ? r.probesize.toLocaleString() : '—';
+      const failColor = r.zap_fail>0 || r.start_fail>0 ? 'var(--red)' : 'var(--text)';
+      html += `<tr style="border-bottom:1px solid var(--border)">`
+        + `<td style="padding:4px 8px 4px 0;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{r.name}}">${{r.name}}</td>`
+        + `<td style="padding:4px 8px;color:${{failColor}}">${{r.zap_ok}}/${{r.zap_fail}}</td>`
+        + `<td style="padding:4px 8px">${{r.zap_avg_ms}}</td>`
+        + `<td style="padding:4px 8px;color:${{failColor}}">${{r.start_ok}}/${{r.start_fail}}</td>`
+        + `<td style="padding:4px 8px">${{r.start_retries}}</td>`
+        + `<td style="padding:4px 8px">${{r.nolatency_fail_total}}</td>`
+        + `<td style="padding:4px 8px">${{ps}}</td>`
+        + `<td style="padding:4px 8px">${{nl}}</td>`
+        + `<td style="padding:4px 8px"><button class="btn" style="padding:2px 8px;font-size:10px" onclick="resetSwitch('${{encodeURIComponent(r.ref)}}')">🗑</button></td>`
+        + `</tr>`;
+    }}
+    html += '</tbody></table>';
+    box.innerHTML = html;
+  }}).catch(e=>{{ const box=document.getElementById('sw-stats'); if(box) box.innerHTML='<div style="color:var(--red)">Fehler: '+e+'</div>'; }});
+}}
+
+function saveSwitchGlobal() {{
+  const fb = document.getElementById('sw-save-fb');
+  const setFb = (msg,color)=>{{ if(fb){{ fb.textContent=msg; fb.style.color=color; fb.style.opacity='1'; setTimeout(()=>{{fb.style.opacity='0';}},4000); }} }};
+  setFb('Speichere…','var(--muted)');
+  const g = {{
+    no_latency: document.getElementById('sw-no-latency').checked,
+    zap_wait_sec: parseFloat(document.getElementById('sw-zap-wait').value)||0,
+    switch_monitor_sec: parseFloat(document.getElementById('sw-monitor').value)||10,
+    switch_max_retries: parseInt(document.getElementById('sw-retries').value)||0,
+    no_latency_probesize: parseInt(document.getElementById('sw-nolat-probe').value)||500000,
+    nolatency_fail_threshold: parseInt(document.getElementById('sw-fail-thresh').value)||3,
+  }};
+  apiPost('/api/switch/settings', {{global: g}}).then(d=>{{
+    if (d && d.ok) {{ showToast('✓ Umschalt-Einstellungen gespeichert','success'); setFb('✓ Gespeichert','var(--green)'); }}
+    else {{ showToast('Fehler beim Speichern','error'); setFb('✕ Fehler','var(--red)'); }}
+  }}).catch(e=>{{ showToast('Fehler beim Speichern','error'); setFb('✕ Fehler: '+e,'var(--red)'); }});
+}}
+
+function resetSwitch(ref) {{
+  const body = ref ? {{ref: decodeURIComponent(ref)}} : {{}};
+  if (!ref && !confirm('Wirklich ALLE gelernten Umschalt-Werte und Statistiken zurücksetzen?')) return;
+  apiPost('/api/switch/reset', body).then(d=>{{
+    if (d && d.ok) {{ showToast('✓ Zurückgesetzt','success'); loadSwitchStats(); }}
+    else showToast('Fehler','error');
+  }}).catch(()=>showToast('Fehler','error'));
+}}
+
 // ── Konfig CRUD ───────────────────────────────────────
 function showModal(title, fields, onSave) {{
   let existing = document.getElementById('crud-modal');
@@ -7394,6 +7806,35 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"ok": ok})
             return
 
+        if parsed.path == "/api/switch/settings":
+            # Globale Umschalt-Defaults und/oder Per-Sender-Override setzen.
+            g = data.get("global")
+            if isinstance(g, dict):
+                cfg = get_config()
+                for k in ("no_latency", "zap_wait_sec", "probe_default",
+                          "no_latency_probesize", "no_latency_analyzeduration",
+                          "switch_monitor_sec", "switch_max_retries",
+                          "nolatency_fail_threshold"):
+                    if k in g and g[k] is not None:
+                        cfg[k] = g[k]
+                update_config(cfg)
+            ref = data.get("ref")
+            if ref:
+                set_switch_override(
+                    ref,
+                    no_latency=data.get("no_latency"),
+                    zap_wait=data.get("zap_wait"),
+                    probesize=data.get("probesize"),
+                    channel_name=data.get("name"),
+                )
+            self.send_json({"ok": True})
+            return
+
+        if parsed.path == "/api/switch/reset":
+            reset_switch_stats(data.get("ref"))
+            self.send_json({"ok": True})
+            return
+
         if parsed.path == "/api/favorites":
             if not isinstance(data, list):
                 self.send_json({"ok": False, "message": "Expected list"})
@@ -7851,6 +8292,35 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/config":
             self.send_json(get_config())
+            return
+
+        if path == "/api/switch/stats":
+            g = get_switch_global()
+            stats = get_switch_stats_snapshot()
+            # Nach Aktivität sortiert (meiste Zaps zuerst)
+            rows = []
+            for ref, e in stats.items():
+                z = e.get("zap", {})
+                s = e.get("start", {})
+                rows.append({
+                    "ref": ref,
+                    "name": e.get("name") or ref[:40],
+                    "no_latency": e.get("no_latency"),
+                    "zap_wait": e.get("zap_wait"),
+                    "probesize": e.get("probesize"),
+                    "nolatency_fail_streak": e.get("nolatency_fail_streak", 0),
+                    "nolatency_fail_total": e.get("nolatency_fail_total", 0),
+                    "zap_ok": z.get("ok", 0),
+                    "zap_fail": z.get("fail", 0),
+                    "zap_avg_ms": z.get("avg_ms", 0),
+                    "zap_last_ms": z.get("last_ms", 0),
+                    "start_ok": s.get("ok", 0),
+                    "start_fail": s.get("fail", 0),
+                    "start_retries": s.get("retries", 0),
+                    "last_update": e.get("last_update"),
+                })
+            rows.sort(key=lambda r: (r["zap_ok"] + r["zap_fail"]), reverse=True)
+            self.send_json({"global": g, "senders": rows})
             return
 
         if path == "/api/favorites":
@@ -8437,12 +8907,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 acquire_receiver(rid, client_ip, service_ref, channel_name)
 
             try:
-                if not do_zap(rid, service_ref):
+                if not do_zap(rid, service_ref, channel_name):
                     self.send_text("Zap fehlgeschlagen", 502)
                     return
 
-                # Kurz waitingn damit Receiver umschaltet
-                time.sleep(1.0)
+                # Warten bis Receiver umgeschaltet hat — pro Sender konfigurierbar
+                # (globaler Default zap_wait_sec, Override im Switch-Store).
+                zap_wait = get_switch_settings(service_ref)["zap_wait"]
+                if zap_wait > 0:
+                    time.sleep(zap_wait)
 
                 if tp.get("codec") == "pass":
                     content_type = "video/mp2t"
@@ -8482,7 +8955,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 if tp.get("codec") == "pass":
                     stream_passthrough(rid, service_ref, self.wfile, use_chunked)
                 else:
-                    stream_transcoded(rid, service_ref, tp, self.wfile, use_chunked)
+                    stream_transcoded(rid, service_ref, tp, self.wfile, use_chunked, channel_name)
 
             except ScrambledStreamError:
                 log.warning(f"SCRAMBLED: {service_ref}")
