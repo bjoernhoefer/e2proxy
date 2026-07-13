@@ -7751,7 +7751,7 @@ function loadFavLogos() {{
       const badge = l.custom ? '<span style="font-size:9px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:1px 4px;margin-left:6px">' + t('set.fav_logos_custom') + '</span>' : '';
       const resetBtn = l.custom ? '<button class="btn" style="font-size:10px" data-name="' + nm + '" onclick="resetFavLogo(this)">↺ ' + t('set.reset') + '</button>' : '';
       const img = l.logo_url
-        ? '<img src="' + l.logo_url + '" title="' + t('set.fav_logos_zoom') + '" onclick="showLogoModal(this.src, this.getAttribute(\'data-nm\'))" data-nm="' + nm + '" style="width:52px;height:32px;object-fit:contain;background:var(--surface2);border:1px solid var(--border);border-radius:4px;cursor:zoom-in" onerror="this.style.opacity=0.2">'
+        ? '<img src="' + l.logo_url + '" title="' + t('set.fav_logos_zoom') + '" onclick="showLogoModal(this.src, this.dataset.nm)" data-nm="' + nm + '" style="width:52px;height:32px;object-fit:contain;background:var(--surface2);border:1px solid var(--border);border-radius:4px;cursor:zoom-in" onerror="this.style.opacity=0.2">'
         : '<div style="width:52px;height:32px;background:var(--surface2);border:1px solid var(--border);border-radius:4px"></div>';
       return '<div class="fav-logo-row" data-name="' + nm + '" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;border:1px solid var(--border);border-radius:6px;padding:6px 8px;background:var(--surface)">' +
         img +
