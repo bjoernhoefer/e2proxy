@@ -315,53 +315,76 @@ def custom_logo_local_url(name):
         ver = 0
     return f"http://{host}:{port}/custom_logos/{fname}?v={ver}"
 
+def _looks_like_html(data):
+    head = data[:512].lstrip().lower()
+    return head.startswith(b"<!doctype html") or head.startswith(b"<html") or b"<head" in head
+
 def _fetch_image_bytes(url, max_bytes=8 * 1024 * 1024):
     """Lädt ein Bild von einer URL herunter (begrenzt auf max_bytes)."""
     if not re.match(r"^https?://", url, re.I):
         raise ValueError("Nur http(s)-URLs erlaubt")
     req = urllib.request.Request(url, headers={"User-Agent": "e2proxy/1.0"})
     with urllib.request.urlopen(req, timeout=15) as resp:
+        ctype = (resp.headers.get("Content-Type") or "").lower()
         data = resp.read(max_bytes + 1)
     if len(data) > max_bytes:
         raise ValueError("Bild zu groß (max 8 MB)")
     if len(data) < 100:
         raise ValueError("Bild leer oder ungültig")
+    if "text/html" in ctype or _looks_like_html(data):
+        raise ValueError("URL liefert eine Webseite, kein Bild. Bitte die direkte "
+                         "Bild-URL verwenden (Rechtsklick aufs Bild, Bildadresse kopieren).")
     return data
 
 def convert_and_store_custom_logo(name, img_bytes):
-    """Konvertiert ein beliebiges Bild via ffmpeg nach PNG (max. 400px breit,
-    Seitenverhältnis erhalten) und speichert es als Custom-Logo für 'name'.
-    Wirft bei Fehler eine Exception."""
+    """Konvertiert ein beliebiges Bild (inkl. SVG) via ffmpeg nach PNG
+    (max. 400px breit, Seitenverhältnis erhalten) und speichert es als
+    Custom-Logo für 'name'. Wirft bei Fehler eine Exception."""
     if not name:
         raise ValueError("Sendername fehlt")
     if not img_bytes or len(img_bytes) < 100:
         raise ValueError("Kein Bild empfangen")
+    if _looks_like_html(img_bytes):
+        raise ValueError("Die Datei ist eine HTML-Seite, kein Bild.")
     os.makedirs(CUSTOM_LOGO_DIR, exist_ok=True)
     out = custom_logo_path(name)
     tmp = out + ".tmp.png"
-    cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-i", "pipe:0",
-        "-vf", "scale='if(gt(iw,400),400,iw)':-2",
-        "-frames:v", "1",
-        "-f", "image2", tmp,
-    ]
+    # ffmpeg über eine echte (seekbare) Datei statt pipe:0 füttern — nur so
+    # erkennt der Demuxer Formate wie SVG zuverlässig.
+    tmp_in = out + ".in"
     try:
-        proc = subprocess.run(cmd, input=img_bytes,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              timeout=30)
-    except FileNotFoundError:
-        raise RuntimeError("ffmpeg nicht gefunden")
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("Bildkonvertierung Timeout")
-    if proc.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) < 100:
-        err = (proc.stderr or b"").decode("utf-8", "replace")[:300]
+        with open(tmp_in, "wb") as f:
+            f.write(img_bytes)
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", tmp_in,
+            "-vf", "scale='if(gt(iw,400),400,iw)':-2",
+            "-frames:v", "1",
+            "-f", "image2", tmp,
+        ]
         try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
+            proc = subprocess.run(cmd,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  timeout=30)
+        except FileNotFoundError:
+            raise RuntimeError("ffmpeg nicht gefunden")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Bildkonvertierung Timeout")
+        if proc.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) < 100:
+            err = (proc.stderr or b"").decode("utf-8", "replace").strip()
+            err_short = err.splitlines()[-1][:180] if err else "unbekannter Fehler"
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            raise RuntimeError(f"Bild konnte nicht konvertiert werden ({err_short})")
+    finally:
+        try:
+            if os.path.exists(tmp_in):
+                os.remove(tmp_in)
         except OSError:
             pass
-        raise RuntimeError(f"Konvertierung fehlgeschlagen: {err or 'unbekannter Fehler'}")
     os.replace(tmp, out)
     with custom_logos_lock:
         mapping = load_custom_logos()
@@ -7768,6 +7791,7 @@ function loadFavLogos() {{
 function _favLogoResult(ok, msg) {{
   const fb = document.getElementById('fav-logo-fb');
   if (fb) fb.textContent = ok ? ('✓ ' + t('set.fav_logos_done')) : ('✗ ' + (msg || 'Fehler'));
+  try {{ showToast(ok ? t('set.fav_logos_done') : (msg || 'Fehler'), ok ? 'success' : 'error'); }} catch(e) {{}}
 }}
 
 function showLogoModal(src, name) {{
