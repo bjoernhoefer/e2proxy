@@ -2711,6 +2711,7 @@ const I18N = {
     "set.fav_logos_upload": "Upload", "set.fav_logos_done": "Logo saved",
     "set.fav_logos_working": "Working…", "set.fav_logos_need_url": "Please enter a URL",
     "set.fav_logos_too_big": "Image too large (max 8 MB)",
+    "set.fav_logos_zoom": "Click to enlarge",
     "set.appearance": "Appearance", "set.appearance_hint": "Switch between dark and light theme. Stored in the browser.",
     "set.log_level_hint": "Controls which log entries are shown. Applies immediately without restart. The RAM buffer always keeps the last 500 entries.",
     "set.api_log_hint": "Logs all API requests persistently in",
@@ -2865,6 +2866,7 @@ const I18N = {
     "set.fav_logos_upload": "Hochladen", "set.fav_logos_done": "Logo gespeichert",
     "set.fav_logos_working": "Wird verarbeitet…", "set.fav_logos_need_url": "Bitte eine URL angeben",
     "set.fav_logos_too_big": "Bild zu groß (max 8 MB)",
+    "set.fav_logos_zoom": "Zum Vergrößern klicken",
     "set.appearance": "Darstellung", "set.appearance_hint": "Zwischen dunklem und hellem Design wechseln. Wird im Browser gespeichert.",
     "set.log_level_hint": "Steuert welche Log-Einträge angezeigt werden. Wirkt sofort ohne Neustart. Im RAM-Buffer werden immer alle 500 letzten Einträge gespeichert.",
     "set.api_log_hint": "Protokolliert alle API-Anfragen persistent in",
@@ -6346,6 +6348,11 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
       </div>
     </div>
 
+    <div id="logo-modal" onclick="closeLogoModal()" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.8);align-items:center;justify-content:center;flex-direction:column;gap:12px;cursor:zoom-out">
+      <img id="logo-modal-img" src="" alt="" style="max-width:80vw;max-height:75vh;object-fit:contain;background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px;box-shadow:0 8px 40px rgba(0,0,0,0.6)">
+      <div id="logo-modal-name" style="color:#fff;font-family:monospace;font-size:13px"></div>
+    </div>
+
   </div>
 
   <!-- ── TAB: EPG ───────────────────────────────────── -->
@@ -7744,7 +7751,7 @@ function loadFavLogos() {{
       const badge = l.custom ? '<span style="font-size:9px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:1px 4px;margin-left:6px">' + t('set.fav_logos_custom') + '</span>' : '';
       const resetBtn = l.custom ? '<button class="btn" style="font-size:10px" data-name="' + nm + '" onclick="resetFavLogo(this)">↺ ' + t('set.reset') + '</button>' : '';
       const img = l.logo_url
-        ? '<img src="' + l.logo_url + '" style="width:52px;height:32px;object-fit:contain;background:var(--surface2);border:1px solid var(--border);border-radius:4px" onerror="this.style.opacity=0.2">'
+        ? '<img src="' + l.logo_url + '" title="' + t('set.fav_logos_zoom') + '" onclick="showLogoModal(this.src, this.getAttribute(\'data-nm\'))" data-nm="' + nm + '" style="width:52px;height:32px;object-fit:contain;background:var(--surface2);border:1px solid var(--border);border-radius:4px;cursor:zoom-in" onerror="this.style.opacity=0.2">'
         : '<div style="width:52px;height:32px;background:var(--surface2);border:1px solid var(--border);border-radius:4px"></div>';
       return '<div class="fav-logo-row" data-name="' + nm + '" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;border:1px solid var(--border);border-radius:6px;padding:6px 8px;background:var(--surface)">' +
         img +
@@ -7762,6 +7769,25 @@ function _favLogoResult(ok, msg) {{
   const fb = document.getElementById('fav-logo-fb');
   if (fb) fb.textContent = ok ? ('✓ ' + t('set.fav_logos_done')) : ('✗ ' + (msg || 'Fehler'));
 }}
+
+function showLogoModal(src, name) {{
+  const m = document.getElementById('logo-modal');
+  if (!m || !src) return;
+  document.getElementById('logo-modal-img').src = src;
+  document.getElementById('logo-modal-name').textContent = name || '';
+  m.style.display = 'flex';
+}}
+
+function closeLogoModal() {{
+  const m = document.getElementById('logo-modal');
+  if (m) m.style.display = 'none';
+  const img = document.getElementById('logo-modal-img');
+  if (img) img.src = '';
+}}
+
+document.addEventListener('keydown', function(e) {{
+  if (e.key === 'Escape') closeLogoModal();
+}});
 
 function setFavLogoUrl(btn) {{
   const row = btn.closest('.fav-logo-row');
