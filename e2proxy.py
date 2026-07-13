@@ -491,7 +491,7 @@ def get_switch_global():
     c = get_config()
     return {
         "no_latency":            bool(c.get("no_latency", False)),
-        "zap_wait":              float(c.get("zap_wait_sec", 2.0)),
+        "zap_wait":              float(c.get("zap_wait_sec", 1.0)),
         "probe_default":         int(c.get("probe_default", _PROBE_DEFAULT)),
         "nolat_probesize":       int(c.get("no_latency_probesize", _NOLAT_PROBE_DEFAULT)),
         "nolat_analyzeduration": int(c.get("no_latency_analyzeduration", _NOLAT_PROBE_DEFAULT)),
@@ -1114,11 +1114,14 @@ def stream_transcoded(rid, service_ref, tp, wfile, use_chunked=False, channel_na
                 pass
 
     try:
-        # ── Phase 1: ffmpeg starten und auf erste Daten „überwachen" ──────
-        # Solange noch nichts an den Client ging, dürfen wir bei ausbleibendem
-        # Datenfluss transparent neu starten (mit eskaliertem Probesize).
+        # ── Phase 1: ffmpeg starten und Fehlstart erkennen ───────────────
+        # Ziel: einen *fehlgeschlagenen* Start (Prozess stirbt / liefert nichts)
+        # erkennen und transparent mit größerem Probesize neu starten — solange
+        # noch nichts an den Client ging. Ein noch LAUFENDES ffmpeg, das nur
+        # langsam probed (großer Probesize bei hoher Bitrate), wird NICHT gekillt,
+        # sonst würde der Stream nie starten.
         first_chunk = None
-        while attempts < max_attempts and first_chunk is None:
+        while attempts < max_attempts:
             attempts += 1
             cmd, content_type = build_ffmpeg_cmd(
                 rid, service_ref, tp,
@@ -1134,11 +1137,11 @@ def stream_transcoded(rid, service_ref, tp, wfile, use_chunked=False, channel_na
             t = threading.Thread(target=read_stderr, args=(proc.stderr, stderr_lines), daemon=True)
             t.start()
 
-            # Auf erste Nutzdaten warten (select mit Timeout-Fenster)
+            # Monitor-Fenster: auf erste Nutzdaten oder frühen Prozess-Tod warten
             deadline = time.time() + monitor_sec
             while time.time() < deadline:
                 if proc.poll() is not None:
-                    break  # ffmpeg vorzeitig beendet (z.B. Verbindungsfehler)
+                    break  # ffmpeg vorzeitig beendet (Fehlstart)
                 remaining = max(0.0, deadline - time.time())
                 rlist, _, _ = select.select([proc.stdout], [], [], min(0.5, remaining))
                 if rlist:
@@ -1146,12 +1149,16 @@ def stream_transcoded(rid, service_ref, tp, wfile, use_chunked=False, channel_na
                     if c:
                         first_chunk = c
                         break
-                    break  # EOF ohne Daten
+                    break  # EOF ohne Daten → Prozess terminiert gleich
 
             if first_chunk is not None:
+                break  # Erfolg: Daten fließen
+            if proc.poll() is None:
+                # Prozess lebt noch, probed nur langsam → beibehalten und unten
+                # per blockierendem Read auf die ersten Daten warten.
                 break
 
-            # Kein Datenfluss → scrambled prüfen, Prozess killen, ggf. neu starten
+            # Prozess ist ohne Daten gestorben → echter Fehlstart
             t.join(timeout=1)
             scrambled = any(
                 any(kw in l.lower() for kw in ["scrambled", "conditional access", "not authorized"])
@@ -1167,14 +1174,23 @@ def stream_transcoded(rid, service_ref, tp, wfile, use_chunked=False, channel_na
             if attempts < max_attempts:
                 probesize = min(_PROBE_MAX, probesize * 2)
                 analyzeduration = min(_PROBE_MAX, max(analyzeduration, probesize))
-                log.warning(f"Switch: keine Daten in {monitor_sec:.0f}s "
-                            f"(try {attempts}) — Neustart mit Probesize {probesize}")
+                log.warning(f"Switch: ffmpeg-Fehlstart (try {attempts}) — "
+                            f"Neustart mit Probesize {probesize}")
 
-        if first_chunk is None:
+        if proc is None:
+            # Alle Versuche gestorben
             record_stream_start(service_ref, False, attempts, no_latency, channel_name)
             raise ScrambledStreamError("Stream delivered no data (scrambled or unavailable)")
 
-        # ── Phase 2: Erste Daten erhalten → Erfolg werten & normal streamen ──
+        # Falls Prozess lebt aber noch keine Daten kamen (langsames Probing):
+        # blockierend auf den ersten Chunk warten (rw_timeout begrenzt das ffmpeg-seitig).
+        if first_chunk is None:
+            first_chunk = proc.stdout.read(CHUNK_SIZE)
+        if not first_chunk:
+            record_stream_start(service_ref, False, attempts, no_latency, channel_name)
+            raise ScrambledStreamError("Stream delivered no data (scrambled or unavailable)")
+
+        # ── Phase 2: Daten erhalten → Erfolg werten & normal streamen ────────
         record_stream_start(service_ref, True, attempts, no_latency, channel_name)
         chunk = first_chunk
         while chunk:
