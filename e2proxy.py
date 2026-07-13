@@ -1446,6 +1446,47 @@ def load_epg_from_disk():
     return None, 0
 
 
+_EPG_CHANNEL_RE = re.compile(
+    r'  <channel id="([^"]*)">\n'
+    r'    <display-name>(.*?)</display-name>\n'
+    r'(?:    <icon src="[^"]*"/>\n)?'
+    r'  </channel>')
+
+
+def apply_custom_logos_to_epg_cache():
+    """Aktualisiert die <icon>-Einträge im bereits gecachten EPG-XML anhand der
+    aktuellen Logo-Auflösung (Custom-Logo > lokaler Cache > URL).
+
+    Das EPG-XML wird nur bei einem vollständigen EPG-Run neu gebaut und danach
+    24 h gecached. Ohne diese Funktion würden neu hinterlegte Custom-Logos erst
+    beim nächsten Run im Plex-Guide erscheinen. Der Patch ist günstig (Regex auf
+    den Kanalköpfen) und lässt die Event-Daten unangetastet."""
+    with epg_cache_lock:
+        xml = epg_cache["xml"]
+    if not xml:
+        return False
+
+    def _unescape(s):
+        return s.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+
+    def _repl(m):
+        cid, name_esc = m.group(1), m.group(2)
+        logo = get_logo_for_epg(_unescape(name_esc))
+        block = f'  <channel id="{cid}">\n    <display-name>{name_esc}</display-name>\n'
+        if logo:
+            block += f'    <icon src="{logo}"/>\n'
+        block += '  </channel>'
+        return block
+
+    new_xml, n = _EPG_CHANNEL_RE.subn(_repl, xml)
+    if new_xml != xml:
+        with epg_cache_lock:
+            epg_cache["xml"] = new_xml
+        save_epg_to_disk(new_xml)
+        log.info(f"EPG-Logos im Cache aktualisiert ({n} Kanäle gepatcht)")
+    return True
+
+
 def fetch_epg_from_receiver(favorites_only=False):
     """Holt EPG von allen Bouquets vom Receiver und konvertiert nach XMLTV."""
     receivers = get_receivers()
@@ -4964,7 +5005,7 @@ def build_help_ui():
           <b style="color:var(--accent);font-family:monospace;font-size:11px">v3.8.0</b>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-07-13</span>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">Editable favorite logos</span>
-          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Favorite channel logos can now be edited under <b>Settings → Maintenance</b>. For each favorite you can upload an image or enter a URL; the image is converted with ffmpeg to the correct format (PNG, max 400px wide, aspect preserved) and stored locally. Custom logos take precedence over the built-in logo database and cache for both the M3U playlist and the XMLTV EPG, and can be reset to fall back to the automatic logo. New endpoints <code>/api/favorites/logos</code>, <code>/api/favorites/logo</code> and <code>/api/favorites/logo/reset</code>; custom logos are served at <code>/custom_logos/</code> and stored in <code>/data/custom_logos/</code>.</div>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Favorite channel logos can now be edited under <b>Settings → Maintenance</b>. For each favorite you can upload an image or enter a URL; the image is converted with ffmpeg to the correct format (PNG, max 400px wide, aspect preserved) and stored locally. Custom logos take precedence over the built-in logo database and cache for both the M3U playlist and the XMLTV EPG, and can be reset to fall back to the automatic logo. New endpoints <code>/api/favorites/logos</code>, <code>/api/favorites/logo</code> and <code>/api/favorites/logo/reset</code>; custom logos are served at <code>/custom_logos/</code> and stored in <code>/data/custom_logos/</code>. Custom logos are now also injected into the cached XMLTV EPG immediately (on change and at startup), so they show up in Plex without waiting for the next full EPG run.</div>
         </div>
 
         <div style="border-left:3px solid var(--border);padding-left:14px">
@@ -8193,6 +8234,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "message": "Weder URL noch Bild angegeben"})
                     return
                 convert_and_store_custom_logo(name, img_bytes)
+                threading.Thread(target=apply_custom_logos_to_epg_cache, daemon=True).start()
                 self.send_json({"ok": True, "logo_url": custom_logo_local_url(name)})
             except Exception as e:
                 self.send_json({"ok": False, "message": str(e)})
@@ -8204,6 +8246,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "message": "Sendername fehlt"})
                 return
             delete_custom_logo(name)
+            threading.Thread(target=apply_custom_logos_to_epg_cache, daemon=True).start()
             self.send_json({"ok": True, "logo_url": get_logo_for_epg(name)})
             return
 
@@ -9393,6 +9436,12 @@ def run():
             epg_cache["xml"] = disk_xml
             epg_cache["last_update"] = disk_ts
         log.info("EPG preloaded from disk cache")
+        # Custom-Logos in den gecachten EPG einpatchen (falls seit dem letzten
+        # EPG-Run neue eigene Logos hinterlegt wurden).
+        try:
+            apply_custom_logos_to_epg_cache()
+        except Exception as e:
+            log.warning(f"EPG-Logo-Patch beim Start fehlgeschlagen: {e}")
 
     def _announce_to_recorder():
         """Sendet Startup-Announce an e2recorder falls konfiguriert."""
