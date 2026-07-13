@@ -39,7 +39,7 @@ from datetime import datetime
 # ── Pfade ─────────────────────────────────────────────────
 # Datenpfad: via Env-Variable überschreibbar (für Docker)
 DATA_DIR       = os.environ.get("E2PROXY_DATA_DIR", "/var/lib/e2proxy")
-VERSION        = "3.8"   # Versions-ID — wird bei jeder Änderung neu generiert
+VERSION        = "3.9"   # Versions-ID — wird bei jeder Änderung neu generiert
 CONFIG_FILE    = f"{DATA_DIR}/config.json"
 FAVORITES_FILE = f"{DATA_DIR}/favorites.json"
 
@@ -1844,6 +1844,17 @@ def run_epg_update(triggered_by="manual"):
             epg_run_state["phase"] = "Abgeschlossen"
             epg_run_state["last_result"] = result
 
+        # Plex DVR-Guide neu laden, damit die frischen EPG-Daten übernommen werden.
+        # Nicht beim Startup-Run (Plex kann/soll da noch nicht angestoßen werden).
+        if triggered_by != "startup":
+            try:
+                rcfg = get_recordings_config()
+                if rcfg.get("plex_dvr_refresh") and rcfg.get("plex_url") and rcfg.get("plex_token"):
+                    threading.Thread(target=_plex_dvr_refresh_guide, args=(rcfg,),
+                                     daemon=True).start()
+            except Exception as e:
+                log.warning(f"Plex DVR-Guide-Refresh nach EPG-Run fehlgeschlagen: {e}")
+
         return True
 
     except Exception as e:
@@ -2790,6 +2801,10 @@ const I18N = {
     "rec.via_login": "🔑 Generate via login", "rec.load_sections": "📁 Load sections",
     "rec.plex_verify": "Verify in Plex",
     "rec.plex_verify_hint": "After recording/conversion, check via Plex token whether the file was actually indexed (logs result)",
+    "epg.plex_dvr_title": "Plex DVR Guide",
+    "epg.plex_dvr_desc": "Reloads the guide of the e2proxy DVR in Plex so new EPG data is picked up. Requires Plex URL + token (configured under Recordings). Only the e2proxy DVR is touched.",
+    "epg.plex_dvr_auto": "Automatically reload the Plex guide after each EPG run",
+    "epg.plex_dvr_now": "Update guide now",
     "rec.select_channel": "— Select channel —", "rec.min": "min",
     "rec.no_active": "No active recordings.", "rec.duration_label": "Duration:",
     "epg.update_hint": "Fetches the program guide from both receivers, loads missing channels via zap and adds from the online source (Rytec). Runs daily automatically or manually.",
@@ -2945,6 +2960,10 @@ const I18N = {
     "rec.via_login": "🔑 Via Login generieren", "rec.load_sections": "📁 Sections laden",
     "rec.plex_verify": "In Plex verifizieren",
     "rec.plex_verify_hint": "Nach Aufnahme/Konvertierung per Plex-Token prüfen, ob die Datei tatsächlich indexiert wurde (Ergebnis im Log)",
+    "epg.plex_dvr_title": "Plex DVR Guide",
+    "epg.plex_dvr_desc": "Lädt den Guide des e2proxy-DVR in Plex neu, damit neue EPG-Daten übernommen werden. Benötigt Plex URL + Token (unter Aufnahmen konfiguriert). Nur der e2proxy-DVR wird angesprochen.",
+    "epg.plex_dvr_auto": "Plex-Guide nach jedem EPG-Run automatisch neu laden",
+    "epg.plex_dvr_now": "Guide jetzt aktualisieren",
     "rec.select_channel": "— Kanal wählen —", "rec.min": "Min",
     "rec.no_active": "Keine aktiven Aufnahmen.", "rec.duration_label": "Dauer:",
     "epg.update_hint": "Holt den Programmführer aus beiden Receivern, lädt fehlende Sender per Zap nach und ergänzt aus der Online-Quelle (Rytec). Läuft täglich automatisch oder manuell.",
@@ -3164,6 +3183,7 @@ def get_recordings_config():
         "plex_token":  cfg.get("recordings_plex_token", ""),
         "plex_section":cfg.get("recordings_plex_section", ""),
         "plex_verify": cfg.get("recordings_plex_verify", False),
+        "plex_dvr_refresh": cfg.get("recordings_plex_dvr_refresh", False),
     }
 
 def _safe_filename(title):
@@ -3235,6 +3255,67 @@ def _plex_refresh(rcfg):
                 log.info(f"Plex refresh section={section}: {r.status}")
         except Exception as e:
             log.warning(f"Plex refresh section={section} failed: {e}")
+
+
+def _plex_dvr_refresh_guide(rcfg):
+    """Stößt in Plex einen Guide-Reload für den e2proxy-DVR an.
+
+    Anders als _plex_refresh (das eine Media-Library scannt) aktualisiert das
+    die EPG-/Guide-Daten des DVR-Geräts. Wird typischerweise nach einem
+    EPG-Run aufgerufen, damit Plex die neuen Programminformationen zieht.
+
+    Es werden nur DVRs angesprochen, die zum e2proxy-Gerät gehören (Match über
+    Device-UUID/URI bzw. den HDHomeRun-DeviceID). Fremde DVRs bleiben unberührt.
+    """
+    url = rcfg.get("plex_url", "").rstrip("/")
+    token = rcfg.get("plex_token", "")
+    if not url or not token:
+        return
+    import urllib.request as _ur
+    import urllib.parse as _up
+
+    def _plex_json(req_url):
+        req = _ur.Request(req_url, headers={"Accept": "application/json",
+                                            "User-Agent": "e2proxy/1.0"})
+        with _ur.urlopen(req, timeout=12) as r:
+            return json.loads(r.read())
+
+    tok_q = _up.quote(token)
+    try:
+        data = _plex_json(f"{url}/livetv/dvrs?X-Plex-Token={tok_q}")
+    except Exception as e:
+        log.warning(f"Plex DVR-Liste abrufen fehlgeschlagen: {e}")
+        return
+
+    dvrs = data.get("MediaContainer", {}).get("Dvr", []) or []
+    if not dvrs:
+        log.info("Plex Guide-Refresh: keine DVRs in Plex gefunden")
+        return
+
+    device_id = HDHR_DEVICE_ID.lower()
+    host = str(get_proxy_host()).lower()
+    port = str(get_proxy_port())
+    matched = []
+    for dvr in dvrs:
+        blob = json.dumps(dvr).lower()
+        if device_id in blob or "e2proxy" in blob or (host in blob and port in blob):
+            key = dvr.get("key")
+            if key is not None:
+                matched.append(str(key))
+
+    if not matched:
+        log.info("Plex Guide-Refresh: kein e2proxy-DVR gefunden — übersprungen")
+        return
+
+    for key in matched:
+        try:
+            req_url = f"{url}/livetv/dvrs/{key}/reloadGuide?X-Plex-Token={tok_q}"
+            req = _ur.Request(req_url, method="POST",
+                              headers={"User-Agent": "e2proxy/1.0"})
+            with _ur.urlopen(req, timeout=15) as r:
+                log.info(f"Plex Guide-Refresh DVR={key}: {r.status}")
+        except Exception as e:
+            log.warning(f"Plex Guide-Refresh DVR={key} fehlgeschlagen: {e}")
 
 
 def _plex_find_file(rcfg, filepath):
@@ -4984,7 +5065,7 @@ def build_help_ui():
       <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:0 24px">
         <div>
           <b style="color:var(--accent2)" data-i18n="help.api_channels">Channels &amp; EPG</b><br>
-          GET /api/channels<br>GET /api/favorites<br>GET /api/epg/data<br>GET /api/epg/status<br>GET /api/epg/run<br>GET /api/epg/history<br>GET /api/health
+          GET /api/channels<br>GET /api/favorites<br>GET /api/epg/data<br>GET /api/epg/status<br>GET /api/epg/run<br>GET /api/epg/history<br>GET /api/plex/dvr-refresh<br>GET /api/health
         </div>
         <div>
           <b style="color:var(--accent2)">Aufnahmen</b><br>
@@ -5705,6 +5786,7 @@ def build_settings_ui():
     rec_plex_token = rcfg["plex_token"]
     rec_plex_section = rcfg["plex_section"]
     rec_plex_verify_attr = "checked" if rcfg.get("plex_verify") else ""
+    rec_plex_dvr_refresh_attr = "checked" if rcfg.get("plex_dvr_refresh") else ""
     # Compression config
     ccfg = get_compression_config()
     comp_enabled_attr = "checked" if ccfg["enabled"] else ""
@@ -6455,6 +6537,19 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
         </div>
         <div id="epg-tmdb-list" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px;font-family:'JetBrains Mono',monospace;font-size:10px;line-height:1.8;max-height:180px;overflow-y:auto;">
         </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">📡 <span data-i18n="epg.plex_dvr_title">Plex DVR Guide</span></div>
+      <p class="card-desc" data-i18n="epg.plex_dvr_desc">Reloads the guide of the e2proxy DVR in Plex so new EPG data is picked up. Requires Plex URL + token (configured under Recordings). Only the e2proxy DVR is touched.</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text);margin-bottom:12px">
+        <input type="checkbox" id="epg-plex-dvr-refresh" {rec_plex_dvr_refresh_attr} onchange="savePlexDvrRefresh(this.checked)">
+        <span data-i18n="epg.plex_dvr_auto">Automatically reload the Plex guide after each EPG run</span>
+      </label>
+      <div class="flex">
+        <button class="btn btn-primary" id="plex-dvr-refresh-btn" onclick="triggerPlexDvrRefresh()">🔄 <span data-i18n="epg.plex_dvr_now">Update guide now</span></button>
+        <span class="action-feedback" id="plex-dvr-refresh-fb"></span>
       </div>
     </div>
 
@@ -7386,6 +7481,42 @@ function resetSwitch(ref) {{
     if (d && d.ok) {{ showToast('✓ Zurückgesetzt','success'); loadSwitchStats(); }}
     else showToast('Fehler','error');
   }}).catch(()=>showToast('Fehler','error'));
+}}
+
+function savePlexDvrRefresh(enabled) {{
+  const fb = document.getElementById('plex-dvr-refresh-fb');
+  const showFb = (msg, color) => {{
+    if (!fb) return;
+    fb.textContent = msg; fb.style.color = color; fb.style.opacity = '1';
+    setTimeout(() => {{ fb.style.opacity = '0'; }}, 3000);
+  }};
+  apiPost('/api/config-update', {{recordings_plex_dvr_refresh: !!enabled}}).then(d => {{
+    if (d && d.ok) showFb(enabled ? '✓ Auto-Refresh an' : '✓ Auto-Refresh aus', 'var(--green)');
+    else showFb('✕ Fehler', 'var(--red)');
+  }}).catch(e => showFb('✕ Fehler: ' + e, 'var(--red)'));
+}}
+
+function triggerPlexDvrRefresh() {{
+  const btn = document.getElementById('plex-dvr-refresh-btn');
+  const fb = document.getElementById('plex-dvr-refresh-fb');
+  const showFb = (msg, color) => {{
+    if (!fb) return;
+    fb.textContent = msg; fb.style.color = color; fb.style.opacity = '1';
+    setTimeout(() => {{ fb.style.opacity = '0'; }}, 4000);
+  }};
+  if (btn) btn.disabled = true;
+  fetch('/api/plex/dvr-refresh').then(r => r.json()).then(d => {{
+    if (d && d.ok) {{
+      showToast('✓ Plex Guide-Refresh gestartet', 'success');
+      showFb('✓ ' + (d.message || 'gestartet'), 'var(--green)');
+    }} else {{
+      showToast((d && d.message) || 'Fehler', 'error');
+      showFb('✕ ' + ((d && d.message) || 'Fehler'), 'var(--red)');
+    }}
+  }}).catch(e => {{
+    showToast('Fehler: ' + e, 'error');
+    showFb('✕ Fehler: ' + e, 'var(--red)');
+  }}).finally(() => {{ if (btn) btn.disabled = false; }});
 }}
 
 // ── Konfig CRUD ───────────────────────────────────────
@@ -9099,6 +9230,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             else:
                 threading.Thread(target=lambda: run_epg_update("manual"), daemon=True).start()
                 self.send_json({"ok": True, "message": "EPG-Run started"})
+            return
+
+        if path == "/api/plex/dvr-refresh":
+            rcfg = get_recordings_config()
+            if not (rcfg.get("plex_url") and rcfg.get("plex_token")):
+                self.send_json({"ok": False, "message": "Plex URL/Token nicht konfiguriert"})
+                return
+            threading.Thread(target=_plex_dvr_refresh_guide, args=(rcfg,), daemon=True).start()
+            self.send_json({"ok": True, "message": "Plex DVR guide refresh started"})
             return
 
         if path == "/api/logos/check":
