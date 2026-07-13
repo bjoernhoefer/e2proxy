@@ -39,7 +39,7 @@ from datetime import datetime
 # ── Pfade ─────────────────────────────────────────────────
 # Datenpfad: via Env-Variable überschreibbar (für Docker)
 DATA_DIR       = os.environ.get("E2PROXY_DATA_DIR", "/var/lib/e2proxy")
-VERSION        = "3.7"   # Versions-ID — wird bei jeder Änderung neu generiert
+VERSION        = "3.8"   # Versions-ID — wird bei jeder Änderung neu generiert
 CONFIG_FILE    = f"{DATA_DIR}/config.json"
 FAVORITES_FILE = f"{DATA_DIR}/favorites.json"
 
@@ -164,7 +164,10 @@ def get_channel_logo_urls(name):
     return [val]
 
 def get_channel_logo(name):
-    """Gibt die erste konfigurierte Logo-URL zurück (für M3U Playlist)."""
+    """Gibt die Logo-URL zurück (für M3U Playlist).
+    Ein manuell hinterlegtes Custom-Logo hat Vorrang vor der Logo-Datenbank."""
+    if has_custom_logo(name):
+        return custom_logo_local_url(name)
     urls = get_channel_logo_urls(name)
     return urls[0] if urls else ""
 
@@ -248,13 +251,193 @@ def refresh_logo_cache(force=False):
 
 def get_logo_for_epg(name):
     """Gibt die URL für den EPG zurück.
-    Bevorzugt lokalen Cache, fällt auf direkte URL zurück.
+    Reihenfolge: manuelles Custom-Logo > lokaler Cache > direkte URL.
     """
+    if has_custom_logo(name):
+        return custom_logo_local_url(name)
     fname = os.path.join(LOGO_CACHE_DIR, logo_cache_filename(name))
     if os.path.exists(fname):
         return logo_local_url(name)
     # Noch nicht gecacht — direkte URL als Fallback
     return get_channel_logo(name)
+
+
+# ── Custom Sender-Logos (manuell, nur für Favoriten) ──────────────────
+# Nutzer können in den Einstellungen (Wartung) pro Favorit ein eigenes Logo
+# hinterlegen — entweder per Datei-Upload oder per URL. Das Bild wird mit
+# ffmpeg ins richtige Format (PNG, max. 400px Breite) konvertiert und lokal
+# gespeichert. Custom-Logos haben Vorrang vor der Logo-Datenbank und dem
+# automatischen Cache.
+CUSTOM_LOGO_DIR   = f"{DATA_DIR}/custom_logos"
+CUSTOM_LOGOS_FILE = f"{DATA_DIR}/custom_logos.json"
+custom_logos_lock = threading.Lock()
+
+def load_custom_logos():
+    """Mapping Sendername → Dateiname der hinterlegten Custom-Logos."""
+    try:
+        if os.path.exists(CUSTOM_LOGOS_FILE):
+            with open(CUSTOM_LOGOS_FILE, "r") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+    except Exception as e:
+        log.warning(f"Custom-Logos laden fehlgeschlagen: {e}")
+    return {}
+
+def save_custom_logos(mapping):
+    try:
+        os.makedirs(os.path.dirname(CUSTOM_LOGOS_FILE), exist_ok=True)
+        with open(CUSTOM_LOGOS_FILE, "w") as f:
+            json.dump(mapping, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        log.error(f"Custom-Logos speichern fehlgeschlagen: {e}")
+        return False
+
+def custom_logo_path(name):
+    return os.path.join(CUSTOM_LOGO_DIR, logo_cache_filename(name))
+
+def has_custom_logo(name):
+    try:
+        p = custom_logo_path(name)
+        return os.path.exists(p) and os.path.getsize(p) > 100
+    except OSError:
+        return False
+
+def custom_logo_local_url(name):
+    """Lokale Proxy-URL für ein Custom-Logo (mit Cache-Buster gegen Client-Caching)."""
+    host = get_proxy_host()
+    port = get_proxy_port()
+    fname = logo_cache_filename(name)
+    try:
+        ver = int(os.path.getmtime(custom_logo_path(name)))
+    except OSError:
+        ver = 0
+    return f"http://{host}:{port}/custom_logos/{fname}?v={ver}"
+
+def _looks_like_html(data):
+    head = data[:512].lstrip().lower()
+    return head.startswith(b"<!doctype html") or head.startswith(b"<html") or b"<head" in head
+
+def _fetch_image_bytes(url, max_bytes=8 * 1024 * 1024):
+    """Lädt ein Bild von einer URL herunter (begrenzt auf max_bytes)."""
+    if not re.match(r"^https?://", url, re.I):
+        raise ValueError("Nur http(s)-URLs erlaubt")
+    req = urllib.request.Request(url, headers={"User-Agent": "e2proxy/1.0"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        data = resp.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError("Bild zu groß (max 8 MB)")
+    if len(data) < 100:
+        raise ValueError("Bild leer oder ungültig")
+    if "text/html" in ctype or _looks_like_html(data):
+        raise ValueError("URL liefert eine Webseite, kein Bild. Bitte die direkte "
+                         "Bild-URL verwenden (Rechtsklick aufs Bild, Bildadresse kopieren).")
+    return data
+
+def convert_and_store_custom_logo(name, img_bytes):
+    """Konvertiert ein beliebiges Bild (inkl. SVG) via ffmpeg nach PNG
+    (max. 400px breit, Seitenverhältnis erhalten) und speichert es als
+    Custom-Logo für 'name'. Wirft bei Fehler eine Exception."""
+    if not name:
+        raise ValueError("Sendername fehlt")
+    if not img_bytes or len(img_bytes) < 100:
+        raise ValueError("Kein Bild empfangen")
+    if _looks_like_html(img_bytes):
+        raise ValueError("Die Datei ist eine HTML-Seite, kein Bild.")
+    os.makedirs(CUSTOM_LOGO_DIR, exist_ok=True)
+    out = custom_logo_path(name)
+    tmp = out + ".tmp.png"
+    # ffmpeg über eine echte (seekbare) Datei statt pipe:0 füttern — nur so
+    # erkennt der Demuxer Formate wie SVG zuverlässig.
+    tmp_in = out + ".in"
+    try:
+        with open(tmp_in, "wb") as f:
+            f.write(img_bytes)
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", tmp_in,
+            "-vf", "scale='if(gt(iw,400),400,iw)':-2",
+            "-frames:v", "1",
+            "-f", "image2", tmp,
+        ]
+        try:
+            proc = subprocess.run(cmd,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  timeout=30)
+        except FileNotFoundError:
+            raise RuntimeError("ffmpeg nicht gefunden")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Bildkonvertierung Timeout")
+        if proc.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) < 100:
+            err = (proc.stderr or b"").decode("utf-8", "replace").strip()
+            err_short = err.splitlines()[-1][:180] if err else "unbekannter Fehler"
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            raise RuntimeError(f"Bild konnte nicht konvertiert werden ({err_short})")
+    finally:
+        try:
+            if os.path.exists(tmp_in):
+                os.remove(tmp_in)
+        except OSError:
+            pass
+    os.replace(tmp, out)
+    with custom_logos_lock:
+        mapping = load_custom_logos()
+        mapping[name] = logo_cache_filename(name)
+        save_custom_logos(mapping)
+    log.info(f"Custom-Logo gespeichert: {name} → {out}")
+    return True
+
+def delete_custom_logo(name):
+    """Entfernt ein Custom-Logo — der Sender fällt auf das automatische Logo zurück."""
+    removed = False
+    try:
+        p = custom_logo_path(name)
+        if os.path.exists(p):
+            os.remove(p)
+            removed = True
+    except OSError as e:
+        log.warning(f"Custom-Logo löschen fehlgeschlagen ({name}): {e}")
+    with custom_logos_lock:
+        mapping = load_custom_logos()
+        if name in mapping:
+            del mapping[name]
+            save_custom_logos(mapping)
+            removed = True
+    if removed:
+        log.info(f"Custom-Logo entfernt: {name}")
+    return removed
+
+def get_favorite_logo_overview():
+    """Liefert für jeden Favoriten Name, Ref, aktuelle Logo-URL, Custom-Status
+    und die automatische (Datenbank-)URL — für die Bearbeitungs-UI."""
+    favs = load_favorites()
+    with channel_cache_lock:
+        all_channels = channel_cache.get("channels", [])
+    ref_to_name = {ch["ref"]: ch["name"] for ch in all_channels}
+    out = []
+    seen = set()
+    for f in favs:
+        ref = f.get("ref", "")
+        name = ref_to_name.get(ref) or f.get("name") or ""
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        is_custom = has_custom_logo(name)
+        auto_urls = get_channel_logo_urls(name)
+        out.append({
+            "name": name,
+            "ref": ref,
+            "custom": is_custom,
+            "logo_url": custom_logo_local_url(name) if is_custom else get_logo_for_epg(name),
+            "auto_url": auto_urls[0] if auto_urls else "",
+        })
+    return out
 
 
 CONFIG_DEFAULT = f"{DATA_DIR}/config_default.json"
@@ -1261,6 +1444,47 @@ def load_epg_from_disk():
     except Exception as e:
         log.warning(f"EPG Disk-Laden fehlgeschlagen: {e}")
     return None, 0
+
+
+_EPG_CHANNEL_RE = re.compile(
+    r'  <channel id="([^"]*)">\n'
+    r'    <display-name>(.*?)</display-name>\n'
+    r'(?:    <icon src="[^"]*"/>\n)?'
+    r'  </channel>')
+
+
+def apply_custom_logos_to_epg_cache():
+    """Aktualisiert die <icon>-Einträge im bereits gecachten EPG-XML anhand der
+    aktuellen Logo-Auflösung (Custom-Logo > lokaler Cache > URL).
+
+    Das EPG-XML wird nur bei einem vollständigen EPG-Run neu gebaut und danach
+    24 h gecached. Ohne diese Funktion würden neu hinterlegte Custom-Logos erst
+    beim nächsten Run im Plex-Guide erscheinen. Der Patch ist günstig (Regex auf
+    den Kanalköpfen) und lässt die Event-Daten unangetastet."""
+    with epg_cache_lock:
+        xml = epg_cache["xml"]
+    if not xml:
+        return False
+
+    def _unescape(s):
+        return s.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+
+    def _repl(m):
+        cid, name_esc = m.group(1), m.group(2)
+        logo = get_logo_for_epg(_unescape(name_esc))
+        block = f'  <channel id="{cid}">\n    <display-name>{name_esc}</display-name>\n'
+        if logo:
+            block += f'    <icon src="{logo}"/>\n'
+        block += '  </channel>'
+        return block
+
+    new_xml, n = _EPG_CHANNEL_RE.subn(_repl, xml)
+    if new_xml != xml:
+        with epg_cache_lock:
+            epg_cache["xml"] = new_xml
+        save_epg_to_disk(new_xml)
+        log.info(f"EPG-Logos im Cache aktualisiert ({n} Kanäle gepatcht)")
+    return True
 
 
 def fetch_epg_from_receiver(favorites_only=False):
@@ -2545,6 +2769,13 @@ const I18N = {
     "set.run_history_hint": "Bars = duration in seconds. Red = outlier (>2× average).",
     "set.epg_run_log": "EPG Run Log", "set.logo_check_card": "Logo Check",
     "set.logo_check_hint": "Checks whether the favorite channel logos are reachable.",
+    "set.fav_logos": "Favorite logos", "set.fav_logos_hint": "Set a custom logo for each favorite — upload an image or enter a URL. The image is converted to the correct format automatically. Reset falls back to the automatic logo.",
+    "set.fav_logos_empty": "No favorites found. Add favorites first.", "set.fav_logos_custom": "custom",
+    "set.fav_logos_url_ph": "Logo URL (https://…)", "set.fav_logos_save_url": "Save URL",
+    "set.fav_logos_upload": "Upload", "set.fav_logos_done": "Logo saved",
+    "set.fav_logos_working": "Working…", "set.fav_logos_need_url": "Please enter a URL",
+    "set.fav_logos_too_big": "Image too large (max 8 MB)",
+    "set.fav_logos_zoom": "Click to enlarge",
     "set.appearance": "Appearance", "set.appearance_hint": "Switch between dark and light theme. Stored in the browser.",
     "set.log_level_hint": "Controls which log entries are shown. Applies immediately without restart. The RAM buffer always keeps the last 500 entries.",
     "set.api_log_hint": "Logs all API requests persistently in",
@@ -2693,6 +2924,13 @@ const I18N = {
     "set.run_history_hint": "Balken = Dauer in Sekunden. Rot = Ausreißer (>2× Durchschnitt).",
     "set.epg_run_log": "EPG-Run Log", "set.logo_check_card": "Logo-Prüfung",
     "set.logo_check_hint": "Prüft ob die Senderlogos der Favoriten erreichbar sind.",
+    "set.fav_logos": "Sender-Logos", "set.fav_logos_hint": "Hinterlege pro Favorit ein eigenes Logo — Bild hochladen oder URL angeben. Das Bild wird automatisch ins richtige Format konvertiert. Zurücksetzen nutzt wieder das automatische Logo.",
+    "set.fav_logos_empty": "Keine Favoriten gefunden. Zuerst Favoriten anlegen.", "set.fav_logos_custom": "eigen",
+    "set.fav_logos_url_ph": "Logo-URL (https://…)", "set.fav_logos_save_url": "URL speichern",
+    "set.fav_logos_upload": "Hochladen", "set.fav_logos_done": "Logo gespeichert",
+    "set.fav_logos_working": "Wird verarbeitet…", "set.fav_logos_need_url": "Bitte eine URL angeben",
+    "set.fav_logos_too_big": "Bild zu groß (max 8 MB)",
+    "set.fav_logos_zoom": "Zum Vergrößern klicken",
     "set.appearance": "Darstellung", "set.appearance_hint": "Zwischen dunklem und hellem Design wechseln. Wird im Browser gespeichert.",
     "set.log_level_hint": "Steuert welche Log-Einträge angezeigt werden. Wirkt sofort ohne Neustart. Im RAM-Buffer werden immer alle 500 letzten Einträge gespeichert.",
     "set.api_log_hint": "Protokolliert alle API-Anfragen persistent in",
@@ -4764,7 +5002,14 @@ def build_help_ui():
       <div style="display:flex;flex-direction:column;gap:12px">
 
         <div style="border-left:3px solid var(--accent);padding-left:14px">
-          <b style="color:var(--accent);font-family:monospace;font-size:11px">v3.7.0</b>
+          <b style="color:var(--accent);font-family:monospace;font-size:11px">v3.8.0</b>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-07-13</span>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">Editable favorite logos</span>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Favorite channel logos can now be edited under <b>Settings → Maintenance</b>. For each favorite you can upload an image or enter a URL; the image is converted with ffmpeg to the correct format (PNG, max 400px wide, aspect preserved) and stored locally. Custom logos take precedence over the built-in logo database and cache for both the M3U playlist and the XMLTV EPG, and can be reset to fall back to the automatic logo. New endpoints <code>/api/favorites/logos</code>, <code>/api/favorites/logo</code> and <code>/api/favorites/logo/reset</code>; custom logos are served at <code>/custom_logos/</code> and stored in <code>/data/custom_logos/</code>. Custom logos are now also injected into the cached XMLTV EPG immediately (on change and at startup), so they show up in Plex without waiting for the next full EPG run.</div>
+        </div>
+
+        <div style="border-left:3px solid var(--border);padding-left:14px">
+          <b style="font-family:monospace;font-size:11px">v3.7.0</b>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-07-12</span>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">Switch Tuning · NoLatency · Self-Learning</span>
           <div style="font-size:11px;margin-top:4px;color:var(--muted)">Faster channel switching (esp. Plex): per-channel <b>NoLatency</b> mode starts ffmpeg with minimal probing + low-delay input flags, and the post-zap wait is now configurable (was a hardcoded 1s). ffmpeg is monitored during the first seconds — if no data flows the stream is transparently restarted with a larger probesize. Self-learning: repeated NoLatency failures raise a channel's probesize in small steps automatically. New per-channel statistics (zap ok/fail + avg ms, stream start ok/fail + retries) in Settings, plus <code>/api/switch/stats</code>, <code>/api/switch/settings</code> and <code>/api/switch/reset</code>.</div>
@@ -6155,6 +6400,23 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
       <div class="log-box" id="log-box">Logs werden geladen…</div>
     </div>
 
+    <div class="card">
+      <div class="card-title">🖼 <span data-i18n="set.fav_logos">Favorite logos</span></div>
+      <p class="card-desc" data-i18n="set.fav_logos_hint">Set a custom logo for each favorite — upload an image or enter a URL. The image is converted to the correct format automatically. Reset falls back to the automatic logo.</p>
+      <div class="flex" style="margin-bottom:12px">
+        <button class="btn" onclick="loadFavLogos()">↻ <span data-i18n="common.refresh">Refresh</span></button>
+        <span class="action-feedback" id="fav-logo-fb"></span>
+      </div>
+      <div id="fav-logo-list" style="display:flex;flex-direction:column;gap:8px">
+        <span style="color:var(--muted);font-size:11px;font-family:monospace" data-i18n="common.loading">Loading…</span>
+      </div>
+    </div>
+
+    <div id="logo-modal" onclick="closeLogoModal()" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.8);align-items:center;justify-content:center;flex-direction:column;gap:12px;cursor:zoom-out">
+      <img id="logo-modal-img" src="" alt="" style="max-width:80vw;max-height:75vh;object-fit:contain;background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px;box-shadow:0 8px 40px rgba(0,0,0,0.6)">
+      <div id="logo-modal-name" style="color:#fff;font-family:monospace;font-size:13px"></div>
+    </div>
+
   </div>
 
   <!-- ── TAB: EPG ───────────────────────────────────── -->
@@ -6331,7 +6593,7 @@ function switchTab(name) {{
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
   event.target.classList.add('active');
-  if (name === 'maintenance') {{ refreshLogs(); initApiLogToggle(); initMaintNotify(); }}
+  if (name === 'maintenance') {{ refreshLogs(); initApiLogToggle(); initMaintNotify(); loadFavLogos(); }}
   else {{
     if (_logPollTimer) {{ clearInterval(_logPollTimer); _logPollTimer = null; }}
     if (_apiLogPollTimer) {{ clearInterval(_apiLogPollTimer); _apiLogPollTimer = null; }}
@@ -6816,7 +7078,7 @@ function copyUrl(btn, url) {{
 }}
 
 // Logs beim Start laden wenn Maintenance-Tab aktiv
-if (document.getElementById('tab-maintenance').classList.contains('active')) {{ refreshLogs(); initApiLogToggle(); initMaintNotify(); }}
+if (document.getElementById('tab-maintenance').classList.contains('active')) {{ refreshLogs(); initApiLogToggle(); initMaintNotify(); loadFavLogos(); }}
 
 // ── Recording ─────────────────────────────────────────
 let _quickRecId = null;
@@ -7536,8 +7798,103 @@ function checkLogos() {{
     }}
   }}).catch(() => {{ fb.textContent = '✗ Fehler'; }});
 }}
+
+// ── Favoriten-Logos bearbeiten ─────────────────────────────
+function loadFavLogos() {{
+  const box = document.getElementById('fav-logo-list');
+  if (!box) return;
+  const fb = document.getElementById('fav-logo-fb');
+  if (fb) fb.textContent = '';
+  fetch('/api/favorites/logos').then(r => r.json()).then(d => {{
+    if (!d.ok || !d.logos || !d.logos.length) {{
+      box.innerHTML = '<span style="color:var(--muted);font-size:11px;font-family:monospace">' + t('set.fav_logos_empty') + '</span>';
+      return;
+    }}
+    box.innerHTML = d.logos.map(function(l) {{
+      const nm = String(l.name).replace(/"/g, '&quot;');
+      const badge = l.custom ? '<span style="font-size:9px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:1px 4px;margin-left:6px">' + t('set.fav_logos_custom') + '</span>' : '';
+      const resetBtn = l.custom ? '<button class="btn" style="font-size:10px" data-name="' + nm + '" onclick="resetFavLogo(this)">↺ ' + t('set.reset') + '</button>' : '';
+      const img = l.logo_url
+        ? '<img src="' + l.logo_url + '" title="' + t('set.fav_logos_zoom') + '" onclick="showLogoModal(this.src, this.dataset.nm)" data-nm="' + nm + '" style="width:52px;height:32px;object-fit:contain;background:var(--surface2);border:1px solid var(--border);border-radius:4px;cursor:zoom-in" onerror="this.style.opacity=0.2">'
+        : '<div style="width:52px;height:32px;background:var(--surface2);border:1px solid var(--border);border-radius:4px"></div>';
+      return '<div class="fav-logo-row" data-name="' + nm + '" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;border:1px solid var(--border);border-radius:6px;padding:6px 8px;background:var(--surface)">' +
+        img +
+        '<div style="min-width:150px;flex:0 0 auto;font-size:12px">' + l.name + badge + '</div>' +
+        '<input type="text" class="input logo-url-inp" placeholder="' + t('set.fav_logos_url_ph') + '" style="flex:1;min-width:180px;font-size:11px">' +
+        '<button class="btn" style="font-size:10px" onclick="setFavLogoUrl(this)">' + t('set.fav_logos_save_url') + '</button>' +
+        '<label class="btn" style="font-size:10px;cursor:pointer">📁 ' + t('set.fav_logos_upload') + '<input type="file" accept="image/*" style="display:none" onchange="uploadFavLogo(this)"></label>' +
+        resetBtn +
+      '</div>';
+    }}).join('');
+  }}).catch(() => {{ box.innerHTML = '<span style="color:var(--amber);font-size:11px">✗ Fehler</span>'; }});
+}}
+
+function _favLogoResult(ok, msg) {{
+  const fb = document.getElementById('fav-logo-fb');
+  if (fb) fb.textContent = ok ? ('✓ ' + t('set.fav_logos_done')) : ('✗ ' + (msg || 'Fehler'));
+  try {{ showToast(ok ? t('set.fav_logos_done') : (msg || 'Fehler'), ok ? 'success' : 'error'); }} catch(e) {{}}
+}}
+
+function showLogoModal(src, name) {{
+  const m = document.getElementById('logo-modal');
+  if (!m || !src) return;
+  document.getElementById('logo-modal-img').src = src;
+  document.getElementById('logo-modal-name').textContent = name || '';
+  m.style.display = 'flex';
+}}
+
+function closeLogoModal() {{
+  const m = document.getElementById('logo-modal');
+  if (m) m.style.display = 'none';
+  const img = document.getElementById('logo-modal-img');
+  if (img) img.src = '';
+}}
+
+document.addEventListener('keydown', function(e) {{
+  if (e.key === 'Escape') closeLogoModal();
+}});
+
+function setFavLogoUrl(btn) {{
+  const row = btn.closest('.fav-logo-row');
+  const name = row.getAttribute('data-name');
+  const inp = row.querySelector('.logo-url-inp');
+  const url = (inp.value || '').trim();
+  if (!url) {{ _favLogoResult(false, t('set.fav_logos_need_url')); return; }}
+  const fb = document.getElementById('fav-logo-fb');
+  if (fb) fb.textContent = t('set.fav_logos_working');
+  fetch('/api/favorites/logo', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{name: name, url: url}})}})
+    .then(r => r.json()).then(d => {{ _favLogoResult(d.ok, d.message); loadFavLogos(); }})
+    .catch(() => _favLogoResult(false));
+}}
+
+function uploadFavLogo(input) {{
+  const row = input.closest('.fav-logo-row');
+  const name = row.getAttribute('data-name');
+  const file = input.files && input.files[0];
+  if (!file) return;
+  if (file.size > 8 * 1024 * 1024) {{ _favLogoResult(false, t('set.fav_logos_too_big')); input.value = ''; return; }}
+  const fb = document.getElementById('fav-logo-fb');
+  if (fb) fb.textContent = t('set.fav_logos_working');
+  const reader = new FileReader();
+  reader.onload = function() {{
+    fetch('/api/favorites/logo', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{name: name, data: reader.result}})}})
+      .then(r => r.json()).then(d => {{ _favLogoResult(d.ok, d.message); loadFavLogos(); }})
+      .catch(() => _favLogoResult(false));
+    input.value = '';
+  }};
+  reader.readAsDataURL(file);
+}}
+
+function resetFavLogo(btn) {{
+  const name = btn.getAttribute('data-name');
+  const fb = document.getElementById('fav-logo-fb');
+  if (fb) fb.textContent = t('set.fav_logos_working');
+  fetch('/api/favorites/logo/reset', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{name: name}})}})
+    .then(r => r.json()).then(d => {{ _favLogoResult(d.ok, d.message); loadFavLogos(); }})
+    .catch(() => _favLogoResult(false));
+}}
 </script>
-"""
+""" 
     return html_page("Settings", body, css)
 
 # ── HDHomeRun Emulation ───────────────────────────────────
@@ -7853,6 +8210,44 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 log.info(f"Favoriten gespeichert: {len(data)} Sender")
             self.send_json({"ok": ok, "count": len(data),
                            "message": None if ok else f"Schreiben nach {FAVORITES_FILE} fehlgeschlagen"})
+            return
+
+        if parsed.path == "/api/favorites/logo":
+            try:
+                name = (data.get("name") or "").strip()
+                if not name:
+                    self.send_json({"ok": False, "message": "Sendername fehlt"})
+                    return
+                url = (data.get("url") or "").strip()
+                data_uri = data.get("data") or ""
+                if url:
+                    img_bytes = _fetch_image_bytes(url)
+                elif data_uri:
+                    # data:image/...;base64,<payload>  oder reines Base64
+                    b64 = data_uri.split(",", 1)[1] if "," in data_uri else data_uri
+                    import base64
+                    img_bytes = base64.b64decode(b64)
+                    if len(img_bytes) > 8 * 1024 * 1024:
+                        self.send_json({"ok": False, "message": "Bild zu groß (max 8 MB)"})
+                        return
+                else:
+                    self.send_json({"ok": False, "message": "Weder URL noch Bild angegeben"})
+                    return
+                convert_and_store_custom_logo(name, img_bytes)
+                threading.Thread(target=apply_custom_logos_to_epg_cache, daemon=True).start()
+                self.send_json({"ok": True, "logo_url": custom_logo_local_url(name)})
+            except Exception as e:
+                self.send_json({"ok": False, "message": str(e)})
+            return
+
+        if parsed.path == "/api/favorites/logo/reset":
+            name = (data.get("name") or "").strip()
+            if not name:
+                self.send_json({"ok": False, "message": "Sendername fehlt"})
+                return
+            delete_custom_logo(name)
+            threading.Thread(target=apply_custom_logos_to_epg_cache, daemon=True).start()
+            self.send_json({"ok": True, "logo_url": get_logo_for_epg(name)})
             return
 
         if parsed.path == "/api/access-log/toggle":
@@ -8711,6 +9106,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"ok": True, "broken": broken, "count": len(broken)})
             return
 
+        if path == "/api/favorites/logos":
+            self.send_json({"ok": True, "logos": get_favorite_logo_overview()})
+            return
+
         if path == "/kill":
             rid = params.get("receiver", [None])[0]
             if rid and get_receiver_by_id(rid):
@@ -8727,6 +9126,26 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Location", "/settings")
             self.send_header("Connection", "close")
             self.end_headers()
+            return
+
+        if path.startswith("/custom_logos/"):
+            fname = path[len("/custom_logos/"):]
+            if "/" in fname or ".." in fname:
+                self.send_text("Not found", 404)
+                return
+            fpath = os.path.join(CUSTOM_LOGO_DIR, fname)
+            if os.path.exists(fpath):
+                with open(fpath, "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "public, max-age=3600")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(data)
+            else:
+                self.send_text("Not found", 404)
             return
 
         if path.startswith("/logos/"):
@@ -9017,6 +9436,12 @@ def run():
             epg_cache["xml"] = disk_xml
             epg_cache["last_update"] = disk_ts
         log.info("EPG preloaded from disk cache")
+        # Custom-Logos in den gecachten EPG einpatchen (falls seit dem letzten
+        # EPG-Run neue eigene Logos hinterlegt wurden).
+        try:
+            apply_custom_logos_to_epg_cache()
+        except Exception as e:
+            log.warning(f"EPG-Logo-Patch beim Start fehlgeschlagen: {e}")
 
     def _announce_to_recorder():
         """Sendet Startup-Announce an e2recorder falls konfiguriert."""

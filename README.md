@@ -15,6 +15,7 @@ Single Python file, runs in Docker, manages two SAT receivers with automatic tun
 - **Fast Switching** — Per-channel switch tuning (NoLatency probing, configurable zap wait) with self-learning probesize and zap/start statistics
 - **Tuner Lock** — Temporarily lock a tuner in Settings so e2proxy won't use it (handy in exceptional situations)
 - **Favorites** — Drag & drop channel ordering with group/category assignments
+- **Editable Logos** — Set a custom logo per favorite (upload or URL), auto-converted to PNG via ffmpeg
 - **Bilingual UI** — English/German with browser language auto-detection
 - **Dark/Light Theme** — Switchable in settings
 
@@ -122,6 +123,9 @@ All configuration stored in `/data/config.json`.
 |----------|--------|-------------|
 | `/api/channels` | GET | All channels (247+) |
 | `/api/favorites` | GET/POST | Favorite channels |
+| `/api/favorites/logos` | GET | Favorite logos overview (name, ref, current + auto URL, custom flag) |
+| `/api/favorites/logo` | POST | Set a custom favorite logo (`{name, url}` or `{name, data}` base64) — converted to PNG |
+| `/api/favorites/logo/reset` | POST | Remove custom logo, fall back to automatic (`{name}`) |
 | `/api/epg/data` | GET | EPG data (28h window, JSON) |
 | `/api/epg/status` | GET | EPG update status |
 | `/epg.xml` | GET | XMLTV for Plex/Kodi |
@@ -202,6 +206,7 @@ All configuration stored in `/data/config.json`.
 | `/data/tmdb_cache.json` | TMDB poster cache |
 | `/data/tvdb_cache.json` | TVDB series cache |
 | `/data/logos/` | Channel logo cache |
+| `/data/custom_logos/` | Manually set favorite logos (uploaded/URL, PNG-converted) |
 
 ## Update
 
