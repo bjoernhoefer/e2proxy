@@ -45,7 +45,7 @@ VERSION        = "3.9"   # Offizielle Version — nur beim Pull Request erhöhen
 # offizielle VERSION zu verändern (die steigt erst beim PR). Bei jedem Test-
 # Rollout eines neuen Standes BUILD_SEQ erhöhen.
 BUILD_BRANCH     = "feature/openwebif-emulation"
-BUILD_SEQ        = "4"
+BUILD_SEQ        = "5"
 INTERNAL_VERSION = f"{VERSION}+{BUILD_BRANCH.split('/')[-1]}.{BUILD_SEQ}"
 CONFIG_FILE    = f"{DATA_DIR}/config.json"
 FAVORITES_FILE = f"{DATA_DIR}/favorites.json"
@@ -9910,6 +9910,10 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
             if self._is_stream():
                 self._serve_stream(rest)
                 return
+            # Bouquet-Liste wie in der Web-UI kuratieren/sortieren
+            if self._is_bouquet_list_request():
+                self._serve_bouquet_list()
+                return
             self._reverse_proxy(b"")
         except (BrokenPipeError, ConnectionResetError):
             pass
@@ -9980,6 +9984,90 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    # ── Bouquet-Liste kuratieren (wie Web-UI) ────────────
+    def _is_bouquet_list_request(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if not parsed.path.lower().rstrip("/").endswith("getservices"):
+            return False
+        q = urllib.parse.parse_qs(parsed.query)
+        sref = (q.get("sRef") or q.get("sref") or
+                q.get("bRef") or q.get("bref") or [""])[0]
+        low = sref.lower()
+        if not sref:
+            return True  # Default = TV-Bouquet-Liste
+        if "userbouquet" in low or "radio" in low:
+            return False  # einzelnes Bouquet bzw. Radio → unverändert durchreichen
+        return "bouquets" in low
+
+    def _filter_bouquet_payload(self, raw, is_json, ctype):
+        rx = re.compile(r'"(userbouquet\.[^"]+?\.(?:tv|radio))"')
+        order = {name: i for i, name in enumerate(BOUQUETS)}
+        if is_json:
+            d = json.loads(raw.decode("utf-8", "replace"))
+            keep = []
+            for s in d.get("services", []):
+                m = rx.search(s.get("servicereference", ""))
+                if m and m.group(1) in order:
+                    keep.append((order[m.group(1)], s))
+            keep.sort(key=lambda t: t[0])
+            d["services"] = [s for _, s in keep]
+            return (json.dumps(d).encode("utf-8"),
+                    ctype or "application/json; charset=utf-8", len(keep))
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(raw)
+        services = root.findall("e2service")
+        keep = []
+        for el in services:
+            refel = el.find("e2servicereference")
+            ref = refel.text if refel is not None and refel.text else ""
+            m = rx.search(ref)
+            if m and m.group(1) in order:
+                keep.append((order[m.group(1)], el))
+        for el in services:
+            root.remove(el)
+        for _, el in sorted(keep, key=lambda t: t[0]):
+            root.append(el)
+        body = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        return body, ctype or "text/xml; charset=utf-8", len(keep)
+
+    def _serve_bouquet_list(self):
+        r = _owif_metadata_receiver()
+        if not r:
+            self._fail(503, "Kein Receiver konfiguriert")
+            return
+        url = f"http://{r['ip']}:{r.get('port', 80)}{self.path}"
+        req = urllib.request.Request(url, method="GET")
+        ua = self.headers.get("User-Agent")
+        if ua:
+            req.add_header("User-Agent", ua)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                raw = resp.read()
+                ctype = resp.headers.get("Content-Type", "") or ""
+                status = resp.status
+        except Exception as e:
+            log.warning(f"OpenWebif getservices Upstream-Fehler: {e}")
+            self._reverse_proxy(b"")
+            return
+        is_json = ("json" in ctype.lower() or
+                   urllib.parse.urlparse(self.path).path.lower().startswith("/api"))
+        try:
+            out, out_ctype, n = self._filter_bouquet_payload(raw, is_json, ctype)
+        except Exception as e:
+            log.warning(f"OpenWebif Bouquet-Filter Fehler, reiche unverändert durch: {e}")
+            out, out_ctype, n = raw, (ctype or "application/octet-stream"), -1
+        log.info(f"OpenWebif PROXY [{status}] GET {self.path[:60]} → {r['id']} "
+                 f"(Bouquets kuratiert: {n}) [{(ua or '')[:30]}]")
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", out_ctype)
+            self.send_header("Content-Length", str(len(out)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(out)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
