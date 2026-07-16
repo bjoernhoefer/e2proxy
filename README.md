@@ -196,7 +196,8 @@ e2proxy can impersonate an Enigma2 receiver on its **standard ports** so any nat
 
 **How it works:**
 
-- **Metadata & EPG** (`/api/*`, `/web/*`, `/picon/*`, …) are reverse-proxied to a real receiver, so the app sees authentic OpenWebif responses (device info, bouquets, EPG now/next/multi, picons).
+- **Metadata & EPG** (`/api/*`, `/web/*`, `/picon/*`, …) are reverse-proxied to a real receiver, so the app sees authentic OpenWebif responses (device info, bouquets, EPG now/next/multi, picons). Every request is access-logged (with status + User-Agent) for easy diagnostics.
+- **Bouquet list matches the web UI**: the top-level `getservices` (bouquet list) is curated and reordered to the same selection/order as the e2proxy web UI, so apps like Dream Player don't show the receiver's full raw bouquet list. Channels within a bouquet keep the receiver's native order.
 - **Streaming** (`/<serviceRef>`) is intercepted: e2proxy picks a **free tuner** (orchestration across receivers) and passes the **raw TS through unchanged** (passthrough, no ffmpeg) — fast and light, ideal for Dream Player/Kodi. Plex keeps using its own HDHomeRun path and is unaffected.
 - **Recordings** (`/web/movielist`, `/api/movielist`) are served on the Enigma alt-web port `81` (Dream Player's Recordings tab). e2proxy builds an OpenWebif movie list from its own recordings directory (with title/plot/date pulled from the `.nfo` files) and streams the recording files back with HTTP Range support (seeking), again as raw TS. The recordings live on the e2proxy/e2recorder storage, not on the box — so this exposes *your* recordings, not the (empty) box movie list.
 - **Per-player profiles**: by default everything is passthrough. If a player can't handle raw TS, add a **User-Agent override** in Settings to force a remux/transcode profile for that player only.
