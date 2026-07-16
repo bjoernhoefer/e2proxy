@@ -39,7 +39,14 @@ from datetime import datetime
 # ── Pfade ─────────────────────────────────────────────────
 # Datenpfad: via Env-Variable überschreibbar (für Docker)
 DATA_DIR       = os.environ.get("E2PROXY_DATA_DIR", "/var/lib/e2proxy")
-VERSION        = "3.9"   # Versions-ID — wird bei jeder Änderung neu generiert
+VERSION        = "3.9"   # Offizielle Version — nur beim Pull Request erhöhen (major/minor)
+# ── Interne Build-/Versionskennung ────────────────────────
+# Identifiziert eindeutig den ausgerollten Branch/Stand bei Tests, OHNE die
+# offizielle VERSION zu verändern (die steigt erst beim PR). Bei jedem Test-
+# Rollout eines neuen Standes BUILD_SEQ erhöhen.
+BUILD_BRANCH     = "feature/openwebif-emulation"
+BUILD_SEQ        = "1"
+INTERNAL_VERSION = f"{VERSION}+{BUILD_BRANCH.split('/')[-1]}.{BUILD_SEQ}"
 CONFIG_FILE    = f"{DATA_DIR}/config.json"
 FAVORITES_FILE = f"{DATA_DIR}/favorites.json"
 
@@ -653,6 +660,39 @@ def get_zap_wait():
 
 def get_default_profile():
     return get_config().get("default_device_profile", "Web-SD")
+
+
+def get_owif_config():
+    """Konfiguration der OpenWebif-Emulation ('virtuelle Enigma2-Box').
+
+    e2proxy imitiert auf einem eigenen Port eine Enigma2-Box, sodass Enigma2-
+    Clients (z.B. Dream Player, Kodi) glauben, mit einer echten Box zu reden.
+    Metadaten/EPG werden per Reverse-Proxy vom Receiver geliefert (authentisch),
+    Streaming wird orchestriert (freier Tuner) und standardmäßig als rohes TS
+    durchgereicht. Plex bleibt davon unberührt (eigener HDHomeRun-Pfad).
+
+    ua_overrides: Liste von {"match": <substring>, "profile": <transcode-profil>}
+    — case-insensitive User-Agent-Match wählt ein abweichendes Profil (falls ein
+    Player kein rohes TS kann).
+    """
+    c = get_config().get("openwebif_emulation", {}) or {}
+    overrides = []
+    for ov in c.get("ua_overrides", []) or []:
+        if isinstance(ov, dict) and ov.get("match") and ov.get("profile"):
+            overrides.append({"match": str(ov["match"]), "profile": str(ov["profile"])})
+    # Enigma2-Standardports: OpenWebif :80, Streaming :8001 — für eine 1:1-
+    # Imitation. "port" (Alt-Schlüssel) wird als webif_port akzeptiert.
+    webif_port = int(c.get("webif_port", c.get("port", 80)))
+    stream_port = int(c.get("stream_port", 8001))
+    return {
+        "enabled": bool(c.get("enabled", False)),
+        "bind": c.get("bind", "0.0.0.0"),
+        "webif_port": webif_port,
+        "stream_port": stream_port,
+        "default_profile": c.get("default_profile", "pass"),
+        "metadata_receiver": c.get("metadata_receiver", "auto"),
+        "ua_overrides": overrides,
+    }
 
 
 # ── Umschalt-Tuning (Switch Time) ─────────────────────────
@@ -5775,6 +5815,18 @@ def build_settings_ui():
     tvdb_api_key = cfg.get("tvdb_api_key", "")
     recorder_url = cfg.get("recorder_url", "")
     log_retention_days = cfg.get("log_retention_days", 5)
+    # OpenWebif-Emulation ("virtuelle Enigma2-Box")
+    owif = get_owif_config()
+    owif_enabled_attr = "checked" if owif["enabled"] else ""
+    owif_webif_port = owif["webif_port"]
+    owif_stream_port = owif["stream_port"]
+    owif_bind = owif["bind"]
+    owif_default_profile = owif["default_profile"]
+    owif_profile_options = "".join(
+        f'<option value="{pid}"{" selected" if pid == owif_default_profile else ""}>{pid}</option>'
+        for pid in transcode_profiles.keys()
+    )
+    owif_ua_text = "\n".join(f'{o["match"]} => {o["profile"]}' for o in owif["ua_overrides"])
     version = VERSION
     api_logging_enabled = cfg.get("api_logging", False)
     cfg_json = json.dumps(cfg, indent=2, ensure_ascii=False)
@@ -6371,6 +6423,47 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
     </div>
 
     <div class="card">
+      <div class="card-title">📺 OpenWebif-Emulation <span style="color:var(--muted);font-size:9px;font-weight:400;margin-left:8px;">DREAM PLAYER / KODI</span></div>
+      <p class="card-desc">e2proxy imitiert eine Enigma2-Box auf Standardports (OpenWebif <code>:80</code>, Stream <code>:8001</code>). Enigma2-Apps wie <b>Dream Player</b> (Android/Google TV) oder Kodi zeigen einfach auf e2proxy und glauben, mit einer echten Box zu reden. Metadaten/EPG kommen authentisch vom Receiver, Streaming wird orchestriert (freier Tuner) und standardmäßig als rohes TS durchgereicht (Passthrough, kein ffmpeg). <b>Plex bleibt unberührt.</b></p>
+      <table>
+        <tbody>
+          <tr>
+            <td style="color:var(--muted);width:160px;font-size:11px">Aktiviert</td>
+            <td><label style="font-size:11px"><input type="checkbox" id="owif-enabled" {owif_enabled_attr}> Emulation aktiv</label></td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);font-size:11px">Bind-Adresse</td>
+            <td><input class="input" id="owif-bind" value="{owif_bind}" style="width:180px;font-family:monospace;font-size:11px"> <span style="font-size:10px;color:var(--muted)">0.0.0.0 = alle; oder dedizierte IP</span></td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);font-size:11px">OpenWebif-Port</td>
+            <td><input class="input" id="owif-webif-port" type="number" min="1" max="65535" value="{owif_webif_port}" style="width:90px;font-family:monospace;font-size:11px"> <span style="font-size:10px;color:var(--muted)">Enigma-Standard: 80</span></td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);font-size:11px">Streaming-Port</td>
+            <td><input class="input" id="owif-stream-port" type="number" min="1" max="65535" value="{owif_stream_port}" style="width:90px;font-family:monospace;font-size:11px"> <span style="font-size:10px;color:var(--muted)">Enigma-Standard: 8001</span></td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);font-size:11px">Standard-Profil</td>
+            <td><select class="input" id="owif-default-profile" style="width:180px;font-size:11px">{owif_profile_options}</select> <span style="font-size:10px;color:var(--muted)">pass = rohes TS</span></td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);font-size:11px;vertical-align:top">Player-Overrides<br>(User-Agent)</td>
+            <td>
+              <textarea class="input" id="owif-ua" placeholder="ExoPlayer =&gt; remux-ac3&#10;VLC =&gt; pass" style="width:100%;max-width:420px;height:70px;font-family:monospace;font-size:11px">{owif_ua_text}</textarea>
+              <div style="font-size:10px;color:var(--muted)">Je Zeile: <code>User-Agent-Text =&gt; Profil-ID</code>. Erster Treffer (case-insensitive) gewinnt. Für Player, die kein rohes TS können.</div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="flex">
+        <button class="btn btn-primary" onclick="saveOwif()">💾 <span data-i18n="common.save">Save</span></button>
+        <span id="owif-fb" style="font-size:11px;color:var(--muted)"></span>
+      </div>
+      <p class="card-desc" style="margin-top:8px;font-size:10px">⚠ Port-Änderungen erfordern einen Service-Neustart. Standardports (80/8001) setzen voraus, dass sie auf dem Host frei sind.</p>
+    </div>
+
+    <div class="card">
       <div class="card-title">⚙ <span data-i18n="set.config_editor">Config Editor</span> <span style="color:var(--muted);font-size:9px;font-weight:400;margin-left:8px;">ADVANCED</span></div>
       <p class="card-desc" data-i18n="set.config_editor_hint">Direct editing of the full configuration as JSON. For advanced settings.</p>
       <textarea class="input" id="config-json">{cfg_json}</textarea>
@@ -6911,6 +7004,32 @@ function saveApiKey(key, inputId) {{
       showToast(d.ok ? '✓ API-Key gespeichert!' : 'Fehler', d.ok ? 'success' : 'error');
     }});
   }});
+}}
+
+function saveOwif() {{
+  const fb = document.getElementById('owif-fb');
+  const overrides = [];
+  document.getElementById('owif-ua').value.split('\n').forEach(line => {{
+    const t = line.trim();
+    if (!t) return;
+    const idx = t.indexOf('=>');
+    if (idx < 0) return;
+    const match = t.slice(0, idx).trim();
+    const profile = t.slice(idx + 2).trim();
+    if (match && profile) overrides.push({{match: match, profile: profile}});
+  }});
+  const owif = {{
+    enabled: document.getElementById('owif-enabled').checked,
+    bind: document.getElementById('owif-bind').value.trim() || '0.0.0.0',
+    webif_port: parseInt(document.getElementById('owif-webif-port').value, 10) || 80,
+    stream_port: parseInt(document.getElementById('owif-stream-port').value, 10) || 8001,
+    default_profile: document.getElementById('owif-default-profile').value,
+    ua_overrides: overrides
+  }};
+  apiPost('/api/config-update', {{openwebif_emulation: owif}}).then(d => {{
+    fb.textContent = d.ok ? '✓ Gespeichert — Neustart für Port-Änderungen nötig' : '✗ Fehler';
+    showToast(d.ok ? '✓ OpenWebif-Emulation gespeichert!' : 'Fehler', d.ok ? 'success' : 'error');
+  }}).catch(() => {{ fb.textContent = '✗ Fehler'; }});
 }}
 
 function resetConfig() {{
@@ -8704,7 +8823,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if path == "/api/version":
-            self.send_json({"version": VERSION, "service": "e2proxy"})
+            self.send_json({
+                "version": VERSION,
+                "internal_version": INTERNAL_VERSION,
+                "branch": BUILD_BRANCH,
+                "build": BUILD_SEQ,
+                "service": "e2proxy",
+            })
             return
 
         if path == "/api/logs/files":
@@ -9534,6 +9659,264 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.send_text("Not found", 404)
 
 
+# ── OpenWebif-Emulation ("virtuelle Enigma2-Box") ─────────
+# Eigener HTTP-Listener, der eine Enigma2-Box imitiert. Enigma2-Clients
+# (Dream Player, Kodi, VU+-Apps) werden auf diesen Port konfiguriert und glauben,
+# mit einer echten Box zu reden.
+#   • Metadaten/EPG-Endpunkte (/api/*, /web/*, /picon/*, /grab, ...) → Reverse-
+#     Proxy an einen erreichbaren Receiver → authentische Antworten inkl. EPG.
+#   • Stream-Pfad (/<serviceRef>) → intercept: e2proxy wählt einen freien Tuner
+#     (Orchestrierung) und reicht das rohe TS durch (Passthrough, kein ffmpeg);
+#     per User-Agent kann ein abweichendes Transcode-Profil erzwungen werden.
+# Plex bleibt davon vollständig unberührt (eigener HDHomeRun-Pfad auf Port 8888).
+
+# Erkennung eines Enigma2-Service-Reference-Stream-Pfads: 1:0:19:EF11:421:1:...
+_OWIF_SREF_RE = re.compile(r'^\d+:\d+:[0-9A-Fa-f]+:')
+# Sauberer 10-Feld-Service-Reference (ohne evtl. angehängten Kanalnamen)
+_OWIF_SREF_CLEAN_RE = re.compile(r'^((?:[^:]*:){10})')
+
+
+def _owif_metadata_receiver():
+    """Wählt den Receiver, der Metadaten/EPG-Anfragen beantwortet (Reverse-Proxy).
+
+    Bevorzugt den konfigurierten metadata_receiver, sonst den Default-Receiver,
+    sonst den ersten aktivierten. Gesperrte Receiver sind ok (nur Metadaten, kein
+    Tuner nötig)."""
+    receivers = get_receivers()
+    if not receivers:
+        return None
+    pref = get_owif_config().get("metadata_receiver", "auto")
+    if pref and pref != "auto":
+        for r in receivers:
+            if r["id"] == pref and r.get("enabled", True):
+                return r
+    for r in receivers:
+        if r.get("default") and r.get("enabled", True):
+            return r
+    for r in receivers:
+        if r.get("enabled", True):
+            return r
+    return receivers[0]
+
+
+class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    # ── Routing ──────────────────────────────────────────
+    def _rest(self):
+        parsed = urllib.parse.urlparse(self.path)
+        return urllib.parse.unquote(parsed.path).lstrip("/")
+
+    def _is_stream(self):
+        return bool(_OWIF_SREF_RE.match(self._rest()))
+
+    def do_HEAD(self):
+        if self._is_stream():
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "video/mp2t")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+            except Exception:
+                pass
+            return
+        # Metadaten: einfacher 200er reicht als Verbindungstest
+        try:
+            self.send_response(200)
+            self.send_header("Connection", "close")
+            self.end_headers()
+        except Exception:
+            pass
+
+    def do_GET(self):
+        try:
+            if self._is_stream():
+                self._serve_stream(self._rest())
+            else:
+                self._reverse_proxy(b"")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            log.error(f"OpenWebif do_GET Fehler ({self.path}): {e}")
+            self._fail(500, str(e))
+
+    def do_POST(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            body = self.rfile.read(length) if length else b""
+            self._reverse_proxy(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            log.error(f"OpenWebif do_POST Fehler ({self.path}): {e}")
+            self._fail(500, str(e))
+
+    # ── Hilfen ───────────────────────────────────────────
+    def _fail(self, code, msg):
+        try:
+            body = msg.encode("utf-8", "replace")
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    # ── Reverse-Proxy für Metadaten/EPG ──────────────────
+    def _reverse_proxy(self, body):
+        r = _owif_metadata_receiver()
+        if not r:
+            self._fail(503, "Kein Receiver konfiguriert")
+            return
+        url = f"http://{r['ip']}:{r.get('port', 80)}{self.path}"
+        req = urllib.request.Request(url, data=(body or None), method=self.command)
+        for h in ("User-Agent", "Accept", "Accept-Language", "Authorization", "Content-Type"):
+            v = self.headers.get(h)
+            if v:
+                req.add_header(h, v)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = resp.read()
+                status = resp.status
+                ctype = resp.headers.get("Content-Type", "application/octet-stream")
+        except urllib.error.HTTPError as e:
+            data = e.read()
+            status = e.code
+            ctype = e.headers.get("Content-Type", "text/plain") if e.headers else "text/plain"
+        except Exception as e:
+            log.warning(f"OpenWebif Reverse-Proxy Fehler ({url}): {e}")
+            self._fail(502, f"Upstream-Fehler: {e}")
+            return
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    # ── Stream-Intercept mit Tuner-Orchestrierung ────────
+    def _pick_profile(self):
+        owif = get_owif_config()
+        ua = self.headers.get("User-Agent", "") or ""
+        ua_l = ua.lower()
+        profile_id = owif["default_profile"]
+        for ov in owif["ua_overrides"]:
+            if ov["match"].lower() in ua_l:
+                profile_id = ov["profile"]
+                break
+        return profile_id, ua
+
+    def _serve_stream(self, rest):
+        m = _OWIF_SREF_CLEAN_RE.match(rest)
+        sref = m.group(1) if m else rest
+        profile_id, ua = self._pick_profile()
+        client_ip = self.client_address[0]
+
+        tp = get_transcode_profile(profile_id)
+        passthrough = (not tp) or tp.get("codec") == "pass"
+
+        _ch_lookup = {ch["ref"].rstrip("/"): ch["name"] for ch in get_channels()}
+        channel_name = _ch_lookup.get(sref.rstrip("/"), sref[:30])
+
+        # Receiver wählen: bereits laufenden Tuner für denselben Sender bevorzugen
+        # (Shared Tuner), sonst einen freien.
+        rid = None
+        shared = False
+        with receiver_lock:
+            for r in get_receivers():
+                st = _receiver_state.get(r["id"])
+                if st and st.get("service_ref", "").rstrip("/") == sref.rstrip("/"):
+                    rid = r["id"]
+                    shared = True
+                    break
+        if not rid:
+            rid = get_free_receiver()
+        if not rid:
+            self._fail(503, "All receivers busy")
+            return
+
+        log.info(f"OpenWebif STREAM [{profile_id}] from {client_ip}: {channel_name} "
+                 f"[{ua[:40]}] (receiver={rid}, shared={shared})")
+
+        if not shared:
+            acquire_receiver(rid, client_ip, sref, channel_name)
+        try:
+            if not shared:
+                if not do_zap(rid, sref, channel_name):
+                    self._fail(502, "Zap fehlgeschlagen")
+                    return
+                zap_wait = get_switch_settings(sref)["zap_wait"]
+                if zap_wait > 0:
+                    time.sleep(zap_wait)
+
+            if passthrough:
+                content_type = "video/mp2t"
+            else:
+                _, content_type = build_ffmpeg_cmd(rid, sref, tp)
+
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            if passthrough:
+                stream_passthrough(rid, sref, self.wfile, use_chunked=False)
+            else:
+                stream_transcoded(rid, sref, tp, self.wfile, use_chunked=False,
+                                   channel_name=channel_name)
+        except ScrambledStreamError:
+            log.warning(f"OpenWebif SCRAMBLED: {sref}")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            log.error(f"OpenWebif STREAM ERROR: {e}")
+        finally:
+            if not shared:
+                release_receiver(rid)
+
+
+def start_openwebif_server():
+    """Startet die OpenWebif-Emulation, falls aktiviert.
+
+    Imitiert eine Enigma2-Box mit Standardports: OpenWebif auf :80 (Metadaten/EPG)
+    und Streaming auf :8001. Beide Ports nutzen denselben Handler (Stream-Pfade
+    werden intern erkannt), sind aber getrennt lauschbar wie bei einer echten Box.
+    """
+    owif = get_owif_config()
+    if not owif["enabled"]:
+        log.info("OpenWebif-Emulation: deaktiviert")
+        return []
+    bind = owif["bind"]
+    ports = {owif["webif_port"], owif["stream_port"]}
+    servers = []
+    for p in sorted(ports):
+        try:
+            srv = http.server.ThreadingHTTPServer((bind, p), OpenWebifHandler)
+        except Exception as e:
+            log.error(f"OpenWebif-Emulation: Port {p} konnte nicht gebunden werden: {e}")
+            continue
+        threading.Thread(target=srv.serve_forever, daemon=True,
+                         name=f"openwebif-{p}").start()
+        servers.append(srv)
+    if servers:
+        log.info(f"OpenWebif-Emulation aktiv auf {bind} — OpenWebif:{owif['webif_port']} "
+                 f"Stream:{owif['stream_port']} (Default-Profil: {owif['default_profile']}, "
+                 f"{len(owif['ua_overrides'])} UA-Overrides)")
+    return servers
+
+
 # ── Main ──────────────────────────────────────────────────
 
 _proxy_start_time = time.time()
@@ -9628,10 +10011,14 @@ def run():
     # SSDP Discovery starten (Plex findet den Proxy automatisch)
     start_ssdp_server()
 
+    # OpenWebif-Emulation ("virtuelle Enigma2-Box") starten, falls aktiviert
+    start_openwebif_server()
+
     server = http.server.ThreadingHTTPServer(("0.0.0.0", proxy_port), ProxyHandler)
 
     log.info("=" * 55)
     log.info(f"e2proxy v{VERSION} started")
+    log.info(f"Build:     {INTERNAL_VERSION}")
     log.info(f"Web-UI:    http://{proxy_host}:{proxy_port}/")
     log.info(f"Settings:  http://{proxy_host}:{proxy_port}/settings")
     log.info(f"Config:    {CONFIG_FILE}")

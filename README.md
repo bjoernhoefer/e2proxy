@@ -7,6 +7,7 @@ Single Python file, runs in Docker, manages two SAT receivers with automatic tun
 ## Features
 
 - **Live TV Streaming** — Watch any channel in the browser (WebM VP8/VP9) or via M3U playlist
+- **OpenWebif Emulation** — Impersonates an Enigma2 box on standard ports (OpenWebif `:80`, streaming `:8001`) so native Enigma2 apps like **Dream Player** (Android/Google TV) or Kodi can point straight at e2proxy. Metadata/EPG are served authentically from the receiver, streaming is orchestrated onto a free tuner and passed through as raw TS by default (no ffmpeg)
 - **Plex DVR Integration** — HDHomeRun emulation with SSDP auto-discovery, no Threadfin needed
 - **EPG Browser** — 28-hour program guide as interactive timeline grid with TMDB artwork
 - **Recording System** — ffmpeg-based with Plex-compliant directory structure (`TV/Show/Season XX/`)
@@ -188,6 +189,36 @@ All configuration stored in `/data/config.json`.
 - **Daily shows** → Day-of-year numbering (S2026E163 = June 12)
 - **Movies** → `Movies/<Title> (<Year>)/`
 - **NFO files** → Plex/Kodi-compatible metadata
+
+## OpenWebif Emulation (Dream Player, Kodi & other Enigma2 apps)
+
+e2proxy can impersonate an Enigma2 receiver on its **standard ports** so any native Enigma2 client — most notably **[Dream Player](https://dreamepg.de) for Android/Google TV** — can talk to e2proxy as if it were a real box, including full EPG.
+
+**How it works:**
+
+- **Metadata & EPG** (`/api/*`, `/web/*`, `/picon/*`, …) are reverse-proxied to a real receiver, so the app sees authentic OpenWebif responses (device info, bouquets, EPG now/next/multi, picons).
+- **Streaming** (`/<serviceRef>`) is intercepted: e2proxy picks a **free tuner** (orchestration across receivers) and passes the **raw TS through unchanged** (passthrough, no ffmpeg) — fast and light, ideal for Dream Player/Kodi. Plex keeps using its own HDHomeRun path and is unaffected.
+- **Per-player profiles**: by default everything is passthrough. If a player can't handle raw TS, add a **User-Agent override** in Settings to force a remux/transcode profile for that player only.
+
+**Enable** (Settings → OpenWebif Emulation, or `config.json`):
+
+```json
+"openwebif_emulation": {
+  "enabled": true,
+  "bind": "0.0.0.0",
+  "webif_port": 80,
+  "stream_port": 8001,
+  "default_profile": "pass",
+  "metadata_receiver": "auto",
+  "ua_overrides": [
+    { "match": "ExoPlayer", "profile": "remux-ac3" }
+  ]
+}
+```
+
+> Standard ports `80` + `8001` must be free on the host (e.g. disable any web server occupying port 80). Ports are configurable; a change requires a service restart.
+
+**Dream Player setup:** add a device pointing at the e2proxy host IP, OpenWebif port `80`, streaming port `8001`, no username/password. EPG and channels are pulled automatically.
 
 ## Companion: e2recorder
 
