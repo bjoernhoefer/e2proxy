@@ -45,7 +45,7 @@ VERSION        = "3.9"   # Offizielle Version — nur beim Pull Request erhöhen
 # offizielle VERSION zu verändern (die steigt erst beim PR). Bei jedem Test-
 # Rollout eines neuen Standes BUILD_SEQ erhöhen.
 BUILD_BRANCH     = "feature/openwebif-emulation"
-BUILD_SEQ        = "1"
+BUILD_SEQ        = "3"
 INTERNAL_VERSION = f"{VERSION}+{BUILD_BRANCH.split('/')[-1]}.{BUILD_SEQ}"
 CONFIG_FILE    = f"{DATA_DIR}/config.json"
 FAVORITES_FILE = f"{DATA_DIR}/favorites.json"
@@ -684,11 +684,16 @@ def get_owif_config():
     # Imitation. "port" (Alt-Schlüssel) wird als webif_port akzeptiert.
     webif_port = int(c.get("webif_port", c.get("port", 80)))
     stream_port = int(c.get("stream_port", 8001))
+    # Aufnahmen: Dream Player erwartet die Movielist auf einem zweiten
+    # OpenWebif-Web-Port (Enigma-Standard-Alt-Port 81). 0 = deaktiviert.
+    recordings_port = int(c.get("recordings_port", 81))
     return {
         "enabled": bool(c.get("enabled", False)),
         "bind": c.get("bind", "0.0.0.0"),
         "webif_port": webif_port,
         "stream_port": stream_port,
+        "recordings_port": recordings_port,
+        "recordings_enabled": bool(c.get("recordings_enabled", True)),
         "default_profile": c.get("default_profile", "pass"),
         "metadata_receiver": c.get("metadata_receiver", "auto"),
         "ua_overrides": overrides,
@@ -5820,6 +5825,8 @@ def build_settings_ui():
     owif_enabled_attr = "checked" if owif["enabled"] else ""
     owif_webif_port = owif["webif_port"]
     owif_stream_port = owif["stream_port"]
+    owif_recordings_port = owif["recordings_port"]
+    owif_recordings_attr = "checked" if owif["recordings_enabled"] else ""
     owif_bind = owif["bind"]
     owif_default_profile = owif["default_profile"]
     owif_profile_options = "".join(
@@ -6444,6 +6451,14 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
             <td><input class="input" id="owif-stream-port" type="number" min="1" max="65535" value="{owif_stream_port}" style="width:90px;font-family:monospace;font-size:11px"> <span style="font-size:10px;color:var(--muted)">Enigma-Standard: 8001</span></td>
           </tr>
           <tr>
+            <td style="color:var(--muted);font-size:11px">Aufnahmen (Dream Player)</td>
+            <td><label style="font-size:11px"><input type="checkbox" id="owif-recordings-enabled" {owif_recordings_attr}> Movielist bereitstellen</label></td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);font-size:11px">Aufnahmen-Port</td>
+            <td><input class="input" id="owif-recordings-port" type="number" min="0" max="65535" value="{owif_recordings_port}" style="width:90px;font-family:monospace;font-size:11px"> <span style="font-size:10px;color:var(--muted)">Enigma-Standard: 81 (0 = aus)</span></td>
+          </tr>
+          <tr>
             <td style="color:var(--muted);font-size:11px">Standard-Profil</td>
             <td><select class="input" id="owif-default-profile" style="width:180px;font-size:11px">{owif_profile_options}</select> <span style="font-size:10px;color:var(--muted)">pass = rohes TS</span></td>
           </tr>
@@ -7023,6 +7038,8 @@ function saveOwif() {{
     bind: document.getElementById('owif-bind').value.trim() || '0.0.0.0',
     webif_port: parseInt(document.getElementById('owif-webif-port').value, 10) || 80,
     stream_port: parseInt(document.getElementById('owif-stream-port').value, 10) || 8001,
+    recordings_enabled: document.getElementById('owif-recordings-enabled').checked,
+    recordings_port: parseInt(document.getElementById('owif-recordings-port').value, 10) || 0,
     default_profile: document.getElementById('owif-default-profile').value,
     ua_overrides: overrides
   }};
@@ -9078,7 +9095,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         continue
                     try:
                         # Parse XMLTV timestamp: "20260528130000 +0000"
-                        from datetime import datetime, timezone
+                        from datetime import timezone
                         def parse_xmltv_ts(s):
                             s = s.strip()
                             if " " in s:
@@ -9699,6 +9716,145 @@ def _owif_metadata_receiver():
     return receivers[0]
 
 
+# ── Aufnahmen-Movielist (OpenWebif-Emulation für Dream Player) ────────
+_OWIF_REC_MEDIA_EXT = (".ts", ".mkv", ".mp4", ".m2ts")
+# File-Service-Reference einer Aufnahme: 1:0:0:0:0:0:0:0:0:0:/pfad/datei.ts
+_OWIF_FILE_SREF_PREFIX = "1:0:0:0:0:0:0:0:0:0:"
+
+
+def _owif_parse_nfo(path):
+    """Best-effort Parser für Kodi/e2proxy .nfo-Dateien.
+
+    Liefert dict(title, plot, duration_s, ts_epoch) oder None."""
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.parse(path).getroot()
+    except Exception:
+        return None
+
+    def g(tag):
+        el = root.find(tag)
+        return el.text.strip() if el is not None and el.text else ""
+
+    title = g("title")
+    plot = g("plot") or g("outline")
+    dur = 0
+    di = root.find(".//durationinseconds")
+    if di is not None and di.text and di.text.strip().isdigit():
+        dur = int(di.text.strip())
+    elif g("runtime").isdigit():
+        dur = int(g("runtime")) * 60
+    ts = 0
+    for tag in ("aired", "premiered", "dateadded"):
+        v = g(tag)
+        if not v:
+            continue
+        for fmt, ln in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d", 10)):
+            try:
+                ts = int(datetime.strptime(v[:ln], fmt).timestamp())
+                break
+            except Exception:
+                pass
+        if ts:
+            break
+    return {"title": title, "plot": plot, "duration": dur, "ts": ts}
+
+
+def _owif_scan_movies():
+    """Durchsucht das Aufnahme-Verzeichnis und baut eine OpenWebif-taugliche
+    Movie-Liste (neueste zuerst). Metadaten kommen aus .nfo-Dateien."""
+    rcfg = get_recordings_config()
+    base = os.path.abspath(rcfg["path"])
+    movies = []
+    if not os.path.isdir(base):
+        return base, movies
+    for root_dir, dirs, files in os.walk(base):
+        for fname in sorted(files):
+            if not fname.lower().endswith(_OWIF_REC_MEDIA_EXT):
+                continue
+            fpath = os.path.join(root_dir, fname)
+            try:
+                size = os.path.getsize(fpath)
+                mtime = int(os.path.getmtime(fpath))
+            except OSError:
+                continue
+            stem = os.path.splitext(fname)[0]
+            meta = None
+            for cand in (os.path.join(root_dir, stem + ".nfo"),
+                         os.path.join(root_dir, "movie.nfo"),
+                         os.path.join(root_dir, "tvshow.nfo")):
+                if os.path.exists(cand):
+                    meta = _owif_parse_nfo(cand)
+                    if meta:
+                        break
+            meta = meta or {}
+            rel = os.path.relpath(fpath, base)
+            parts = rel.split(os.sep)
+            category = parts[0] if len(parts) > 1 else ""
+            # TV/<Serie>/Season …/datei.ts  bzw.  Movies/<Titel>/datei.ts
+            if category.lower() in ("tv", "movies") and len(parts) >= 2:
+                series = parts[1]
+            else:
+                series = category
+            ep_title = meta.get("title") or stem
+            if category.lower() == "tv" and series and ep_title and ep_title != series:
+                disp_title = f"{series} – {ep_title}"
+            else:
+                disp_title = ep_title or series
+            movies.append({
+                "path": fpath,
+                "title": disp_title,
+                "plot": meta.get("plot", ""),
+                "servicename": series or "e2proxy",
+                "time": meta.get("ts") or mtime,
+                "duration": meta.get("duration", 0),
+                "size": size,
+                "filename": fpath,
+                "sref": _OWIF_FILE_SREF_PREFIX + fpath,
+            })
+    movies.sort(key=lambda m: m["time"], reverse=True)
+    return base, movies
+
+
+def _owif_movielist_xml(base, movies):
+    from xml.sax.saxutils import escape
+    out = ['<?xml version="1.0" encoding="UTF-8"?>', "<e2movielist>"]
+    for m in movies:
+        out.append("<e2movie>")
+        out.append(f"<e2servicereference>{escape(m['sref'])}</e2servicereference>")
+        out.append(f"<e2title>{escape(m['title'])}</e2title>")
+        out.append(f"<e2description>{escape(m['plot'][:200])}</e2description>")
+        out.append(f"<e2descriptionextended>{escape(m['plot'])}</e2descriptionextended>")
+        out.append(f"<e2servicename>{escape(m['servicename'])}</e2servicename>")
+        out.append(f"<e2time>{m['time']}</e2time>")
+        out.append(f"<e2length>{m['duration']}</e2length>")
+        out.append("<e2tags></e2tags>")
+        out.append(f"<e2filename>{escape(m['filename'])}</e2filename>")
+        out.append(f"<e2filesize>{m['size']}</e2filesize>")
+        out.append("</e2movie>")
+    out.append("</e2movielist>")
+    return "\n".join(out)
+
+
+def _owif_movielist_json(base, movies):
+    return {
+        "directory": base if base.endswith("/") else base + "/",
+        "bookmarks": [],
+        "movies": [{
+            "servicereference": m["sref"],
+            "title": m["title"],
+            "description": m["plot"][:200],
+            "descriptionExtended": m["plot"],
+            "servicename": m["servicename"],
+            "recordingtime": m["time"],
+            "length": m["duration"],
+            "filename": m["filename"],
+            "filesize": m["size"],
+            "tags": "",
+        } for m in movies],
+    }
+
+
 class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
 
     protocol_version = "HTTP/1.1"
@@ -9710,6 +9866,10 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
     def _rest(self):
         parsed = urllib.parse.urlparse(self.path)
         return urllib.parse.unquote(parsed.path).lstrip("/")
+
+    def _query(self):
+        parsed = urllib.parse.urlparse(self.path)
+        return urllib.parse.parse_qs(parsed.query)
 
     def _is_stream(self):
         return bool(_OWIF_SREF_RE.match(self._rest()))
@@ -9735,10 +9895,22 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
+            rest = self._rest()
+            low = rest.lower()
+            # Aufnahmen-Übersicht (Dream Player Recordings-Tab)
+            if low in ("web/movielist", "api/movielist"):
+                log.info(f"OpenWebif MOVIELIST from {self.client_address[0]} "
+                         f"[{self.headers.get('User-Agent','')[:40]}]")
+                self._serve_movielist(is_json=low.startswith("api/"))
+                return
+            # OpenWebif-Datei-Download/-Stream einer Aufnahme
+            if low == "file":
+                self._serve_file_param()
+                return
             if self._is_stream():
-                self._serve_stream(self._rest())
-            else:
-                self._reverse_proxy(b"")
+                self._serve_stream(rest)
+                return
+            self._reverse_proxy(b"")
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as e:
@@ -9804,6 +9976,85 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    # ── Aufnahmen: Movielist + Datei-Streaming ───────────
+    def _serve_movielist(self, is_json):
+        if not get_owif_config().get("recordings_enabled", True):
+            base, movies = "/", []
+        else:
+            base, movies = _owif_scan_movies()
+        if is_json:
+            payload = json.dumps(_owif_movielist_json(base, movies)).encode("utf-8")
+            ctype = "application/json; charset=utf-8"
+        else:
+            payload = _owif_movielist_xml(base, movies).encode("utf-8")
+            ctype = "text/xml; charset=utf-8"
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _serve_file_param(self):
+        """OpenWebif /file?file=<pfad> — Aufnahmen lokal ausliefern, sonst
+        an den Receiver weiterreichen (z. B. Picons/Logs)."""
+        fp = self._query().get("file", [""])[0]
+        base = os.path.abspath(get_recordings_config()["path"])
+        if fp and os.path.abspath(fp).startswith(base) and os.path.isfile(fp):
+            self._send_file_range(fp)
+            return
+        self._reverse_proxy(b"")
+
+    def _serve_recording_file(self, filepath):
+        base = os.path.abspath(get_recordings_config()["path"])
+        real = os.path.abspath(filepath)
+        if not real.startswith(base) or not os.path.isfile(real):
+            self._fail(404, "Aufnahme nicht gefunden")
+            return
+        log.info(f"OpenWebif RECORDING from {self.client_address[0]}: "
+                 f"{os.path.basename(real)}")
+        self._send_file_range(real)
+
+    def _send_file_range(self, filepath):
+        """Liefert eine Datei mit Range-Support (Seeking) aus — rohes TS,
+        kein ffmpeg."""
+        file_size = os.path.getsize(filepath)
+        range_header = self.headers.get("Range", "")
+        start, end, status = 0, file_size - 1, 200
+        if range_header.startswith("bytes="):
+            try:
+                r = range_header[6:].split("-")
+                start = int(r[0]) if r[0] else 0
+                end = int(r[1]) if len(r) > 1 and r[1] else file_size - 1
+                end = min(end, file_size - 1)
+                status = 206
+            except Exception:
+                start, end, status = 0, file_size - 1, 200
+        length = end - start + 1
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "video/mp2t")
+            self.send_header("Content-Length", str(length))
+            self.send_header("Accept-Ranges", "bytes")
+            if status == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            with open(filepath, "rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(262144, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     # ── Stream-Intercept mit Tuner-Orchestrierung ────────
     def _pick_profile(self):
         owif = get_owif_config()
@@ -9818,6 +10069,12 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
 
     def _serve_stream(self, rest):
         m = _OWIF_SREF_CLEAN_RE.match(rest)
+        # File-Service-Reference einer Aufnahme (…:0:/pfad.ts) → lokale Datei
+        if m:
+            remainder = rest[m.end():]
+            if remainder.startswith("/"):
+                self._serve_recording_file(remainder)
+                return
         sref = m.group(1) if m else rest
         profile_id, ua = self._pick_profile()
         client_ip = self.client_address[0]
@@ -9900,6 +10157,8 @@ def start_openwebif_server():
         return []
     bind = owif["bind"]
     ports = {owif["webif_port"], owif["stream_port"]}
+    if owif.get("recordings_enabled", True) and owif.get("recordings_port"):
+        ports.add(owif["recordings_port"])
     servers = []
     for p in sorted(ports):
         try:
@@ -9912,7 +10171,8 @@ def start_openwebif_server():
         servers.append(srv)
     if servers:
         log.info(f"OpenWebif-Emulation aktiv auf {bind} — OpenWebif:{owif['webif_port']} "
-                 f"Stream:{owif['stream_port']} (Default-Profil: {owif['default_profile']}, "
+                 f"Stream:{owif['stream_port']} Recordings:{owif.get('recordings_port')} "
+                 f"(Default-Profil: {owif['default_profile']}, "
                  f"{len(owif['ua_overrides'])} UA-Overrides)")
     return servers
 
