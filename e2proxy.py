@@ -39,7 +39,14 @@ from datetime import datetime
 # ── Pfade ─────────────────────────────────────────────────
 # Datenpfad: via Env-Variable überschreibbar (für Docker)
 DATA_DIR       = os.environ.get("E2PROXY_DATA_DIR", "/var/lib/e2proxy")
-VERSION        = "3.9"   # Versions-ID — wird bei jeder Änderung neu generiert
+VERSION        = "4.0"   # Offizielle Version — nur beim Pull Request erhöhen (major/minor)
+# ── Interne Build-/Versionskennung ────────────────────────
+# Identifiziert eindeutig den ausgerollten Branch/Stand bei Tests, OHNE die
+# offizielle VERSION zu verändern (die steigt erst beim PR). Bei jedem Test-
+# Rollout eines neuen Standes BUILD_SEQ erhöhen.
+BUILD_BRANCH     = "feature/openwebif-emulation"
+BUILD_SEQ        = "7"
+INTERNAL_VERSION = f"{VERSION}+{BUILD_BRANCH.split('/')[-1]}.{BUILD_SEQ}"
 CONFIG_FILE    = f"{DATA_DIR}/config.json"
 FAVORITES_FILE = f"{DATA_DIR}/favorites.json"
 
@@ -653,6 +660,44 @@ def get_zap_wait():
 
 def get_default_profile():
     return get_config().get("default_device_profile", "Web-SD")
+
+
+def get_owif_config():
+    """Konfiguration der OpenWebif-Emulation ('virtuelle Enigma2-Box').
+
+    e2proxy imitiert auf einem eigenen Port eine Enigma2-Box, sodass Enigma2-
+    Clients (z.B. Dream Player, Kodi) glauben, mit einer echten Box zu reden.
+    Metadaten/EPG werden per Reverse-Proxy vom Receiver geliefert (authentisch),
+    Streaming wird orchestriert (freier Tuner) und standardmäßig als rohes TS
+    durchgereicht. Plex bleibt davon unberührt (eigener HDHomeRun-Pfad).
+
+    ua_overrides: Liste von {"match": <substring>, "profile": <transcode-profil>}
+    — case-insensitive User-Agent-Match wählt ein abweichendes Profil (falls ein
+    Player kein rohes TS kann).
+    """
+    c = get_config().get("openwebif_emulation", {}) or {}
+    overrides = []
+    for ov in c.get("ua_overrides", []) or []:
+        if isinstance(ov, dict) and ov.get("match") and ov.get("profile"):
+            overrides.append({"match": str(ov["match"]), "profile": str(ov["profile"])})
+    # Enigma2-Standardports: OpenWebif :80, Streaming :8001 — für eine 1:1-
+    # Imitation. "port" (Alt-Schlüssel) wird als webif_port akzeptiert.
+    webif_port = int(c.get("webif_port", c.get("port", 80)))
+    stream_port = int(c.get("stream_port", 8001))
+    # Aufnahmen: Dream Player erwartet die Movielist auf einem zweiten
+    # OpenWebif-Web-Port (Enigma-Standard-Alt-Port 81). 0 = deaktiviert.
+    recordings_port = int(c.get("recordings_port", 81))
+    return {
+        "enabled": bool(c.get("enabled", False)),
+        "bind": c.get("bind", "0.0.0.0"),
+        "webif_port": webif_port,
+        "stream_port": stream_port,
+        "recordings_port": recordings_port,
+        "recordings_enabled": bool(c.get("recordings_enabled", True)),
+        "default_profile": c.get("default_profile", "pass"),
+        "metadata_receiver": c.get("metadata_receiver", "auto"),
+        "ua_overrides": overrides,
+    }
 
 
 # ── Umschalt-Tuning (Switch Time) ─────────────────────────
@@ -5775,6 +5820,20 @@ def build_settings_ui():
     tvdb_api_key = cfg.get("tvdb_api_key", "")
     recorder_url = cfg.get("recorder_url", "")
     log_retention_days = cfg.get("log_retention_days", 5)
+    # OpenWebif-Emulation ("virtuelle Enigma2-Box")
+    owif = get_owif_config()
+    owif_enabled_attr = "checked" if owif["enabled"] else ""
+    owif_webif_port = owif["webif_port"]
+    owif_stream_port = owif["stream_port"]
+    owif_recordings_port = owif["recordings_port"]
+    owif_recordings_attr = "checked" if owif["recordings_enabled"] else ""
+    owif_bind = owif["bind"]
+    owif_default_profile = owif["default_profile"]
+    owif_profile_options = "".join(
+        f'<option value="{pid}"{" selected" if pid == owif_default_profile else ""}>{pid}</option>'
+        for pid in transcode_profiles.keys()
+    )
+    owif_ua_text = "\n".join(f'{o["match"]} => {o["profile"]}' for o in owif["ua_overrides"])
     version = VERSION
     api_logging_enabled = cfg.get("api_logging", False)
     cfg_json = json.dumps(cfg, indent=2, ensure_ascii=False)
@@ -6371,6 +6430,55 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
     </div>
 
     <div class="card">
+      <div class="card-title">📺 OpenWebif-Emulation <span style="color:var(--muted);font-size:9px;font-weight:400;margin-left:8px;">DREAM PLAYER / KODI</span></div>
+      <p class="card-desc">e2proxy imitiert eine Enigma2-Box auf Standardports (OpenWebif <code>:80</code>, Stream <code>:8001</code>). Enigma2-Apps wie <b>Dream Player</b> (Android/Google TV) oder Kodi zeigen einfach auf e2proxy und glauben, mit einer echten Box zu reden. Metadaten/EPG kommen authentisch vom Receiver, Streaming wird orchestriert (freier Tuner) und standardmäßig als rohes TS durchgereicht (Passthrough, kein ffmpeg). <b>Plex bleibt unberührt.</b></p>
+      <table>
+        <tbody>
+          <tr>
+            <td style="color:var(--muted);width:160px;font-size:11px">Aktiviert</td>
+            <td><label style="font-size:11px"><input type="checkbox" id="owif-enabled" {owif_enabled_attr}> Emulation aktiv</label></td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);font-size:11px">Bind-Adresse</td>
+            <td><input class="input" id="owif-bind" value="{owif_bind}" style="width:180px;font-family:monospace;font-size:11px"> <span style="font-size:10px;color:var(--muted)">0.0.0.0 = alle; oder dedizierte IP</span></td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);font-size:11px">OpenWebif-Port</td>
+            <td><input class="input" id="owif-webif-port" type="number" min="1" max="65535" value="{owif_webif_port}" style="width:90px;font-family:monospace;font-size:11px"> <span style="font-size:10px;color:var(--muted)">Enigma-Standard: 80</span></td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);font-size:11px">Streaming-Port</td>
+            <td><input class="input" id="owif-stream-port" type="number" min="1" max="65535" value="{owif_stream_port}" style="width:90px;font-family:monospace;font-size:11px"> <span style="font-size:10px;color:var(--muted)">Enigma-Standard: 8001</span></td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);font-size:11px">Aufnahmen (Dream Player)</td>
+            <td><label style="font-size:11px"><input type="checkbox" id="owif-recordings-enabled" {owif_recordings_attr}> Movielist bereitstellen</label></td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);font-size:11px">Aufnahmen-Port</td>
+            <td><input class="input" id="owif-recordings-port" type="number" min="0" max="65535" value="{owif_recordings_port}" style="width:90px;font-family:monospace;font-size:11px"> <span style="font-size:10px;color:var(--muted)">Enigma-Standard: 81 (0 = aus)</span></td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);font-size:11px">Standard-Profil</td>
+            <td><select class="input" id="owif-default-profile" style="width:180px;font-size:11px">{owif_profile_options}</select> <span style="font-size:10px;color:var(--muted)">pass = rohes TS</span></td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);font-size:11px;vertical-align:top">Player-Overrides<br>(User-Agent)</td>
+            <td>
+              <textarea class="input" id="owif-ua" placeholder="ExoPlayer =&gt; remux-ac3&#10;VLC =&gt; pass" style="width:100%;max-width:420px;height:70px;font-family:monospace;font-size:11px">{owif_ua_text}</textarea>
+              <div style="font-size:10px;color:var(--muted)">Je Zeile: <code>User-Agent-Text =&gt; Profil-ID</code>. Erster Treffer (case-insensitive) gewinnt. Für Player, die kein rohes TS können.</div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="flex">
+        <button class="btn btn-primary" onclick="saveOwif()">💾 <span data-i18n="common.save">Save</span></button>
+        <span id="owif-fb" style="font-size:11px;color:var(--muted)"></span>
+      </div>
+      <p class="card-desc" style="margin-top:8px;font-size:10px">⚠ Port-Änderungen erfordern einen Service-Neustart. Standardports (80/8001) setzen voraus, dass sie auf dem Host frei sind.</p>
+    </div>
+
+    <div class="card">
       <div class="card-title">⚙ <span data-i18n="set.config_editor">Config Editor</span> <span style="color:var(--muted);font-size:9px;font-weight:400;margin-left:8px;">ADVANCED</span></div>
       <p class="card-desc" data-i18n="set.config_editor_hint">Direct editing of the full configuration as JSON. For advanced settings.</p>
       <textarea class="input" id="config-json">{cfg_json}</textarea>
@@ -6911,6 +7019,34 @@ function saveApiKey(key, inputId) {{
       showToast(d.ok ? '✓ API-Key gespeichert!' : 'Fehler', d.ok ? 'success' : 'error');
     }});
   }});
+}}
+
+function saveOwif() {{
+  const fb = document.getElementById('owif-fb');
+  const overrides = [];
+  document.getElementById('owif-ua').value.split('\n').forEach(line => {{
+    const t = line.trim();
+    if (!t) return;
+    const idx = t.indexOf('=>');
+    if (idx < 0) return;
+    const match = t.slice(0, idx).trim();
+    const profile = t.slice(idx + 2).trim();
+    if (match && profile) overrides.push({{match: match, profile: profile}});
+  }});
+  const owif = {{
+    enabled: document.getElementById('owif-enabled').checked,
+    bind: document.getElementById('owif-bind').value.trim() || '0.0.0.0',
+    webif_port: parseInt(document.getElementById('owif-webif-port').value, 10) || 80,
+    stream_port: parseInt(document.getElementById('owif-stream-port').value, 10) || 8001,
+    recordings_enabled: document.getElementById('owif-recordings-enabled').checked,
+    recordings_port: parseInt(document.getElementById('owif-recordings-port').value, 10) || 0,
+    default_profile: document.getElementById('owif-default-profile').value,
+    ua_overrides: overrides
+  }};
+  apiPost('/api/config-update', {{openwebif_emulation: owif}}).then(d => {{
+    fb.textContent = d.ok ? '✓ Gespeichert — Neustart für Port-Änderungen nötig' : '✗ Fehler';
+    showToast(d.ok ? '✓ OpenWebif-Emulation gespeichert!' : 'Fehler', d.ok ? 'success' : 'error');
+  }}).catch(() => {{ fb.textContent = '✗ Fehler'; }});
 }}
 
 function resetConfig() {{
@@ -8704,7 +8840,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if path == "/api/version":
-            self.send_json({"version": VERSION, "service": "e2proxy"})
+            self.send_json({
+                "version": VERSION,
+                "internal_version": INTERNAL_VERSION,
+                "branch": BUILD_BRANCH,
+                "build": BUILD_SEQ,
+                "service": "e2proxy",
+            })
             return
 
         if path == "/api/logs/files":
@@ -8953,7 +9095,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         continue
                     try:
                         # Parse XMLTV timestamp: "20260528130000 +0000"
-                        from datetime import datetime, timezone
+                        from datetime import timezone
                         def parse_xmltv_ts(s):
                             s = s.strip()
                             if " " in s:
@@ -9534,6 +9676,825 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.send_text("Not found", 404)
 
 
+# ── OpenWebif-Emulation ("virtuelle Enigma2-Box") ─────────
+# Eigener HTTP-Listener, der eine Enigma2-Box imitiert. Enigma2-Clients
+# (Dream Player, Kodi, VU+-Apps) werden auf diesen Port konfiguriert und glauben,
+# mit einer echten Box zu reden.
+#   • Metadaten/EPG-Endpunkte (/api/*, /web/*, /picon/*, /grab, ...) → Reverse-
+#     Proxy an einen erreichbaren Receiver → authentische Antworten inkl. EPG.
+#   • Stream-Pfad (/<serviceRef>) → intercept: e2proxy wählt einen freien Tuner
+#     (Orchestrierung) und reicht das rohe TS durch (Passthrough, kein ffmpeg);
+#     per User-Agent kann ein abweichendes Transcode-Profil erzwungen werden.
+# Plex bleibt davon vollständig unberührt (eigener HDHomeRun-Pfad auf Port 8888).
+
+# Erkennung eines Enigma2-Service-Reference-Stream-Pfads: 1:0:19:EF11:421:1:...
+_OWIF_SREF_RE = re.compile(r'^\d+:\d+:[0-9A-Fa-f]+:')
+# Sauberer 10-Feld-Service-Reference (ohne evtl. angehängten Kanalnamen)
+_OWIF_SREF_CLEAN_RE = re.compile(r'^((?:[^:]*:){10})')
+
+
+def _owif_metadata_receiver():
+    """Wählt den Receiver, der Metadaten/EPG-Anfragen beantwortet (Reverse-Proxy).
+
+    Bevorzugt den konfigurierten metadata_receiver, sonst den Default-Receiver,
+    sonst den ersten aktivierten. Gesperrte Receiver sind ok (nur Metadaten, kein
+    Tuner nötig)."""
+    receivers = get_receivers()
+    if not receivers:
+        return None
+    pref = get_owif_config().get("metadata_receiver", "auto")
+    if pref and pref != "auto":
+        for r in receivers:
+            if r["id"] == pref and r.get("enabled", True):
+                return r
+    for r in receivers:
+        if r.get("default") and r.get("enabled", True):
+            return r
+    for r in receivers:
+        if r.get("enabled", True):
+            return r
+    return receivers[0]
+
+
+# ── Synthetisches "Favoriten"-Bouquet (arrangierte e2proxy-Favoriten) ──────
+# Wird den Enigma2-Apps (dreamEPG/Dream Player) als erstes Bouquet gezeigt und
+# enthält exakt die in e2proxy per Drag&Drop arrangierten Favoriten (favorites.json)
+# in ihrer Reihenfolge – statt der favourites.tv des Receivers.
+_OWIF_FAV_BNAME = "Favoriten"
+_OWIF_FAV_BREF = ('1:7:1:0:0:0:0:0:0:0:FROM BOUQUET '
+                  '"userbouquet.e2proxy_favoriten.tv" ORDER BY bouquet')
+
+
+def _owif_xml_escape(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _owif_is_fav_bref(value):
+    return "e2proxy_favoriten" in (value or "")
+
+
+def _owif_fav_list():
+    """Arrangierte e2proxy-Favoriten als [(ref, name), …] in Reihenfolge."""
+    out = []
+    for f in load_favorites():
+        ref = (f.get("ref") or "").strip()
+        if ref:
+            out.append((ref, f.get("name") or ""))
+    return out
+
+
+def _owif_fetch_upstream(path):
+    """GET beim Metadaten-Receiver, liefert bytes oder None."""
+    r = _owif_metadata_receiver()
+    if not r:
+        return None
+    url = f"http://{r['ip']}:{r.get('port', 80)}{path}"
+    try:
+        with urllib.request.urlopen(url, timeout=12) as resp:
+            return resp.read()
+    except Exception:
+        return None
+
+
+def _owif_fav_channel_objs():
+    """Favoriten als getservices-Kanalobjekte (JSON) in Reihenfolge."""
+    return [{"servicereference": ref, "program": 0, "servicename": name,
+             "pos": i + 1} for i, (ref, name) in enumerate(_owif_fav_list())]
+
+
+def _owif_fav_channels_payload(is_json):
+    favs = _owif_fav_list()
+    if is_json:
+        return (json.dumps({"services": _owif_fav_channel_objs()}).encode("utf-8"),
+                "application/json; charset=utf-8", len(favs))
+    parts = ['<?xml version="1.0" encoding="UTF-8"?>', "<e2servicelist>"]
+    for ref, name in favs:
+        parts.append(
+            "<e2service><e2servicereference>%s</e2servicereference>"
+            "<e2servicename>%s</e2servicename></e2service>"
+            % (_owif_xml_escape(ref), _owif_xml_escape(name)))
+    parts.append("</e2servicelist>")
+    return ("".join(parts).encode("utf-8"), "text/xml; charset=utf-8", len(favs))
+
+
+def _owif_fav_bouquet_json(nested):
+    """Favoriten-Bouquet-Eintrag für getservices (flach) bzw. getallservices."""
+    obj = {"servicereference": _OWIF_FAV_BREF, "program": 0,
+           "servicename": _OWIF_FAV_BNAME, "pos": 0}
+    if nested:
+        obj = {"servicereference": _OWIF_FAV_BREF,
+               "subservices": _owif_fav_channel_objs(),
+               "servicename": _OWIF_FAV_BNAME}
+    return obj
+
+
+def _owif_fav_bouquet_xml_element(nested):
+    import xml.etree.ElementTree as ET
+    if nested:
+        el = ET.Element("e2bouquet")
+    else:
+        el = ET.Element("e2service")
+    ref = ET.SubElement(el, "e2servicereference")
+    ref.text = _OWIF_FAV_BREF
+    nm = ET.SubElement(el, "e2servicename")
+    nm.text = _OWIF_FAV_BNAME
+    if nested:
+        lst = ET.SubElement(el, "e2servicelist")
+        for cref, cname in _owif_fav_list():
+            svc = ET.SubElement(lst, "e2service")
+            r = ET.SubElement(svc, "e2servicereference")
+            r.text = cref
+            n = ET.SubElement(svc, "e2servicename")
+            n.text = cname
+    return el
+
+
+def _owif_fav_epg_payload(kind, is_json):
+    """EPG (now/next) für die Favoriten zusammensetzen.
+    kind: 'nownext' | 'now' | 'next'."""
+    import concurrent.futures as _cf
+    favs = _owif_fav_list()
+    want_now = kind in ("nownext", "now")
+    want_next = kind in ("nownext", "next")
+    api = "api" if is_json else "web"
+
+    def fetch(entry):
+        ref = entry[0]
+        q = urllib.parse.quote(ref)
+        blobs = []
+        if want_now:
+            blobs.append(_owif_fetch_upstream(f"/{api}/epgservicenow?sRef={q}"))
+        if want_next:
+            blobs.append(_owif_fetch_upstream(f"/{api}/epgservicenext?sRef={q}"))
+        return blobs
+
+    with _cf.ThreadPoolExecutor(max_workers=8) as ex:
+        ordered = list(ex.map(fetch, favs))  # Reihenfolge bleibt erhalten
+
+    if is_json:
+        events = []
+        for blobs in ordered:
+            for d in blobs:
+                if not d:
+                    continue
+                try:
+                    events.extend(json.loads(d.decode("utf-8", "replace")).get("events", []))
+                except Exception:
+                    pass
+        return (json.dumps({"events": events}).encode("utf-8"),
+                "application/json; charset=utf-8", len(events))
+    import xml.etree.ElementTree as ET
+    root = ET.Element("e2eventlist")
+    cnt = 0
+    for blobs in ordered:
+        for d in blobs:
+            if not d:
+                continue
+            try:
+                for ev in ET.fromstring(d).findall("e2event"):
+                    root.append(ev)
+                    cnt += 1
+            except Exception:
+                pass
+    return (ET.tostring(root, encoding="utf-8", xml_declaration=True),
+            "text/xml; charset=utf-8", cnt)
+
+
+# ── Aufnahmen-Movielist (OpenWebif-Emulation für Dream Player) ────────
+_OWIF_REC_MEDIA_EXT = (".ts", ".mkv", ".mp4", ".m2ts")
+# File-Service-Reference einer Aufnahme: 1:0:0:0:0:0:0:0:0:0:/pfad/datei.ts
+_OWIF_FILE_SREF_PREFIX = "1:0:0:0:0:0:0:0:0:0:"
+
+
+def _owif_parse_nfo(path):
+    """Best-effort Parser für Kodi/e2proxy .nfo-Dateien.
+
+    Liefert dict(title, plot, duration_s, ts_epoch) oder None."""
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.parse(path).getroot()
+    except Exception:
+        return None
+
+    def g(tag):
+        el = root.find(tag)
+        return el.text.strip() if el is not None and el.text else ""
+
+    title = g("title")
+    plot = g("plot") or g("outline")
+    dur = 0
+    di = root.find(".//durationinseconds")
+    if di is not None and di.text and di.text.strip().isdigit():
+        dur = int(di.text.strip())
+    elif g("runtime").isdigit():
+        dur = int(g("runtime")) * 60
+    ts = 0
+    for tag in ("aired", "premiered", "dateadded"):
+        v = g(tag)
+        if not v:
+            continue
+        for fmt, ln in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d", 10)):
+            try:
+                ts = int(datetime.strptime(v[:ln], fmt).timestamp())
+                break
+            except Exception:
+                pass
+        if ts:
+            break
+    return {"title": title, "plot": plot, "duration": dur, "ts": ts}
+
+
+def _owif_scan_movies():
+    """Durchsucht das Aufnahme-Verzeichnis und baut eine OpenWebif-taugliche
+    Movie-Liste (neueste zuerst). Metadaten kommen aus .nfo-Dateien."""
+    rcfg = get_recordings_config()
+    base = os.path.abspath(rcfg["path"])
+    movies = []
+    if not os.path.isdir(base):
+        return base, movies
+    for root_dir, dirs, files in os.walk(base):
+        for fname in sorted(files):
+            if not fname.lower().endswith(_OWIF_REC_MEDIA_EXT):
+                continue
+            fpath = os.path.join(root_dir, fname)
+            try:
+                size = os.path.getsize(fpath)
+                mtime = int(os.path.getmtime(fpath))
+            except OSError:
+                continue
+            stem = os.path.splitext(fname)[0]
+            meta = None
+            for cand in (os.path.join(root_dir, stem + ".nfo"),
+                         os.path.join(root_dir, "movie.nfo"),
+                         os.path.join(root_dir, "tvshow.nfo")):
+                if os.path.exists(cand):
+                    meta = _owif_parse_nfo(cand)
+                    if meta:
+                        break
+            meta = meta or {}
+            rel = os.path.relpath(fpath, base)
+            parts = rel.split(os.sep)
+            category = parts[0] if len(parts) > 1 else ""
+            # TV/<Serie>/Season …/datei.ts  bzw.  Movies/<Titel>/datei.ts
+            if category.lower() in ("tv", "movies") and len(parts) >= 2:
+                series = parts[1]
+            else:
+                series = category
+            ep_title = meta.get("title") or stem
+            if category.lower() == "tv" and series and ep_title and ep_title != series:
+                disp_title = f"{series} – {ep_title}"
+            else:
+                disp_title = ep_title or series
+            movies.append({
+                "path": fpath,
+                "title": disp_title,
+                "plot": meta.get("plot", ""),
+                "servicename": series or "e2proxy",
+                "time": meta.get("ts") or mtime,
+                "duration": meta.get("duration", 0),
+                "size": size,
+                "filename": fpath,
+                "sref": _OWIF_FILE_SREF_PREFIX + fpath,
+            })
+    movies.sort(key=lambda m: m["time"], reverse=True)
+    return base, movies
+
+
+def _owif_movielist_xml(base, movies):
+    from xml.sax.saxutils import escape
+    out = ['<?xml version="1.0" encoding="UTF-8"?>', "<e2movielist>"]
+    for m in movies:
+        out.append("<e2movie>")
+        out.append(f"<e2servicereference>{escape(m['sref'])}</e2servicereference>")
+        out.append(f"<e2title>{escape(m['title'])}</e2title>")
+        out.append(f"<e2description>{escape(m['plot'][:200])}</e2description>")
+        out.append(f"<e2descriptionextended>{escape(m['plot'])}</e2descriptionextended>")
+        out.append(f"<e2servicename>{escape(m['servicename'])}</e2servicename>")
+        out.append(f"<e2time>{m['time']}</e2time>")
+        out.append(f"<e2length>{m['duration']}</e2length>")
+        out.append("<e2tags></e2tags>")
+        out.append(f"<e2filename>{escape(m['filename'])}</e2filename>")
+        out.append(f"<e2filesize>{m['size']}</e2filesize>")
+        out.append("</e2movie>")
+    out.append("</e2movielist>")
+    return "\n".join(out)
+
+
+def _owif_movielist_json(base, movies):
+    return {
+        "directory": base if base.endswith("/") else base + "/",
+        "bookmarks": [],
+        "movies": [{
+            "servicereference": m["sref"],
+            "title": m["title"],
+            "description": m["plot"][:200],
+            "descriptionExtended": m["plot"],
+            "servicename": m["servicename"],
+            "recordingtime": m["time"],
+            "length": m["duration"],
+            "filename": m["filename"],
+            "filesize": m["size"],
+            "tags": "",
+        } for m in movies],
+    }
+
+
+class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    # ── Routing ──────────────────────────────────────────
+    def _rest(self):
+        parsed = urllib.parse.urlparse(self.path)
+        return urllib.parse.unquote(parsed.path).lstrip("/")
+
+    def _query(self):
+        parsed = urllib.parse.urlparse(self.path)
+        return urllib.parse.parse_qs(parsed.query)
+
+    def _is_stream(self):
+        return bool(_OWIF_SREF_RE.match(self._rest()))
+
+    def do_HEAD(self):
+        if self._is_stream():
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "video/mp2t")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+            except Exception:
+                pass
+            return
+        # Metadaten: einfacher 200er reicht als Verbindungstest
+        try:
+            self.send_response(200)
+            self.send_header("Connection", "close")
+            self.end_headers()
+        except Exception:
+            pass
+
+    def do_GET(self):
+        try:
+            rest = self._rest()
+            low = rest.lower()
+            # Aufnahmen-Übersicht (Dream Player Recordings-Tab)
+            if low in ("web/movielist", "api/movielist"):
+                log.info(f"OpenWebif MOVIELIST from {self.client_address[0]} "
+                         f"[{self.headers.get('User-Agent','')[:40]}]")
+                self._serve_movielist(is_json=low.startswith("api/"))
+                return
+            # OpenWebif-Datei-Download/-Stream einer Aufnahme
+            if low == "file":
+                self._serve_file_param()
+                return
+            if self._is_stream():
+                self._serve_stream(rest)
+                return
+            # Synthetisches Favoriten-Bouquet: Kanalliste (arrangierte Favoriten)
+            if self._is_fav_channel_request():
+                self._serve_fav_channels()
+                return
+            # Synthetisches Favoriten-Bouquet: EPG now/next
+            fav_epg = self._fav_epg_kind()
+            if fav_epg:
+                self._serve_fav_epg(fav_epg)
+                return
+            # Bouquet-Liste wie in der Web-UI kuratieren/sortieren
+            if self._is_bouquet_list_request():
+                self._serve_bouquet_list()
+                return
+            self._reverse_proxy(b"")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            log.error(f"OpenWebif do_GET Fehler ({self.path}): {e}")
+            self._fail(500, str(e))
+
+    def do_POST(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            body = self.rfile.read(length) if length else b""
+            self._reverse_proxy(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            log.error(f"OpenWebif do_POST Fehler ({self.path}): {e}")
+            self._fail(500, str(e))
+
+    # ── Hilfen ───────────────────────────────────────────
+    def _fail(self, code, msg):
+        try:
+            body = msg.encode("utf-8", "replace")
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    # ── Reverse-Proxy für Metadaten/EPG ──────────────────
+    def _reverse_proxy(self, body):
+        r = _owif_metadata_receiver()
+        if not r:
+            self._fail(503, "Kein Receiver konfiguriert")
+            return
+        url = f"http://{r['ip']}:{r.get('port', 80)}{self.path}"
+        req = urllib.request.Request(url, data=(body or None), method=self.command)
+        for h in ("User-Agent", "Accept", "Accept-Language", "Authorization", "Content-Type"):
+            v = self.headers.get(h)
+            if v:
+                req.add_header(h, v)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = resp.read()
+                status = resp.status
+                ctype = resp.headers.get("Content-Type", "application/octet-stream")
+        except urllib.error.HTTPError as e:
+            data = e.read()
+            status = e.code
+            ctype = e.headers.get("Content-Type", "text/plain") if e.headers else "text/plain"
+        except Exception as e:
+            log.warning(f"OpenWebif Reverse-Proxy Fehler ({url}): {e}")
+            self._fail(502, f"Upstream-Fehler: {e}")
+            return
+        # Access-Logging für Diagnose (EPG/getservices/Bouquets sichtbar machen)
+        p = urllib.parse.urlparse(self.path).path
+        noisy = ("/picon" in p or "/logo" in p or
+                 p.endswith((".png", ".jpg", ".jpeg", ".gif", ".ico", ".js", ".css")))
+        (log.debug if noisy else log.info)(
+            f"OpenWebif PROXY [{status}] {self.command} {self.path[:100]} "
+            f"→ {r['id']} [{(self.headers.get('User-Agent', '') or '')[:36]}]")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    # ── Synthetisches Favoriten-Bouquet ─────────────────
+    def _is_fav_channel_request(self):
+        p = urllib.parse.urlparse(self.path).path.lower().rstrip("/")
+        if not p.endswith("getservices"):
+            return False
+        q = self._query()
+        sref = (q.get("sRef") or q.get("sref") or
+                q.get("bRef") or q.get("bref") or [""])[0]
+        return _owif_is_fav_bref(sref)
+
+    def _fav_epg_kind(self):
+        p = urllib.parse.urlparse(self.path).path.lower()
+        if "epg" not in p:
+            return None
+        q = self._query()
+        bref = (q.get("bRef") or q.get("bref") or
+                q.get("sRef") or q.get("sref") or [""])[0]
+        if not _owif_is_fav_bref(bref):
+            return None
+        if p.endswith("epgnext"):
+            return "next"
+        if p.endswith("epgnow") or p.endswith("epgmulti"):
+            return "now"
+        return "nownext"
+
+    def _serve_fav_channels(self):
+        is_json = urllib.parse.urlparse(self.path).path.lower().startswith("/api")
+        body, ctype, n = _owif_fav_channels_payload(is_json)
+        log.info(f"OpenWebif FAV Kanalliste ({n} Favoriten) "
+                 f"[{(self.headers.get('User-Agent','') or '')[:30]}]")
+        self._send_bytes(200, ctype, body)
+
+    def _serve_fav_epg(self, kind):
+        is_json = urllib.parse.urlparse(self.path).path.lower().startswith("/api")
+        try:
+            body, ctype, n = _owif_fav_epg_payload(kind, is_json)
+        except Exception as e:
+            log.warning(f"OpenWebif FAV-EPG Fehler: {e}")
+            self._reverse_proxy(b"")
+            return
+        log.info(f"OpenWebif FAV EPG {kind} ({n} Events) "
+                 f"[{(self.headers.get('User-Agent','') or '')[:30]}]")
+        self._send_bytes(200, ctype, body)
+
+    def _send_bytes(self, status, ctype, body):
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    # ── Bouquet-Liste kuratieren (wie Web-UI) ────────────
+    def _is_bouquet_list_request(self):
+        parsed = urllib.parse.urlparse(self.path)
+        p = parsed.path.lower().rstrip("/")
+        # getallservices = kompletter Bouquet+Kanal-Baum (Voll-Sync der Apps)
+        if p.endswith("getallservices"):
+            return True
+        if not p.endswith("getservices"):
+            return False
+        q = urllib.parse.parse_qs(parsed.query)
+        sref = (q.get("sRef") or q.get("sref") or
+                q.get("bRef") or q.get("bref") or [""])[0]
+        low = sref.lower()
+        if not sref:
+            return True  # Default = TV-Bouquet-Liste
+        if "userbouquet" in low or "radio" in low:
+            return False  # einzelnes Bouquet bzw. Radio → unverändert durchreichen
+        return "bouquets" in low
+
+    def _filter_bouquet_payload(self, raw, is_json, ctype, is_all=False):
+        rx = re.compile(r'"(userbouquet\.[^"]+?\.(?:tv|radio))"')
+        order = {name: i for i, name in enumerate(BOUQUETS)}
+        # Favoriten-Bouquet nur der TV-Liste voranstellen (nicht bei Radio)
+        add_fav = bool(_owif_fav_list())
+        if is_json:
+            d = json.loads(raw.decode("utf-8", "replace"))
+            keep = []
+            for s in d.get("services", []):
+                m = rx.search(s.get("servicereference", ""))
+                if m and m.group(1) in order:
+                    keep.append((order[m.group(1)], s))
+            keep.sort(key=lambda t: t[0])
+            services = [s for _, s in keep]
+            if add_fav:
+                services.insert(0, _owif_fav_bouquet_json(is_all))
+            d["services"] = services
+            return (json.dumps(d).encode("utf-8"),
+                    ctype or "application/json; charset=utf-8", len(services))
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(raw)
+        # getservices → <e2service>, getallservices → <e2bouquet> (mit Kanälen)
+        tag = "e2bouquet" if root.find("e2bouquet") is not None else "e2service"
+        services = root.findall(tag)
+        keep = []
+        for el in services:
+            refel = el.find("e2servicereference")
+            ref = refel.text if refel is not None and refel.text else ""
+            m = rx.search(ref)
+            if m and m.group(1) in order:
+                keep.append((order[m.group(1)], el))
+        for el in services:
+            root.remove(el)
+        ordered = [el for _, el in sorted(keep, key=lambda t: t[0])]
+        if add_fav:
+            root.append(_owif_fav_bouquet_xml_element(tag == "e2bouquet"))
+        for el in ordered:
+            root.append(el)
+        body = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        return body, ctype or "text/xml; charset=utf-8", len(ordered) + (1 if add_fav else 0)
+
+    def _serve_bouquet_list(self):
+        r = _owif_metadata_receiver()
+        if not r:
+            self._fail(503, "Kein Receiver konfiguriert")
+            return
+        url = f"http://{r['ip']}:{r.get('port', 80)}{self.path}"
+        req = urllib.request.Request(url, method="GET")
+        ua = self.headers.get("User-Agent")
+        if ua:
+            req.add_header("User-Agent", ua)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                raw = resp.read()
+                ctype = resp.headers.get("Content-Type", "") or ""
+                status = resp.status
+        except Exception as e:
+            log.warning(f"OpenWebif getservices Upstream-Fehler: {e}")
+            self._reverse_proxy(b"")
+            return
+        is_json = ("json" in ctype.lower() or
+                   urllib.parse.urlparse(self.path).path.lower().startswith("/api"))
+        is_all = urllib.parse.urlparse(self.path).path.lower().rstrip("/").endswith("getallservices")
+        try:
+            out, out_ctype, n = self._filter_bouquet_payload(raw, is_json, ctype, is_all)
+        except Exception as e:
+            log.warning(f"OpenWebif Bouquet-Filter Fehler, reiche unverändert durch: {e}")
+            out, out_ctype, n = raw, (ctype or "application/octet-stream"), -1
+        log.info(f"OpenWebif PROXY [{status}] GET {self.path[:60]} → {r['id']} "
+                 f"(Bouquets kuratiert: {n}) [{(ua or '')[:30]}]")
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", out_ctype)
+            self.send_header("Content-Length", str(len(out)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(out)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    # ── Aufnahmen: Movielist + Datei-Streaming ───────────
+    def _serve_movielist(self, is_json):
+        if not get_owif_config().get("recordings_enabled", True):
+            base, movies = "/", []
+        else:
+            base, movies = _owif_scan_movies()
+        if is_json:
+            payload = json.dumps(_owif_movielist_json(base, movies)).encode("utf-8")
+            ctype = "application/json; charset=utf-8"
+        else:
+            payload = _owif_movielist_xml(base, movies).encode("utf-8")
+            ctype = "text/xml; charset=utf-8"
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _serve_file_param(self):
+        """OpenWebif /file?file=<pfad> — Aufnahmen lokal ausliefern, sonst
+        an den Receiver weiterreichen (z. B. Picons/Logs)."""
+        fp = self._query().get("file", [""])[0]
+        base = os.path.abspath(get_recordings_config()["path"])
+        if fp and os.path.abspath(fp).startswith(base) and os.path.isfile(fp):
+            self._send_file_range(fp)
+            return
+        self._reverse_proxy(b"")
+
+    def _serve_recording_file(self, filepath):
+        base = os.path.abspath(get_recordings_config()["path"])
+        real = os.path.abspath(filepath)
+        if not real.startswith(base) or not os.path.isfile(real):
+            self._fail(404, "Aufnahme nicht gefunden")
+            return
+        log.info(f"OpenWebif RECORDING from {self.client_address[0]}: "
+                 f"{os.path.basename(real)}")
+        self._send_file_range(real)
+
+    def _send_file_range(self, filepath):
+        """Liefert eine Datei mit Range-Support (Seeking) aus — rohes TS,
+        kein ffmpeg."""
+        file_size = os.path.getsize(filepath)
+        range_header = self.headers.get("Range", "")
+        start, end, status = 0, file_size - 1, 200
+        if range_header.startswith("bytes="):
+            try:
+                r = range_header[6:].split("-")
+                start = int(r[0]) if r[0] else 0
+                end = int(r[1]) if len(r) > 1 and r[1] else file_size - 1
+                end = min(end, file_size - 1)
+                status = 206
+            except Exception:
+                start, end, status = 0, file_size - 1, 200
+        length = end - start + 1
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "video/mp2t")
+            self.send_header("Content-Length", str(length))
+            self.send_header("Accept-Ranges", "bytes")
+            if status == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            with open(filepath, "rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(262144, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    # ── Stream-Intercept mit Tuner-Orchestrierung ────────
+    def _pick_profile(self):
+        owif = get_owif_config()
+        ua = self.headers.get("User-Agent", "") or ""
+        ua_l = ua.lower()
+        profile_id = owif["default_profile"]
+        for ov in owif["ua_overrides"]:
+            if ov["match"].lower() in ua_l:
+                profile_id = ov["profile"]
+                break
+        return profile_id, ua
+
+    def _serve_stream(self, rest):
+        m = _OWIF_SREF_CLEAN_RE.match(rest)
+        # File-Service-Reference einer Aufnahme (…:0:/pfad.ts) → lokale Datei
+        if m:
+            remainder = rest[m.end():]
+            if remainder.startswith("/"):
+                self._serve_recording_file(remainder)
+                return
+        sref = m.group(1) if m else rest
+        profile_id, ua = self._pick_profile()
+        client_ip = self.client_address[0]
+
+        tp = get_transcode_profile(profile_id)
+        passthrough = (not tp) or tp.get("codec") == "pass"
+
+        _ch_lookup = {ch["ref"].rstrip("/"): ch["name"] for ch in get_channels()}
+        channel_name = _ch_lookup.get(sref.rstrip("/"), sref[:30])
+
+        # Receiver wählen: bereits laufenden Tuner für denselben Sender bevorzugen
+        # (Shared Tuner), sonst einen freien.
+        rid = None
+        shared = False
+        with receiver_lock:
+            for r in get_receivers():
+                st = _receiver_state.get(r["id"])
+                if st and st.get("service_ref", "").rstrip("/") == sref.rstrip("/"):
+                    rid = r["id"]
+                    shared = True
+                    break
+        if not rid:
+            rid = get_free_receiver()
+        if not rid:
+            self._fail(503, "All receivers busy")
+            return
+
+        log.info(f"OpenWebif STREAM [{profile_id}] from {client_ip}: {channel_name} "
+                 f"[{ua[:40]}] (receiver={rid}, shared={shared})")
+
+        if not shared:
+            acquire_receiver(rid, client_ip, sref, channel_name)
+        try:
+            if not shared:
+                if not do_zap(rid, sref, channel_name):
+                    self._fail(502, "Zap fehlgeschlagen")
+                    return
+                zap_wait = get_switch_settings(sref)["zap_wait"]
+                if zap_wait > 0:
+                    time.sleep(zap_wait)
+
+            if passthrough:
+                content_type = "video/mp2t"
+            else:
+                _, content_type = build_ffmpeg_cmd(rid, sref, tp)
+
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            if passthrough:
+                stream_passthrough(rid, sref, self.wfile, use_chunked=False)
+            else:
+                stream_transcoded(rid, sref, tp, self.wfile, use_chunked=False,
+                                   channel_name=channel_name)
+        except ScrambledStreamError:
+            log.warning(f"OpenWebif SCRAMBLED: {sref}")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            log.error(f"OpenWebif STREAM ERROR: {e}")
+        finally:
+            if not shared:
+                release_receiver(rid)
+
+
+def start_openwebif_server():
+    """Startet die OpenWebif-Emulation, falls aktiviert.
+
+    Imitiert eine Enigma2-Box mit Standardports: OpenWebif auf :80 (Metadaten/EPG)
+    und Streaming auf :8001. Beide Ports nutzen denselben Handler (Stream-Pfade
+    werden intern erkannt), sind aber getrennt lauschbar wie bei einer echten Box.
+    """
+    owif = get_owif_config()
+    if not owif["enabled"]:
+        log.info("OpenWebif-Emulation: deaktiviert")
+        return []
+    bind = owif["bind"]
+    ports = {owif["webif_port"], owif["stream_port"]}
+    if owif.get("recordings_enabled", True) and owif.get("recordings_port"):
+        ports.add(owif["recordings_port"])
+    servers = []
+    for p in sorted(ports):
+        try:
+            srv = http.server.ThreadingHTTPServer((bind, p), OpenWebifHandler)
+        except Exception as e:
+            log.error(f"OpenWebif-Emulation: Port {p} konnte nicht gebunden werden: {e}")
+            continue
+        threading.Thread(target=srv.serve_forever, daemon=True,
+                         name=f"openwebif-{p}").start()
+        servers.append(srv)
+    if servers:
+        log.info(f"OpenWebif-Emulation aktiv auf {bind} — OpenWebif:{owif['webif_port']} "
+                 f"Stream:{owif['stream_port']} Recordings:{owif.get('recordings_port')} "
+                 f"(Default-Profil: {owif['default_profile']}, "
+                 f"{len(owif['ua_overrides'])} UA-Overrides)")
+    return servers
+
+
 # ── Main ──────────────────────────────────────────────────
 
 _proxy_start_time = time.time()
@@ -9628,10 +10589,14 @@ def run():
     # SSDP Discovery starten (Plex findet den Proxy automatisch)
     start_ssdp_server()
 
+    # OpenWebif-Emulation ("virtuelle Enigma2-Box") starten, falls aktiviert
+    start_openwebif_server()
+
     server = http.server.ThreadingHTTPServer(("0.0.0.0", proxy_port), ProxyHandler)
 
     log.info("=" * 55)
     log.info(f"e2proxy v{VERSION} started")
+    log.info(f"Build:     {INTERNAL_VERSION}")
     log.info(f"Web-UI:    http://{proxy_host}:{proxy_port}/")
     log.info(f"Settings:  http://{proxy_host}:{proxy_port}/settings")
     log.info(f"Config:    {CONFIG_FILE}")

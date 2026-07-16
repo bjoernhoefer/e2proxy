@@ -7,6 +7,7 @@ Single Python file, runs in Docker, manages two SAT receivers with automatic tun
 ## Features
 
 - **Live TV Streaming** — Watch any channel in the browser (WebM VP8/VP9) or via M3U playlist
+- **OpenWebif Emulation** — Impersonates an Enigma2 box on standard ports (OpenWebif `:80`, streaming `:8001`, recordings `:81`) so native Enigma2 apps like **Dream Player** (Android/Google TV) or Kodi can point straight at e2proxy. Metadata/EPG are served authentically from the receiver, live streaming is orchestrated onto a free tuner and passed through as raw TS by default (no ffmpeg), and your recordings show up in the app's Recordings tab with full seeking
 - **Plex DVR Integration** — HDHomeRun emulation with SSDP auto-discovery, no Threadfin needed
 - **EPG Browser** — 28-hour program guide as interactive timeline grid with TMDB artwork
 - **Recording System** — ffmpeg-based with Plex-compliant directory structure (`TV/Show/Season XX/`)
@@ -188,6 +189,41 @@ All configuration stored in `/data/config.json`.
 - **Daily shows** → Day-of-year numbering (S2026E163 = June 12)
 - **Movies** → `Movies/<Title> (<Year>)/`
 - **NFO files** → Plex/Kodi-compatible metadata
+
+## OpenWebif Emulation (Dream Player, Kodi & other Enigma2 apps)
+
+e2proxy can impersonate an Enigma2 receiver on its **standard ports** so any native Enigma2 client — most notably **[Dream Player](https://dreamepg.de) for Android/Google TV** — can talk to e2proxy as if it were a real box, including full EPG.
+
+**How it works:**
+
+- **Metadata & EPG** (`/api/*`, `/web/*`, `/picon/*`, …) are reverse-proxied to a real receiver, so the app sees authentic OpenWebif responses (device info, bouquets, EPG now/next/multi, picons). Every request is access-logged (with status + User-Agent) for easy diagnostics.
+- **Bouquet list matches the web UI**: the top-level `getservices` **and** `getallservices` (full-sync) responses are curated and reordered to the same selection/order as the e2proxy web UI, so apps like Dream Player/dreamEPG don't show the receiver's full raw bouquet list. Channels within a bouquet keep the receiver's native order.
+- **"Favoriten" bouquet with your arranged favorites**: a synthetic bouquet named *Favoriten* is injected as the **first** bouquet the apps see. It contains exactly the channels from your e2proxy favorites (`favorites.json`), in your drag-and-drop order — not the receiver's `favourites.tv`. Its channel list and EPG now/next are synthesized by e2proxy (per-service EPG merged from the receiver), so the apps show your curated favorites with correct programme info.
+- **Streaming** (`/<serviceRef>`) is intercepted: e2proxy picks a **free tuner** (orchestration across receivers) and passes the **raw TS through unchanged** (passthrough, no ffmpeg) — fast and light, ideal for Dream Player/Kodi. Plex keeps using its own HDHomeRun path and is unaffected.
+- **Recordings** (`/web/movielist`, `/api/movielist`) are served on the Enigma alt-web port `81` (Dream Player's Recordings tab). e2proxy builds an OpenWebif movie list from its own recordings directory (with title/plot/date pulled from the `.nfo` files) and streams the recording files back with HTTP Range support (seeking), again as raw TS. The recordings live on the e2proxy/e2recorder storage, not on the box — so this exposes *your* recordings, not the (empty) box movie list.
+- **Per-player profiles**: by default everything is passthrough. If a player can't handle raw TS, add a **User-Agent override** in Settings to force a remux/transcode profile for that player only.
+
+**Enable** (Settings → OpenWebif Emulation, or `config.json`):
+
+```json
+"openwebif_emulation": {
+  "enabled": true,
+  "bind": "0.0.0.0",
+  "webif_port": 80,
+  "stream_port": 8001,
+  "recordings_port": 81,
+  "recordings_enabled": true,
+  "default_profile": "pass",
+  "metadata_receiver": "auto",
+  "ua_overrides": [
+    { "match": "ExoPlayer", "profile": "remux-ac3" }
+  ]
+}
+```
+
+> Standard ports `80` + `8001` (+ `81` for recordings) must be free on the host (e.g. disable any web server occupying port 80). Ports are configurable; a change requires a service restart. Set `recordings_port` to `0` to disable the recordings movie list.
+
+**Dream Player setup:** add a device pointing at the e2proxy host IP, OpenWebif port `80`, streaming port `8001`, recordings/second web port `81`, no username/password. EPG, channels and recordings are pulled automatically.
 
 ## Companion: e2recorder
 
