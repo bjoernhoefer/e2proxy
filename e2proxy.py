@@ -45,7 +45,7 @@ VERSION        = "3.9"   # Offizielle Version — nur beim Pull Request erhöhen
 # offizielle VERSION zu verändern (die steigt erst beim PR). Bei jedem Test-
 # Rollout eines neuen Standes BUILD_SEQ erhöhen.
 BUILD_BRANCH     = "feature/openwebif-emulation"
-BUILD_SEQ        = "3"
+BUILD_SEQ        = "4"
 INTERNAL_VERSION = f"{VERSION}+{BUILD_BRANCH.split('/')[-1]}.{BUILD_SEQ}"
 CONFIG_FILE    = f"{DATA_DIR}/config.json"
 FAVORITES_FILE = f"{DATA_DIR}/favorites.json"
@@ -9966,6 +9966,13 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
             log.warning(f"OpenWebif Reverse-Proxy Fehler ({url}): {e}")
             self._fail(502, f"Upstream-Fehler: {e}")
             return
+        # Access-Logging für Diagnose (EPG/getservices/Bouquets sichtbar machen)
+        p = urllib.parse.urlparse(self.path).path
+        noisy = ("/picon" in p or "/logo" in p or
+                 p.endswith((".png", ".jpg", ".jpeg", ".gif", ".ico", ".js", ".css")))
+        (log.debug if noisy else log.info)(
+            f"OpenWebif PROXY [{status}] {self.command} {self.path[:100]} "
+            f"→ {r['id']} [{(self.headers.get('User-Agent', '') or '')[:36]}]")
         try:
             self.send_response(status)
             self.send_header("Content-Type", ctype)
