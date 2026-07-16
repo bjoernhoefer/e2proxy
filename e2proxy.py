@@ -45,7 +45,7 @@ VERSION        = "3.9"   # Offizielle Version — nur beim Pull Request erhöhen
 # offizielle VERSION zu verändern (die steigt erst beim PR). Bei jedem Test-
 # Rollout eines neuen Standes BUILD_SEQ erhöhen.
 BUILD_BRANCH     = "feature/openwebif-emulation"
-BUILD_SEQ        = "5"
+BUILD_SEQ        = "6"
 INTERNAL_VERSION = f"{VERSION}+{BUILD_BRANCH.split('/')[-1]}.{BUILD_SEQ}"
 CONFIG_FILE    = f"{DATA_DIR}/config.json"
 FAVORITES_FILE = f"{DATA_DIR}/favorites.json"
@@ -9990,7 +9990,11 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
     # ── Bouquet-Liste kuratieren (wie Web-UI) ────────────
     def _is_bouquet_list_request(self):
         parsed = urllib.parse.urlparse(self.path)
-        if not parsed.path.lower().rstrip("/").endswith("getservices"):
+        p = parsed.path.lower().rstrip("/")
+        # getallservices = kompletter Bouquet+Kanal-Baum (Voll-Sync der Apps)
+        if p.endswith("getallservices"):
+            return True
+        if not p.endswith("getservices"):
             return False
         q = urllib.parse.parse_qs(parsed.query)
         sref = (q.get("sRef") or q.get("sref") or
@@ -10018,7 +10022,9 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
                     ctype or "application/json; charset=utf-8", len(keep))
         import xml.etree.ElementTree as ET
         root = ET.fromstring(raw)
-        services = root.findall("e2service")
+        # getservices → <e2service>, getallservices → <e2bouquet> (mit Kanälen)
+        tag = "e2bouquet" if root.find("e2bouquet") is not None else "e2service"
+        services = root.findall(tag)
         keep = []
         for el in services:
             refel = el.find("e2servicereference")
