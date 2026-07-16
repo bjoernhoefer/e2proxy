@@ -39,7 +39,7 @@ from datetime import datetime
 # ── Pfade ─────────────────────────────────────────────────
 # Datenpfad: via Env-Variable überschreibbar (für Docker)
 DATA_DIR       = os.environ.get("E2PROXY_DATA_DIR", "/var/lib/e2proxy")
-VERSION        = "3.9"   # Offizielle Version — nur beim Pull Request erhöhen (major/minor)
+VERSION        = "4.0"   # Offizielle Version — nur beim Pull Request erhöhen (major/minor)
 # ── Interne Build-/Versionskennung ────────────────────────
 # Identifiziert eindeutig den ausgerollten Branch/Stand bei Tests, OHNE die
 # offizielle VERSION zu verändern (die steigt erst beim PR). Bei jedem Test-
