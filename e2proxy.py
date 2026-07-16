@@ -45,7 +45,7 @@ VERSION        = "3.9"   # Offizielle Version — nur beim Pull Request erhöhen
 # offizielle VERSION zu verändern (die steigt erst beim PR). Bei jedem Test-
 # Rollout eines neuen Standes BUILD_SEQ erhöhen.
 BUILD_BRANCH     = "feature/openwebif-emulation"
-BUILD_SEQ        = "6"
+BUILD_SEQ        = "7"
 INTERNAL_VERSION = f"{VERSION}+{BUILD_BRANCH.split('/')[-1]}.{BUILD_SEQ}"
 CONFIG_FILE    = f"{DATA_DIR}/config.json"
 FAVORITES_FILE = f"{DATA_DIR}/favorites.json"
@@ -9716,6 +9716,150 @@ def _owif_metadata_receiver():
     return receivers[0]
 
 
+# ── Synthetisches "Favoriten"-Bouquet (arrangierte e2proxy-Favoriten) ──────
+# Wird den Enigma2-Apps (dreamEPG/Dream Player) als erstes Bouquet gezeigt und
+# enthält exakt die in e2proxy per Drag&Drop arrangierten Favoriten (favorites.json)
+# in ihrer Reihenfolge – statt der favourites.tv des Receivers.
+_OWIF_FAV_BNAME = "Favoriten"
+_OWIF_FAV_BREF = ('1:7:1:0:0:0:0:0:0:0:FROM BOUQUET '
+                  '"userbouquet.e2proxy_favoriten.tv" ORDER BY bouquet')
+
+
+def _owif_xml_escape(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _owif_is_fav_bref(value):
+    return "e2proxy_favoriten" in (value or "")
+
+
+def _owif_fav_list():
+    """Arrangierte e2proxy-Favoriten als [(ref, name), …] in Reihenfolge."""
+    out = []
+    for f in load_favorites():
+        ref = (f.get("ref") or "").strip()
+        if ref:
+            out.append((ref, f.get("name") or ""))
+    return out
+
+
+def _owif_fetch_upstream(path):
+    """GET beim Metadaten-Receiver, liefert bytes oder None."""
+    r = _owif_metadata_receiver()
+    if not r:
+        return None
+    url = f"http://{r['ip']}:{r.get('port', 80)}{path}"
+    try:
+        with urllib.request.urlopen(url, timeout=12) as resp:
+            return resp.read()
+    except Exception:
+        return None
+
+
+def _owif_fav_channel_objs():
+    """Favoriten als getservices-Kanalobjekte (JSON) in Reihenfolge."""
+    return [{"servicereference": ref, "program": 0, "servicename": name,
+             "pos": i + 1} for i, (ref, name) in enumerate(_owif_fav_list())]
+
+
+def _owif_fav_channels_payload(is_json):
+    favs = _owif_fav_list()
+    if is_json:
+        return (json.dumps({"services": _owif_fav_channel_objs()}).encode("utf-8"),
+                "application/json; charset=utf-8", len(favs))
+    parts = ['<?xml version="1.0" encoding="UTF-8"?>', "<e2servicelist>"]
+    for ref, name in favs:
+        parts.append(
+            "<e2service><e2servicereference>%s</e2servicereference>"
+            "<e2servicename>%s</e2servicename></e2service>"
+            % (_owif_xml_escape(ref), _owif_xml_escape(name)))
+    parts.append("</e2servicelist>")
+    return ("".join(parts).encode("utf-8"), "text/xml; charset=utf-8", len(favs))
+
+
+def _owif_fav_bouquet_json(nested):
+    """Favoriten-Bouquet-Eintrag für getservices (flach) bzw. getallservices."""
+    obj = {"servicereference": _OWIF_FAV_BREF, "program": 0,
+           "servicename": _OWIF_FAV_BNAME, "pos": 0}
+    if nested:
+        obj = {"servicereference": _OWIF_FAV_BREF,
+               "subservices": _owif_fav_channel_objs(),
+               "servicename": _OWIF_FAV_BNAME}
+    return obj
+
+
+def _owif_fav_bouquet_xml_element(nested):
+    import xml.etree.ElementTree as ET
+    if nested:
+        el = ET.Element("e2bouquet")
+    else:
+        el = ET.Element("e2service")
+    ref = ET.SubElement(el, "e2servicereference")
+    ref.text = _OWIF_FAV_BREF
+    nm = ET.SubElement(el, "e2servicename")
+    nm.text = _OWIF_FAV_BNAME
+    if nested:
+        lst = ET.SubElement(el, "e2servicelist")
+        for cref, cname in _owif_fav_list():
+            svc = ET.SubElement(lst, "e2service")
+            r = ET.SubElement(svc, "e2servicereference")
+            r.text = cref
+            n = ET.SubElement(svc, "e2servicename")
+            n.text = cname
+    return el
+
+
+def _owif_fav_epg_payload(kind, is_json):
+    """EPG (now/next) für die Favoriten zusammensetzen.
+    kind: 'nownext' | 'now' | 'next'."""
+    import concurrent.futures as _cf
+    favs = _owif_fav_list()
+    want_now = kind in ("nownext", "now")
+    want_next = kind in ("nownext", "next")
+    api = "api" if is_json else "web"
+
+    def fetch(entry):
+        ref = entry[0]
+        q = urllib.parse.quote(ref)
+        blobs = []
+        if want_now:
+            blobs.append(_owif_fetch_upstream(f"/{api}/epgservicenow?sRef={q}"))
+        if want_next:
+            blobs.append(_owif_fetch_upstream(f"/{api}/epgservicenext?sRef={q}"))
+        return blobs
+
+    with _cf.ThreadPoolExecutor(max_workers=8) as ex:
+        ordered = list(ex.map(fetch, favs))  # Reihenfolge bleibt erhalten
+
+    if is_json:
+        events = []
+        for blobs in ordered:
+            for d in blobs:
+                if not d:
+                    continue
+                try:
+                    events.extend(json.loads(d.decode("utf-8", "replace")).get("events", []))
+                except Exception:
+                    pass
+        return (json.dumps({"events": events}).encode("utf-8"),
+                "application/json; charset=utf-8", len(events))
+    import xml.etree.ElementTree as ET
+    root = ET.Element("e2eventlist")
+    cnt = 0
+    for blobs in ordered:
+        for d in blobs:
+            if not d:
+                continue
+            try:
+                for ev in ET.fromstring(d).findall("e2event"):
+                    root.append(ev)
+                    cnt += 1
+            except Exception:
+                pass
+    return (ET.tostring(root, encoding="utf-8", xml_declaration=True),
+            "text/xml; charset=utf-8", cnt)
+
+
 # ── Aufnahmen-Movielist (OpenWebif-Emulation für Dream Player) ────────
 _OWIF_REC_MEDIA_EXT = (".ts", ".mkv", ".mp4", ".m2ts")
 # File-Service-Reference einer Aufnahme: 1:0:0:0:0:0:0:0:0:0:/pfad/datei.ts
@@ -9910,6 +10054,15 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
             if self._is_stream():
                 self._serve_stream(rest)
                 return
+            # Synthetisches Favoriten-Bouquet: Kanalliste (arrangierte Favoriten)
+            if self._is_fav_channel_request():
+                self._serve_fav_channels()
+                return
+            # Synthetisches Favoriten-Bouquet: EPG now/next
+            fav_epg = self._fav_epg_kind()
+            if fav_epg:
+                self._serve_fav_epg(fav_epg)
+                return
             # Bouquet-Liste wie in der Web-UI kuratieren/sortieren
             if self._is_bouquet_list_request():
                 self._serve_bouquet_list()
@@ -9987,6 +10140,61 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    # ── Synthetisches Favoriten-Bouquet ─────────────────
+    def _is_fav_channel_request(self):
+        p = urllib.parse.urlparse(self.path).path.lower().rstrip("/")
+        if not p.endswith("getservices"):
+            return False
+        q = self._query()
+        sref = (q.get("sRef") or q.get("sref") or
+                q.get("bRef") or q.get("bref") or [""])[0]
+        return _owif_is_fav_bref(sref)
+
+    def _fav_epg_kind(self):
+        p = urllib.parse.urlparse(self.path).path.lower()
+        if "epg" not in p:
+            return None
+        q = self._query()
+        bref = (q.get("bRef") or q.get("bref") or
+                q.get("sRef") or q.get("sref") or [""])[0]
+        if not _owif_is_fav_bref(bref):
+            return None
+        if p.endswith("epgnext"):
+            return "next"
+        if p.endswith("epgnow") or p.endswith("epgmulti"):
+            return "now"
+        return "nownext"
+
+    def _serve_fav_channels(self):
+        is_json = urllib.parse.urlparse(self.path).path.lower().startswith("/api")
+        body, ctype, n = _owif_fav_channels_payload(is_json)
+        log.info(f"OpenWebif FAV Kanalliste ({n} Favoriten) "
+                 f"[{(self.headers.get('User-Agent','') or '')[:30]}]")
+        self._send_bytes(200, ctype, body)
+
+    def _serve_fav_epg(self, kind):
+        is_json = urllib.parse.urlparse(self.path).path.lower().startswith("/api")
+        try:
+            body, ctype, n = _owif_fav_epg_payload(kind, is_json)
+        except Exception as e:
+            log.warning(f"OpenWebif FAV-EPG Fehler: {e}")
+            self._reverse_proxy(b"")
+            return
+        log.info(f"OpenWebif FAV EPG {kind} ({n} Events) "
+                 f"[{(self.headers.get('User-Agent','') or '')[:30]}]")
+        self._send_bytes(200, ctype, body)
+
+    def _send_bytes(self, status, ctype, body):
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     # ── Bouquet-Liste kuratieren (wie Web-UI) ────────────
     def _is_bouquet_list_request(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -10006,9 +10214,11 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
             return False  # einzelnes Bouquet bzw. Radio → unverändert durchreichen
         return "bouquets" in low
 
-    def _filter_bouquet_payload(self, raw, is_json, ctype):
+    def _filter_bouquet_payload(self, raw, is_json, ctype, is_all=False):
         rx = re.compile(r'"(userbouquet\.[^"]+?\.(?:tv|radio))"')
         order = {name: i for i, name in enumerate(BOUQUETS)}
+        # Favoriten-Bouquet nur der TV-Liste voranstellen (nicht bei Radio)
+        add_fav = bool(_owif_fav_list())
         if is_json:
             d = json.loads(raw.decode("utf-8", "replace"))
             keep = []
@@ -10017,9 +10227,12 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
                 if m and m.group(1) in order:
                     keep.append((order[m.group(1)], s))
             keep.sort(key=lambda t: t[0])
-            d["services"] = [s for _, s in keep]
+            services = [s for _, s in keep]
+            if add_fav:
+                services.insert(0, _owif_fav_bouquet_json(is_all))
+            d["services"] = services
             return (json.dumps(d).encode("utf-8"),
-                    ctype or "application/json; charset=utf-8", len(keep))
+                    ctype or "application/json; charset=utf-8", len(services))
         import xml.etree.ElementTree as ET
         root = ET.fromstring(raw)
         # getservices → <e2service>, getallservices → <e2bouquet> (mit Kanälen)
@@ -10034,10 +10247,13 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
                 keep.append((order[m.group(1)], el))
         for el in services:
             root.remove(el)
-        for _, el in sorted(keep, key=lambda t: t[0]):
+        ordered = [el for _, el in sorted(keep, key=lambda t: t[0])]
+        if add_fav:
+            root.append(_owif_fav_bouquet_xml_element(tag == "e2bouquet"))
+        for el in ordered:
             root.append(el)
         body = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-        return body, ctype or "text/xml; charset=utf-8", len(keep)
+        return body, ctype or "text/xml; charset=utf-8", len(ordered) + (1 if add_fav else 0)
 
     def _serve_bouquet_list(self):
         r = _owif_metadata_receiver()
@@ -10060,8 +10276,9 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
             return
         is_json = ("json" in ctype.lower() or
                    urllib.parse.urlparse(self.path).path.lower().startswith("/api"))
+        is_all = urllib.parse.urlparse(self.path).path.lower().rstrip("/").endswith("getallservices")
         try:
-            out, out_ctype, n = self._filter_bouquet_payload(raw, is_json, ctype)
+            out, out_ctype, n = self._filter_bouquet_payload(raw, is_json, ctype, is_all)
         except Exception as e:
             log.warning(f"OpenWebif Bouquet-Filter Fehler, reiche unverändert durch: {e}")
             out, out_ctype, n = raw, (ctype or "application/octet-stream"), -1
