@@ -39,13 +39,13 @@ from datetime import datetime
 # ── Pfade ─────────────────────────────────────────────────
 # Datenpfad: via Env-Variable überschreibbar (für Docker)
 DATA_DIR       = os.environ.get("E2PROXY_DATA_DIR", "/var/lib/e2proxy")
-VERSION        = "4.0"   # Offizielle Version — nur beim Pull Request erhöhen (major/minor)
+VERSION        = "4.1"   # Offizielle Version — nur beim Pull Request erhöhen (major/minor)
 # ── Interne Build-/Versionskennung ────────────────────────
 # Identifiziert eindeutig den ausgerollten Branch/Stand bei Tests, OHNE die
 # offizielle VERSION zu verändern (die steigt erst beim PR). Bei jedem Test-
 # Rollout eines neuen Standes BUILD_SEQ erhöhen.
-BUILD_BRANCH     = "feature/openwebif-emulation"
-BUILD_SEQ        = "7"
+BUILD_BRANCH     = "bug/ui_issue_01"
+BUILD_SEQ        = "3"
 INTERNAL_VERSION = f"{VERSION}+{BUILD_BRANCH.split('/')[-1]}.{BUILD_SEQ}"
 CONFIG_FILE    = f"{DATA_DIR}/config.json"
 FAVORITES_FILE = f"{DATA_DIR}/favorites.json"
@@ -2723,491 +2723,6 @@ def build_m3u(channels, profile_name, favorites_only=False):
 
 # ── HTML Templates ────────────────────────────────────────
 
-# ── i18n: Übersetzungs-Dictionary + Client-Engine ──────────────────────────────
-# Strings werden via data-i18n="key" Attribut im HTML markiert und client-seitig
-# ersetzt. Default-Sprache: Englisch (mit Browser-Erkennung als Fallback).
-I18N_JS = r"""
-<script>
-const I18N = {
-  en: {
-    // Navigation & allgemein
-    "nav.home": "Home", "nav.back": "← Home", "nav.settings": "Settings",
-    "nav.favorites": "Favorites", "nav.epg": "EPG Browser", "nav.help": "Help",
-    "nav.mainpage": "← Main page", "nav.save": "Save", "nav.m3u_fav": "↓ M3U Favorites",
-    "common.save": "Save", "common.cancel": "Cancel", "common.delete": "Delete",
-    "common.add": "Add", "common.close": "Close", "common.refresh": "Refresh",
-    "common.loading": "Loading…", "common.search": "Search…", "common.enabled": "Enabled",
-    "common.disabled": "Disabled", "common.yes": "Yes", "common.no": "No",
-    "common.channels": "channels", "common.none": "— none —",
-    // Hauptseite
-    "main.live_tv": "Live TV", "main.all_channels": "All Channels",
-    "main.tuner_status": "Tuner Status", "main.free": "free", "main.busy": "busy",
-    "main.quick_record": "Quick Record", "main.duration_min": "Duration (min)",
-    "main.record": "Record", "main.stop": "Stop", "main.running": "Running",
-    "main.play": "Play", "main.no_channels": "No channels found",
-    "main.status": "Status:", "main.select_channel": "Select a channel…",
-    "main.pick_from_list": "Pick a channel from the list",
-    "main.fullscreen": "⤢ Fullscreen",
-    "main.connecting": "Connecting…", "main.device_profile": "Device profile",
-    // EPG Browser
-    "epg.title": "EPG Browser", "epg.today": "Today", "epg.tomorrow": "Tomorrow",
-    "epg.now": "▶ Now", "epg.search": "Search…", "epg.no_desc": "(No description)",
-    "epg.recording": "RECORDING", "epg.record_series": "📺 Record series",
-    "epg.record_movie": "🎬 Record as movie", "epg.starting": "Starting recording…",
-    "epg.rec_series_hint": "Series: TVDB lookup for real S/E, daily-show fallback (S2026E<i>day</i>)",
-    "epg.rec_movie_hint": "Movie: Movies/<Title>/ (year added only for duplicates)",
-    "epg.search_tmdb": "🎬 Search on TMDB →", "epg.search_tvdb": "📺 Search on TVDB →",
-    // Favoriten
-    "fav.title": "Favorites", "fav.all_channels": "ALL CHANNELS", "fav.group": "— Group —",
-    "fav.category": "— Category —", "fav.added": "Added to favorites",
-    "fav.saved": "Favorites saved", "fav.already": "Already a favorite",
-    "fav.add_hint": "Add", "fav.export_m3u": "↓ M3U Favorites",
-    // Settings — Tabs
-    "set.title": "Settings", "set.tab_config": "Configuration", "set.tab_maint": "Maintenance",
-    "set.tab_epg": "EPG", "set.tab_rec": "Recordings", "set.tab_api": "API",
-    // Settings — Konfiguration
-    "set.receivers": "Receivers", "set.add_receiver": "Add receiver",
-    "set.transcode": "Transcode Profiles", "set.device_profiles": "Device Profiles",
-    "set.api_keys": "API Keys & Tokens", "set.language": "Language",
-    "set.lang_hint": "Interface language. Applies immediately.",
-    "set.about": "About e2proxy", "set.general": "General",
-    // Settings — Wartung
-    "set.maintenance": "Maintenance", "set.update_logos": "🖼 Update logos",
-    "set.live_logs": "Live Logs", "set.log_level": "Log Level",
-    "set.api_access_log": "API Access Log", "set.load_more": "⬆ Load more",
-    "set.live": "↺ Live", "set.clear": "🗑 Clear", "set.logo_check": "Logo Check",
-    "set.log_retention": "Log Retention", "set.days": "days",
-    // Settings — EPG
-    "set.epg_sources": "EPG Sources", "set.epg_schedule": "EPG Schedule",
-    "set.epg_run_now": "Run EPG now", "set.epg_status": "EPG Status",
-    "set.epg_history": "EPG Run History",
-    // Settings — Aufnahmen
-    "set.rec_path": "Recording Path", "set.rec_profile": "Recording Profile",
-    "set.max_duration": "Max Duration", "set.plex_integration": "Plex Integration",
-    "set.plex_url": "Plex URL", "set.plex_token": "Plex Token", "set.plex_sections": "Plex Libraries",
-    // Toast-Meldungen
-    "toast.saved": "✓ Saved", "toast.error": "Error", "toast.deleted": "✓ Deleted",
-    "toast.cleared": "✓ Cleared", "toast.lang_changed": "✓ Language changed",
-    // Status
-    "status.online": "Online", "status.offline": "Offline",
-    "status.epg_updating": "EPG updating…",
-    // Settings — Detail-Strings
-    "set.rec_settings": "Recording Settings", "set.tuner_status": "Tuner Status",
-    "set.switch_tuning": "Switch Tuning", "set.switch_stats": "Per-Channel Statistics",
-    "set.switch_hint": "Speeds up channel switching (e.g. Plex). NoLatency starts ffmpeg with minimal probing; the zap wait is the pause after switching. Values act as global defaults — each channel is learned automatically (see table).",
-    "set.switch_nolatency": "NoLatency (global)",
-    "set.switch_nolatency_hint": "Start ffmpeg without heavy probing (faster, auto-raises on failures)",
-    "set.switch_zapwait": "Zap wait (s)", "set.switch_monitor": "Monitor window (s)",
-    "set.switch_retries": "Max restarts", "set.switch_nolat_probe": "NoLatency probesize",
-    "set.switch_fail_thresh": "Fail threshold (probesize↑)", "set.switch_reset_all": "Reset all",
-    "set.active_recordings": "Active Recordings", "set.quick_rec": "Quick Record",
-    "set.quick_rec_hint": "Select channel → current program shown → start recording.",
-    "set.start_rec": "▶ Start recording", "set.receivers_card": "Receivers",
-    "set.transcode_card": "Transcode Profiles", "set.device_card": "Device Profiles",
-    "set.api_keys_hint": "API keys for external services. Stored securely in the config.",
-    "set.config_editor": "Config Editor", "set.advanced": "ADVANCED",
-    "set.config_editor_hint": "Direct editing of the full configuration as JSON. For advanced settings.",
-    "set.reset": "↺ Reset", "set.maint_actions": "Maintenance Actions",
-    "set.maint_notify": "Maintenance Notifications",
-    "set.maint_notify_hint": "Sends an HTTP call to another system at a scheduled time, e.g. to trigger maintenance tasks. Optionally only when idle (no recording running and nobody watching).",
-    "set.maint_notify_enable": "Enable maintenance notifications",
-    "set.maint_notify_url": "Target URL", "set.maint_notify_time": "Time",
-    "set.maint_notify_days": "Weekdays", "set.maint_notify_idle": "Trigger condition",
-    "set.maint_notify_idle_always": "Always at the scheduled time",
-    "set.maint_notify_idle_only": "Only when idle (no recording / nobody watching)",
-    "set.maint_notify_test": "Send test",
-    "set.update_logos_card": "Update logos", "set.update_logos_hint": "Reloads all channel logos into the local cache.",
-    "set.reload_channels": "Reload channel list", "set.reload_channels_hint": "Reloads all channels and bouquets from the receiver.",
-    "set.restart_service": "Restart service", "set.restart_hint": "Restarts the e2proxy service. Active streams will be interrupted.",
-    "set.epg_update": "EPG Update", "set.epg_run_now_btn": "▶ Update now",
-    "set.schedule": "Schedule", "set.schedule_hint": "Time for the daily automatic EPG run. Should be before the Plex fetch (4-5 AM).",
-    "set.last_run": "Last Run", "set.run_history": "Run History (last 30)",
-    "set.run_history_hint": "Bars = duration in seconds. Red = outlier (>2× average).",
-    "set.epg_run_log": "EPG Run Log", "set.logo_check_card": "Logo Check",
-    "set.logo_check_hint": "Checks whether the favorite channel logos are reachable.",
-    "set.fav_logos": "Favorite logos", "set.fav_logos_hint": "Set a custom logo for each favorite — upload an image or enter a URL. The image is converted to the correct format automatically. Reset falls back to the automatic logo.",
-    "set.fav_logos_empty": "No favorites found. Add favorites first.", "set.fav_logos_custom": "custom",
-    "set.fav_logos_url_ph": "Logo URL (https://…)", "set.fav_logos_save_url": "Save URL",
-    "set.fav_logos_upload": "Upload", "set.fav_logos_done": "Logo saved",
-    "set.fav_logos_working": "Working…", "set.fav_logos_need_url": "Please enter a URL",
-    "set.fav_logos_too_big": "Image too large (max 8 MB)",
-    "set.fav_logos_zoom": "Click to enlarge",
-    "set.appearance": "Appearance", "set.appearance_hint": "Switch between dark and light theme. Stored in the browser.",
-    "set.log_level_hint": "Controls which log entries are shown. Applies immediately without restart. The RAM buffer always keeps the last 500 entries.",
-    "set.api_log_hint": "Logs all API requests persistently in",
-    "set.api_ref": "API Reference", "set.update": "↺ Update",
-    "set.timestamp": "Time", "set.duration": "Duration", "set.result": "Result",
-    "set.get_token": "Get token", "set.api_log_persist": "Logs all API requests persistently in",
-    "set.theme_dark": "🌙 Dark", "set.theme_light": "☀ Light",
-    "set.connection_failed": "Connection failed",
-    "rec.path": "Recording Path", "rec.default_profile": "Default Profile",
-    "rec.max_duration": "Max Duration (Watchdog)", "rec.seconds": "seconds",
-    "rec.plex_url": "Plex URL", "rec.plex_token": "Plex Token", "rec.plex_sections": "Plex Sections",
-    "rec.via_login": "🔑 Generate via login", "rec.load_sections": "📁 Load sections",
-    "rec.plex_verify": "Verify in Plex",
-    "rec.plex_verify_hint": "After recording/conversion, check via Plex token whether the file was actually indexed (logs result)",
-    "epg.plex_dvr_title": "Plex DVR Guide",
-    "epg.plex_dvr_desc": "Reloads the guide of the e2proxy DVR in Plex so new EPG data is picked up. Requires Plex URL + token (configured under Recordings). Only the e2proxy DVR is touched.",
-    "epg.plex_dvr_auto": "Automatically reload the Plex guide after each EPG run",
-    "epg.plex_dvr_now": "Update guide now",
-    "rec.select_channel": "— Select channel —", "rec.min": "min",
-    "rec.no_active": "No active recordings.", "rec.duration_label": "Duration:",
-    "epg.update_hint": "Fetches the program guide from both receivers, loads missing channels via zap and adds from the online source (Rytec). Runs daily automatically or manually.",
-    "epg.progress": "Progress:", "epg.completed": "Completed", "epg.oclock": "h",
-    "epg.jetzt_aktualisieren": "Update now",
-    "set.timestamp": "Time", "set.duration": "Duration", "set.result": "Result",
-    "set.get_token": "Get token",
-    "help.live_tv": "Live TV Streaming", "help.api_overview": "API Overview",
-    "help.recordings": "Recordings",
-    "maint.execute": "Execute", "maint.restart_btn": "Restart",
-    "epg.outlier": "Outlier", "epg.outliers": "Outliers",
-    "log.tip": "Tip: For normal operation we recommend <b>INFO</b> or <b>WARNING</b> — DEBUG logs a lot (SSDP requests etc.)",
-    "apilog.status_label": "active", "apilog.status_off": "inactive",
-    "apilog.hint": "Logs all API requests persistently in",
-    "apilog.activated": "API Logging activated", "apilog.deactivated": "API Logging deactivated",
-    "apilog.clear_confirm": "Clear API log?",
-    "apilog.no_entries": "No entries yet.",
-    "rec.tuner_free": "free", "rec.tuner_busy": "busy",
-    "help.live_tv_desc": "Select a channel on the left → stream starts in the browser. Profile (Web-SD / Web-HD) top right. Fullscreen button maximizes. Each stream uses one receiver — the header status shows who is currently streaming. Kill button (✕) ends a session.",
-    "help.epg_desc": "28-hour program guide as a timeline grid. Channel labels stay visible when scrolling horizontally (sticky). Click on a show → details + TMDB link. Automatically updated daily at 3:00 AM. Manual: <b>Settings → EPG → Update now</b>. Startup run without TMDB (fast) — nightly run with TMDB posters.",
-    "help.fav_desc": "Channel list for Plex DVR, EPG and M3U. Reorder via drag & drop. Per channel: group + EPG category (series/movie/news/sports…) for Kodi color coding in the EPG grid. Changes saved immediately.",
-    "help.rec_desc": "Recordings with ffmpeg (video copy + audio AC3 transcode). Structured in <code>Show/Season/Episode</code> with NFO metadata for Plex/Kodi. Watchdog terminates stuck recordings after <code>max_duration</code>. Plex library refresh after completion.",
-    "help.tmdb_desc": "Posters for EPG shows ≥20 min via TMDB API. Similarity check (45%) prevents wrong matches. Cache: 30 days (found) / 7 days (not found). XMLTV categories + DVB genre IDs for Kodi.",
-    "help.settings_desc": "<b>Configuration:</b> Receivers, transcode profiles, device profiles, TMDB API key, e2recorder URL.<br><b>Maintenance:</b> Live logs, log level, service restart, logo update.<br><b>EPG:</b> Manual run, schedule, run history as bar chart, outlier detection.<br><b>Recordings:</b> Path, profile, Plex integration, tuner status, quick record.",
-    "help.plex_desc": "HDHomeRun emulation (SSDP UDP multicast). Plex automatically discovers e2proxy as a DVR device. No Threadfin needed.",
-    "help.docker_desc": "<code>python:3.11-slim</code> + ffmpeg. Persistent data in <code>/data</code>. <code>network_mode: host</code> required for SSDP and LAN access to receivers.",
-    "comp.title": "Compression",
-    "comp.desc": "Compresses .ts recordings to .mkv to save disk space. Runs during off-hours so it doesn't compete with live streaming for CPU.",
-    "comp.enabled": "Enabled", "comp.profile": "Profile",
-    "comp.window": "Time Window", "comp.window_hint": "When compression may run",
-    "comp.delete_orig": "Delete original .ts after success",
-    "comp.audio_bitrate": "Audio Bitrate",
-    "comp.status": "Status", "comp.pending": "Pending",
-    "comp.current": "Currently compressing", "comp.history": "Recent Runs",
-    "comp.run_now": "▶ Convert now", "comp.in_window": "In window",
-    "comp.select_all": "Select all", "comp.convert_selected": "▶ Convert selected",
-    "comp.select_hint": "Select at least one recording first.",
-    "comp.pause": "Pause", "comp.resume": "Resume", "comp.cancel": "Cancel",
-    "comp.paused": "Paused", "comp.eta": "ETA", "comp.cancelled": "Conversion cancelled",
-    "comp.cancel_confirm": "Cancel the running conversion? The partial file will be discarded and the recording stays pending.",
-    "comp.cpu_limit": "CPU limit", "comp.cpu_hint": "0 = unlimited · lower = gentler background load",
-    "comp.background": "Run anytime", "comp.background_hint": "Ignore the time window (use with a CPU limit)",
-    "comp.out_window": "Outside window", "comp.backlog_warn": "⚠ Backlog forming — compression isn't keeping up",
-    "comp.no_pending": "No files pending compression.",
-    "comp.no_history": "No compression runs yet.",
-    "comp.started": "Compression started",
-    "comp.profile_fast": "Fast (H.264 veryfast, ~40% smaller)",
-    "comp.profile_balanced": "Balanced (H.264 medium, ~55% smaller)",
-    "comp.profile_quality": "Quality (H.265 medium, ~65% smaller)",
-  },
-  de: {
-    "nav.home": "Startseite", "nav.back": "← Startseite", "nav.settings": "Einstellungen",
-    "nav.favorites": "Favoriten", "nav.epg": "EPG Browser", "nav.help": "Hilfe",
-    "nav.mainpage": "← Hauptseite", "nav.save": "Speichern", "nav.m3u_fav": "↓ M3U Favoriten",
-    "common.save": "Speichern", "common.cancel": "Abbrechen", "common.delete": "Löschen",
-    "common.add": "Hinzufügen", "common.close": "Schließen", "common.refresh": "Aktualisieren",
-    "common.loading": "Lädt…", "common.search": "Suchen…", "common.enabled": "Aktiviert",
-    "common.disabled": "Deenabled", "common.yes": "Ja", "common.no": "Nein",
-    "common.channels": "Sender", "common.none": "— keine —",
-    "main.live_tv": "Live TV", "main.all_channels": "Alle Sender",
-    "main.tuner_status": "Tuner Status", "main.free": "frei", "main.busy": "belegt",
-    "main.quick_record": "Schnellaufnahme", "main.duration_min": "Dauer (Min)",
-    "main.record": "Aufnehmen", "main.stop": "Stoppen", "main.running": "Läuft",
-    "main.play": "Abspielen", "main.no_channels": "Keine Sender gefunden",
-    "main.status": "Stand:", "main.select_channel": "Sender auswählen…",
-    "main.pick_from_list": "Sender aus der Liste wählen",
-    "main.fullscreen": "⤢ Vollbild",
-    "main.connecting": "Verbinde…", "main.device_profile": "Device-Profil",
-    "epg.title": "EPG Browser", "epg.today": "Heute", "epg.tomorrow": "Morgen",
-    "epg.now": "▶ Jetzt", "epg.search": "Suche…", "epg.no_desc": "(Keine Beschreibung)",
-    "epg.recording": "AUFNAHME", "epg.record_series": "📺 Serie aufnehmen",
-    "epg.record_movie": "🎬 Als Film aufnehmen", "epg.starting": "Starte Aufnahme…",
-    "epg.rec_series_hint": "Serie: TVDB-Lookup für echte S/E, Daily-Show-Fallback (S2026E<i>tag</i>)",
-    "epg.rec_movie_hint": "Film: Movies/<Titel>/ (Jahr nur bei Duplikaten)",
-    "epg.search_tmdb": "🎬 Auf TMDB suchen →", "epg.search_tvdb": "📺 Auf TVDB suchen →",
-    "fav.title": "Favoriten", "fav.all_channels": "ALLE SENDER", "fav.group": "— Gruppe —",
-    "fav.category": "— Kategorie —", "fav.added": "Zu Favoriten hinzugefügt",
-    "fav.saved": "Favoriten gespeichert", "fav.already": "Bereits Favorit",
-    "fav.add_hint": "Hinzufügen", "fav.export_m3u": "↓ M3U Favoriten",
-    "set.title": "Einstellungen", "set.tab_config": "Konfiguration", "set.tab_maint": "Wartung",
-    "set.tab_epg": "EPG", "set.tab_rec": "Aufnahmen", "set.tab_api": "API",
-    "set.receivers": "Receiver", "set.add_receiver": "Receiver hinzufügen",
-    "set.transcode": "Transcode-Profile", "set.device_profiles": "Device-Profile",
-    "set.api_keys": "API-Keys & Tokens", "set.language": "Sprache",
-    "set.lang_hint": "Sprache der Oberfläche. Wirkt sofort.",
-    "set.about": "Über e2proxy", "set.general": "Allgemein",
-    "set.maintenance": "Wartung", "set.update_logos": "🖼 Logos aktualisieren",
-    "set.live_logs": "Live Logs", "set.log_level": "Log-Level",
-    "set.api_access_log": "API Access Log", "set.load_more": "⬆ Reload",
-    "set.live": "↺ Live", "set.clear": "🗑 Leeren", "set.logo_check": "Logo-Prüfung",
-    "set.log_retention": "Log Aufbewahrung", "set.days": "Tage",
-    "set.epg_sources": "EPG-Quellen", "set.epg_schedule": "EPG-Zeitplan",
-    "set.epg_run_now": "EPG jetzt starten", "set.epg_status": "EPG Status",
-    "set.epg_history": "EPG-Run Historie",
-    "set.rec_path": "Aufnahme-Pfad", "set.rec_profile": "Aufnahme-Profil",
-    "set.max_duration": "Max. Dauer", "set.plex_integration": "Plex Integration",
-    "set.plex_url": "Plex URL", "set.plex_token": "Plex Token", "set.plex_sections": "Plex Mediatheken",
-    "toast.saved": "✓ Gespeichert", "toast.error": "Fehler", "toast.deleted": "✓ Gelöscht",
-    "toast.cleared": "✓ Geleert", "toast.lang_changed": "✓ Sprache geändert",
-    "status.online": "Online", "status.offline": "Offline",
-    "status.epg_updating": "EPG wird aktualisiert…",
-    "set.rec_settings": "Aufnahme-Einstellungen", "set.tuner_status": "Tuner-Status",
-    "set.switch_tuning": "Umschalt-Tuning", "set.switch_stats": "Per-Sender-Statistik",
-    "set.switch_hint": "Beschleunigt das Umschalten (z.B. Plex). NoLatency startet ffmpeg mit minimalem Probing; die Zap-Wartezeit ist die Pause nach dem Umschalten. Werte gelten global als Default — pro Sender wird automatisch gelernt (siehe Tabelle).",
-    "set.switch_nolatency": "NoLatency (global)",
-    "set.switch_nolatency_hint": "ffmpeg ohne großes Probing starten (schneller, lernt bei Fehlern automatisch hoch)",
-    "set.switch_zapwait": "Zap-Wartezeit (s)", "set.switch_monitor": "Monitor-Fenster (s)",
-    "set.switch_retries": "Max. Neustarts", "set.switch_nolat_probe": "NoLatency Probesize",
-    "set.switch_fail_thresh": "Fehler-Schwelle (Probesize↑)", "set.switch_reset_all": "Reset alle",
-    "set.active_recordings": "Aktive Aufnahmen", "set.quick_rec": "Schnell-Aufnahme",
-    "set.quick_rec_hint": "Kanal wählen → aktuelle Sendung wird angezeigt → Aufnahme starten.",
-    "set.start_rec": "▶ Aufnahme starten", "set.receivers_card": "Receiver",
-    "set.transcode_card": "Transcode-Profile", "set.device_card": "Device-Profile",
-    "set.api_keys_hint": "API-Keys für externe Dienste. Werden sicher in der Config gespeichert.",
-    "set.config_editor": "Config Editor", "set.advanced": "ERWEITERT",
-    "set.config_editor_hint": "Direkte Bearbeitung der vollständigen Konfiguration als JSON. Für fortgeschrittene Einstellungen.",
-    "set.reset": "↺ Zurücksetzen", "set.maint_actions": "Wartungs-Aktionen",
-    "set.maint_notify": "Wartungs-Benachrichtigungen",
-    "set.maint_notify_hint": "Sendet zu einem geplanten Zeitpunkt einen HTTP-Call an ein anderes System, z.B. um Wartungsarbeiten anzustoßen. Optional nur im Leerlauf (keine Aufnahme läuft und niemand schaut fern).",
-    "set.maint_notify_enable": "Wartungs-Benachrichtigungen aktivieren",
-    "set.maint_notify_url": "Ziel-URL", "set.maint_notify_time": "Uhrzeit",
-    "set.maint_notify_days": "Wochentage", "set.maint_notify_idle": "Auslöse-Bedingung",
-    "set.maint_notify_idle_always": "Immer zur geplanten Zeit",
-    "set.maint_notify_idle_only": "Nur im Leerlauf (keine Aufnahme / niemand schaut)",
-    "set.maint_notify_test": "Test senden",
-    "set.update_logos_card": "Logos aktualisieren", "set.update_logos_hint": "Lädt alle Senderlogos neu in den lokalen Cache.",
-    "set.reload_channels": "Senderliste neu laden", "set.reload_channels_hint": "Lädt alle Sender und Bouquets neu vom Receiver.",
-    "set.restart_service": "Service neu starten", "set.restart_hint": "Startet den e2proxy Service neu. Aktive Streams werden unterbrochen.",
-    "set.epg_update": "EPG-Aktualisierung", "set.epg_run_now_btn": "▶ Jetzt aktualisieren",
-    "set.schedule": "Zeitplan", "set.schedule_hint": "Uhrzeit für den täglichen automatischen EPG-Run. Sollte vor dem Plex-Abruf (4-5 Uhr) liegen.",
-    "set.last_run": "Letzter Run", "set.run_history": "Run-Historie (letzte 30)",
-    "set.run_history_hint": "Balken = Dauer in Sekunden. Rot = Ausreißer (>2× Durchschnitt).",
-    "set.epg_run_log": "EPG-Run Log", "set.logo_check_card": "Logo-Prüfung",
-    "set.logo_check_hint": "Prüft ob die Senderlogos der Favoriten erreichbar sind.",
-    "set.fav_logos": "Sender-Logos", "set.fav_logos_hint": "Hinterlege pro Favorit ein eigenes Logo — Bild hochladen oder URL angeben. Das Bild wird automatisch ins richtige Format konvertiert. Zurücksetzen nutzt wieder das automatische Logo.",
-    "set.fav_logos_empty": "Keine Favoriten gefunden. Zuerst Favoriten anlegen.", "set.fav_logos_custom": "eigen",
-    "set.fav_logos_url_ph": "Logo-URL (https://…)", "set.fav_logos_save_url": "URL speichern",
-    "set.fav_logos_upload": "Hochladen", "set.fav_logos_done": "Logo gespeichert",
-    "set.fav_logos_working": "Wird verarbeitet…", "set.fav_logos_need_url": "Bitte eine URL angeben",
-    "set.fav_logos_too_big": "Bild zu groß (max 8 MB)",
-    "set.fav_logos_zoom": "Zum Vergrößern klicken",
-    "set.appearance": "Darstellung", "set.appearance_hint": "Zwischen dunklem und hellem Design wechseln. Wird im Browser gespeichert.",
-    "set.log_level_hint": "Steuert welche Log-Einträge angezeigt werden. Wirkt sofort ohne Neustart. Im RAM-Buffer werden immer alle 500 letzten Einträge gespeichert.",
-    "set.api_log_hint": "Protokolliert alle API-Anfragen persistent in",
-    "set.api_ref": "API Referenz", "set.update": "↺ Aktualisieren",
-    "set.timestamp": "Zeitpunkt", "set.duration": "Dauer", "set.result": "Ergebnis",
-    "set.get_token": "Token holen", "set.api_log_persist": "Protokolliert alle API-Anfragen persistent in",
-    "set.theme_dark": "🌙 Dunkel", "set.theme_light": "☀ Hell",
-    "set.connection_failed": "Verbindung fehlgeschlagen",
-    "rec.path": "Aufnahme-Pfad", "rec.default_profile": "Default-Profil",
-    "rec.max_duration": "Max. Dauer (Watchdog)", "rec.seconds": "Sekunden",
-    "rec.plex_url": "Plex URL", "rec.plex_token": "Plex Token", "rec.plex_sections": "Plex Sections",
-    "rec.via_login": "🔑 Via Login generieren", "rec.load_sections": "📁 Sections laden",
-    "rec.plex_verify": "In Plex verifizieren",
-    "rec.plex_verify_hint": "Nach Aufnahme/Konvertierung per Plex-Token prüfen, ob die Datei tatsächlich indexiert wurde (Ergebnis im Log)",
-    "epg.plex_dvr_title": "Plex DVR Guide",
-    "epg.plex_dvr_desc": "Lädt den Guide des e2proxy-DVR in Plex neu, damit neue EPG-Daten übernommen werden. Benötigt Plex URL + Token (unter Aufnahmen konfiguriert). Nur der e2proxy-DVR wird angesprochen.",
-    "epg.plex_dvr_auto": "Plex-Guide nach jedem EPG-Run automatisch neu laden",
-    "epg.plex_dvr_now": "Guide jetzt aktualisieren",
-    "rec.select_channel": "— Kanal wählen —", "rec.min": "Min",
-    "rec.no_active": "Keine aktiven Aufnahmen.", "rec.duration_label": "Dauer:",
-    "epg.update_hint": "Holt den Programmführer aus beiden Receivern, lädt fehlende Sender per Zap nach und ergänzt aus der Online-Quelle (Rytec). Läuft täglich automatisch oder manuell.",
-    "epg.progress": "Fortschritt:", "epg.completed": "Abgeschlossen", "epg.oclock": "Uhr",
-    "epg.jetzt_aktualisieren": "Jetzt aktualisieren",
-    "set.timestamp": "Zeitpunkt", "set.duration": "Dauer", "set.result": "Ergebnis",
-    "set.get_token": "Token holen",
-    "help.live_tv": "Live TV streamen", "help.api_overview": "API Kurzübersicht",
-    "help.recordings": "Aufnahmen",
-    "maint.execute": "Ausführen", "maint.restart_btn": "Neu starten",
-    "epg.outlier": "Ausreißer", "epg.outliers": "Ausreißer",
-    "log.tip": "Tipp: Im Normalbetrieb empfehlen wir <b>INFO</b> oder <b>WARNING</b> \u2014 DEBUG loggt sehr viel (SSDP-Anfragen etc.)",
-    "apilog.status_label": "aktiv", "apilog.status_off": "inaktiv",
-    "apilog.hint": "Protokolliert alle API-Anfragen persistent in",
-    "apilog.activated": "API Logging enabled", "apilog.deactivated": "API Logging deenabled",
-    "apilog.clear_confirm": "API Log leeren?",
-    "apilog.no_entries": "Noch keine Einträge.",
-    "rec.tuner_free": "frei", "rec.tuner_busy": "belegt",
-    "help.live_tv_desc": "Sender links wählen → Stream startet im Browser. Profil (Web-SD / Web-HD) oben rechts. Vollbild-Button maximiert. Jeder Stream belegt einen Receiver — der Header-Status zeigt wer gerade streamt. Kill-Button (✕) beendet eine Session.",
-    "help.epg_desc": "28-Stunden Programmführer als Zeitstrahl-Grid. Sender-Labels bleiben beim horizontalen Scrollen sichtbar (sticky). Klick auf Sendung → Details + TMDB-Link. Täglich 3:00 Uhr automatisch aktualisiert. Manuell: <b>Settings → EPG → Jetzt aktualisieren</b>. Startup-Run ohne TMDB (schnell) — nächtlicher Run mit TMDB-Postern.",
-    "help.fav_desc": "Sender-Liste für Plex DVR, EPG und M3U. Reihenfolge per Drag & Drop. Pro Sender: Gruppe + EPG-Kategorie (serie/movie/news/sports…) für Kodi-Farbkodierung im EPG-Grid. Änderungen sofort gespeichert.",
-    "help.rec_desc": "Aufnahmen mit ffmpeg (Video copy + Audio AC3 Transcode). Strukturiert in <code>Sendung/Staffel/Episode</code> mit NFO-Metadaten für Plex/Kodi. Watchdog beendet hängende Aufnahmen nach <code>max_duration</code>. Plex Library Refresh nach Ende.",
-    "help.tmdb_desc": "Poster für EPG-Sendungen ≥20 Min via TMDB API. Ähnlichkeits-Check (45%) verhindert falsche Zuordnung. Cache: 30 Tage (gefunden) / 7 Tage (nicht gefunden). XMLTV-Kategorien + DVB Genre-IDs für Kodi.",
-    "help.settings_desc": "<b>Konfiguration:</b> Receiver, Transcode-Profile, Device-Profile, TMDB API-Key, e2recorder URL.<br><b>Wartung:</b> Live-Logs, Log-Level, Service-Neustart, Logo-Update.<br><b>EPG:</b> Manueller Run, Zeitplan, Run-Historie als Balkengrafik, Ausreißer-Erkennung.<br><b>Aufnahmen:</b> Pfad, Profil, Plex-Integration, Tuner-Status, Schnell-Aufnahme.",
-    "help.plex_desc": "HDHomeRun-Emulation (SSDP UDP Multicast). Plex erkennt e2proxy automatisch als DVR-Gerät. Kein Threadfin nötig.",
-    "help.docker_desc": "<code>python:3.11-slim</code> + ffmpeg. Persistente Daten in <code>/data</code>. <code>network_mode: host</code> nötig für SSDP und LAN-Zugriff auf Receiver.",
-    "comp.title": "Komprimierung",
-    "comp.desc": "Komprimiert .ts Aufnahmen zu .mkv um Speicherplatz zu sparen. Läuft in Off-Hours damit kein CPU-Konflikt mit Live-Streaming entsteht.",
-    "comp.enabled": "Aktiviert", "comp.profile": "Profil",
-    "comp.window": "Zeitfenster", "comp.window_hint": "Wann darf komprimiert werden",
-    "comp.delete_orig": "Original .ts nach Erfolg löschen",
-    "comp.audio_bitrate": "Audio-Bitrate",
-    "comp.status": "Status", "comp.pending": "Wartend",
-    "comp.current": "Wird gerade komprimiert", "comp.history": "Letzte Läufe",
-    "comp.run_now": "▶ Jetzt konvertieren", "comp.in_window": "Im Zeitfenster",
-    "comp.select_all": "Alle auswählen", "comp.convert_selected": "▶ Auswahl konvertieren",
-    "comp.select_hint": "Bitte zuerst mindestens eine Aufnahme auswählen.",
-    "comp.pause": "Pause", "comp.resume": "Fortsetzen", "comp.cancel": "Abbrechen",
-    "comp.paused": "Pausiert", "comp.eta": "Restzeit", "comp.cancelled": "Konvertierung abgebrochen",
-    "comp.cancel_confirm": "Laufende Konvertierung abbrechen? Die Teildatei wird verworfen und die Aufnahme bleibt wartend.",
-    "comp.cpu_limit": "CPU-Limit", "comp.cpu_hint": "0 = unbegrenzt · niedriger = sanftere Hintergrundlast",
-    "comp.background": "Jederzeit ausführen", "comp.background_hint": "Zeitfenster ignorieren (mit CPU-Limit verwenden)",
-    "comp.out_window": "Außerhalb des Zeitfensters", "comp.backlog_warn": "⚠ Rückstand bildet sich — Komprimierung kommt nicht hinterher",
-    "comp.no_pending": "Keine Dateien zur Komprimierung.",
-    "comp.no_history": "Noch keine Komprimierungsläufe.",
-    "comp.started": "Komprimierung gestartet",
-    "comp.profile_fast": "Schnell (H.264 veryfast, ~40% kleiner)",
-    "comp.profile_balanced": "Ausgewogen (H.264 medium, ~55% kleiner)",
-    "comp.profile_quality": "Qualität (H.265 medium, ~65% kleiner)",
-  }
-};
-
-function getLang() {
-  let l = localStorage.getItem('e2proxy-lang');
-  if (!l) {
-    // Browser-Sprache erkennen, sonst Englisch
-    const nav = (navigator.language || 'en').toLowerCase();
-    l = nav.startsWith('de') ? 'de' : 'en';
-  }
-  return (l === 'de') ? 'de' : 'en';
-}
-
-function t(key) {
-  const lang = getLang();
-  return (I18N[lang] && I18N[lang][key]) || (I18N.en[key]) || key;
-}
-
-function applyI18n() {
-  try {
-    const lang = getLang();
-    document.documentElement.lang = lang;
-    const langSel = document.getElementById('lang-sel');
-    if (langSel) langSel.value = lang;
-    document.querySelectorAll('[data-i18n]').forEach(el => {
-      try {
-        const key = el.getAttribute('data-i18n');
-        const val = t(key);
-        if (el.getAttribute('data-i18n-html') === '1') el.innerHTML = val;
-        else el.textContent = val;
-      } catch(e) {}
-    });
-    document.querySelectorAll('[data-i18n-ph]').forEach(el => {
-      try { el.setAttribute('placeholder', t(el.getAttribute('data-i18n-ph'))); } catch(e) {}
-    });
-    document.querySelectorAll('[data-i18n-title]').forEach(el => {
-      try { el.setAttribute('title', t(el.getAttribute('data-i18n-title'))); } catch(e) {}
-    });
-  } catch(e) { console.warn('applyI18n:', e); }
-}
-
-function setLang(lang) {
-  localStorage.setItem('e2proxy-lang', lang === 'de' ? 'de' : 'en');
-  location.reload();   // Voller Reload — alle Texte inkl. dynamisch gerenderte korrekt
-}
-
-document.addEventListener('DOMContentLoaded', applyI18n);
-</script>
-"""
-
-CSS_BASE = """
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@300;400;500&display=swap');
-:root {
-  --bg:#0a0a0f; --surface:#12121a; --surface2:#1a1a26;
-  --border:#2a2a3d; --accent:#6366f1; --accent2:#818cf8;
-  --text:#e2e2f0; --muted:#6b6b8a;
-  --green:#22c55e; --red:#ef4444; --amber:#f59e0b;
-}
-[data-theme="light"] {
-  --bg:#f4f5f7; --surface:#ffffff; --surface2:#f0f1f5;
-  --border:#d1d5db; --accent:#4f46e5; --accent2:#4f46e5;
-  --text:#1a1a2e; --muted:#6b7280;
-  --green:#16a34a; --red:#dc2626; --amber:#d97706;
-}
-*{margin:0;padding:0;box-sizing:border-box;}
-body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-weight:300;min-height:100vh;}
-.header{background:var(--surface);border-bottom:1px solid var(--border);padding:14px 24px;display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:100;}
-.logo{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:17px;color:var(--accent2);}
-.logo span{color:var(--muted);font-weight:400;}
-.header-right{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
-.btn{padding:6px 12px;border-radius:6px;font-size:11px;font-family:'JetBrains Mono',monospace;cursor:pointer;border:1px solid var(--border);color:var(--text);background:var(--surface2);text-decoration:none;display:inline-block;transition:all 0.15s;white-space:nowrap;}
-.btn:hover{border-color:var(--accent);color:var(--accent2);}
-.btn-primary{background:var(--accent);border-color:var(--accent);color:white;}
-.btn-primary:hover{background:var(--accent2);border-color:var(--accent2);color:white;}
-.btn-danger{color:var(--red);border-color:var(--red);}
-.btn-danger:hover{background:var(--red);color:white;}
-.select{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer;outline:none;}
-.select:focus{border-color:var(--accent);}
-.toast{position:fixed;bottom:20px;right:20px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:9px 14px;border-radius:7px;font-size:12px;font-family:'JetBrains Mono',monospace;opacity:0;transform:translateY(8px);transition:all 0.25s;z-index:9999;}
-.toast.show{opacity:1;transform:translateY(0);}
-.toast.success{border-color:var(--green);color:var(--green);}
-.toast.error{border-color:var(--red);color:var(--red);}
-.theme-toggle{background:none;border:1px solid var(--border);color:var(--muted);padding:4px 8px;border-radius:5px;cursor:pointer;font-size:13px;transition:all 0.15s;}
-.theme-toggle:hover{border-color:var(--accent);color:var(--accent2);}
-"""
-
-def html_page(title, body, head_extra=""):
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>e2proxy · {title}</title>
-<script>(function(){{var t=localStorage.getItem('e2proxy-theme');if(t==='light')document.documentElement.setAttribute('data-theme','light');}})();</script>
-<style>{CSS_BASE}{head_extra}</style>
-{I18N_JS}
-</head>
-<body>
-<div id="epg-status-bar" style="display:none;position:sticky;top:0;z-index:200;background:#f59e0b;color:#1a1200;padding:5px 20px;font-family:'JetBrains Mono',monospace;font-size:11px;align-items:center;gap:8px;">
-  <span style="animation:pulse 1s infinite">⟳</span>
-  <span id="epg-status-text" data-i18n="status.epg_updating">EPG updating…</span>
-</div>
-<style>@keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:0.5}}}}</style>
-{body}
-<div class="toast" id="toast"></div>
-<script>
-function showToast(msg, type) {{
-  const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.className = 'toast show' + (type ? ' ' + type : '');
-  setTimeout(() => t.className = 'toast', 3000);
-}}
-function apiPost(url, data) {{
-  return fetch(url, {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(data)}}).then(r=>r.json());
-}}
-function toggleTheme() {{
-  const isLight = document.documentElement.getAttribute('data-theme') === 'light';
-  if (isLight) {{
-    document.documentElement.removeAttribute('data-theme');
-    localStorage.setItem('e2proxy-theme', 'dark');
-  }} else {{
-    document.documentElement.setAttribute('data-theme', 'light');
-    localStorage.setItem('e2proxy-theme', 'light');
-  }}
-  const btn = document.getElementById('theme-toggle-btn');
-  if (btn) btn.textContent = isLight ? '☀' : '🌙';
-}}
-
-// ── EPG Status Indicator ─────────────────────────────
-(function() {{
-  function checkEpg() {{
-    fetch('/api/epg/status').then(r=>r.json()).then(d=>{{
-      const el = document.getElementById('epg-status-bar');
-      if (!el) return;
-      if (d.running) {{
-        el.style.display = 'flex';
-        el.querySelector('#epg-status-text').textContent =
-          (typeof t === 'function' ? t('status.epg_updating') : 'EPG updating…') + ' ' + (d.phase||'') + (d.progress ? ' ' + d.progress + '%' : '');
-      }} else {{
-        el.style.display = 'none';
-      }}
-    }}).catch(()=>{{}});
-  }}
-  setInterval(checkEpg, 5000);
-  checkEpg();
-}})();
-</script>
-</body>
-</html>"""
-
 
 # ── Recording System ───────────────────────────────────────────────────────────
 import uuid as _uuid
@@ -4537,6 +4052,754 @@ def maintenance_notify_loop():
         time.sleep(20)
 
 
+# ── API Access Log ─────────────────────────────────────────────────────────────
+API_ACCESS_LOG_FILE = f"{DATA_DIR}/api_access.log"
+API_ACCESS_LOG_MAX  = 1000  # max Einträge
+
+def is_api_logging_enabled():
+    return get_config().get("api_logging", False)
+
+def write_access_log(method, path, client_ip, status, duration_ms, params=""):
+    if not is_api_logging_enabled():
+        return
+    try:
+        # Tägliche Rotation: am Mitternacht-Wechsel rotieren
+        _rotate_access_log_if_needed()
+        entry = json.dumps({
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "method": method,
+            "path": path,
+            "params": params[:200] if params else "",
+            "ip": client_ip,
+            "status": status,
+            "ms": duration_ms,
+        }, ensure_ascii=False)
+        # Reines Append — kein Read-Modify-Write
+        os.makedirs(os.path.dirname(API_ACCESS_LOG_FILE), exist_ok=True)
+        with open(API_ACCESS_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(entry + "\n")
+    except Exception as e:
+        log.debug(f"Access-Log Fehler: {e}")
+
+_access_log_last_rotate = [None]  # Datum des letzten Rotate-Checks
+
+def _rotate_access_log_if_needed():
+    """Bei Datumswechsel: aktuelle Datei in api_access.log.YYYY-MM-DD umbenennen.
+    Löscht alte Dateien gemäß log_retention_days."""
+    import datetime as _dt, glob
+    today = _dt.date.today()
+    if _access_log_last_rotate[0] == today:
+        return
+    _access_log_last_rotate[0] = today
+    try:
+        if not os.path.exists(API_ACCESS_LOG_FILE):
+            return
+        # Datum der ersten Zeile prüfen → wenn nicht heute, rotieren
+        with open(API_ACCESS_LOG_FILE, encoding="utf-8") as f:
+            first_line = f.readline().strip()
+        if not first_line:
+            return
+        try:
+            entry = json.loads(first_line)
+            file_date = entry["ts"][:10]  # YYYY-MM-DD
+        except Exception:
+            return
+        if file_date != today.strftime("%Y-%m-%d"):
+            # Rotieren: aktuelle Datei → api_access.log.<file_date>
+            rotated = f"{API_ACCESS_LOG_FILE}.{file_date}"
+            os.rename(API_ACCESS_LOG_FILE, rotated)
+            log.info(f"API access log rotated: {os.path.basename(rotated)}")
+        # Alte Dateien löschen
+        retention = int(get_config().get("log_retention_days", 5))
+        cutoff = today - _dt.timedelta(days=retention)
+        for fp in glob.glob(f"{API_ACCESS_LOG_FILE}.*"):
+            try:
+                date_str = fp.split(".")[-1]
+                fd = _dt.datetime.strptime(date_str, "%Y-%m-%d").date()
+                if fd < cutoff:
+                    os.remove(fp)
+                    log.info(f"API access log deleted (älter als {retention} Tage): {os.path.basename(fp)}")
+            except Exception:
+                pass
+    except Exception as e:
+        log.debug(f"Access-Log Rotation Fehler: {e}")
+
+
+def read_access_log(n=200, since_unix=None):
+    """Liest API Access Log inkl. rotierter Dateien. 
+    
+    n: max Anzahl (None = alle)
+    since_unix: nur Einträge nach diesem Timestamp
+    """
+    import datetime as _dt, glob
+    try:
+        # Wenn since_unix gesetzt → alle rotierten Dateien einbeziehen
+        # Sonst nur die aktuelle (für Live-Polling)
+        if since_unix is not None:
+            files = sorted(glob.glob(f"{API_ACCESS_LOG_FILE}*"))
+        else:
+            files = [API_ACCESS_LOG_FILE] if os.path.exists(API_ACCESS_LOG_FILE) else []
+        all_lines = []
+        for fp in files:
+            try:
+                with open(fp, encoding="utf-8") as f:
+                    all_lines.extend(f.readlines())
+            except Exception:
+                continue
+        entries = []
+        for line in reversed(all_lines):
+            try:
+                e = json.loads(line.strip())
+                if since_unix is not None:
+                    try:
+                        ts_unix = _dt.datetime.strptime(e["ts"], "%Y-%m-%d %H:%M:%S").timestamp()
+                        if ts_unix < since_unix:
+                            continue
+                        e["ts_unix"] = ts_unix
+                    except Exception:
+                        continue
+                else:
+                    try:
+                        e["ts_unix"] = _dt.datetime.strptime(e["ts"], "%Y-%m-%d %H:%M:%S").timestamp()
+                    except Exception:
+                        e["ts_unix"] = 0
+                entries.append(e)
+                if n is not None and len(entries) >= n:
+                    break
+            except Exception:
+                pass
+        return entries
+    except Exception:
+        return []
+
+
+
+# ==============================================================================
+# WEBUI  ─  self-contained web interface block (extraction candidate)
+# ------------------------------------------------------------------------------
+# Everything the browser UI needs lives between the BEGIN/END WEBUI markers:
+#   i18n engine (I18N_JS), base stylesheet (CSS_BASE), the page shell
+#   (html_page), a startup self-check (webui_selfcheck) and the page builders
+#   (build_web_ui / build_help_ui / build_favorites_ui / build_epg_browser /
+#   build_settings_ui).
+#
+# Extraction contract - to later move this into its own service/module, this
+# block only depends on these external symbols from e2proxy:
+#   config/data:  get_config, get_channels, get_favorites, DATA_DIR, VERSION,
+#                 INTERNAL_VERSION, BUILD_BRANCH, BUILD_SEQ
+#   helpers:      read_access_log, is_api_logging_enabled, log
+# Keep new UI code inside these markers so the boundary stays a clean cut.
+# ==============================================================================
+
+# ── i18n: Übersetzungs-Dictionary + Client-Engine ──────────────────────────────
+# Strings werden via data-i18n="key" Attribut im HTML markiert und client-seitig
+# ersetzt. Default-Sprache: Englisch (mit Browser-Erkennung als Fallback).
+I18N_JS = r"""
+<script>
+const I18N = {
+  en: {
+    // Navigation & allgemein
+    "nav.home": "Home", "nav.back": "← Home", "nav.settings": "Settings",
+    "nav.favorites": "Favorites", "nav.epg": "EPG Browser", "nav.help": "Help",
+    "nav.mainpage": "← Main page", "nav.save": "Save", "nav.m3u_fav": "↓ M3U Favorites",
+    "common.save": "Save", "common.cancel": "Cancel", "common.delete": "Delete",
+    "common.add": "Add", "common.close": "Close", "common.refresh": "Refresh",
+    "common.loading": "Loading…", "common.search": "Search…", "common.enabled": "Enabled",
+    "common.disabled": "Disabled", "common.yes": "Yes", "common.no": "No",
+    "common.channels": "channels", "common.none": "— none —",
+    // Hauptseite
+    "main.live_tv": "Live TV", "main.all_channels": "All Channels",
+    "main.tuner_status": "Tuner Status", "main.free": "free", "main.busy": "busy",
+    "main.quick_record": "Quick Record", "main.duration_min": "Duration (min)",
+    "main.record": "Record", "main.stop": "Stop", "main.running": "Running",
+    "main.play": "Play", "main.no_channels": "No channels found",
+    "main.status": "Status:", "main.select_channel": "Select a channel…",
+    "main.pick_from_list": "Pick a channel from the list",
+    "main.fullscreen": "⤢ Fullscreen",
+    "main.connecting": "Connecting…", "main.device_profile": "Device profile",
+    // EPG Browser
+    "epg.title": "EPG Browser", "epg.today": "Today", "epg.tomorrow": "Tomorrow",
+    "epg.now": "▶ Now", "epg.search": "Search…", "epg.no_desc": "(No description)",
+    "epg.recording": "RECORDING", "epg.record_series": "📺 Record series",
+    "epg.record_movie": "🎬 Record as movie", "epg.starting": "Starting recording…",
+    "epg.rec_series_hint": "Series: TVDB lookup for real S/E, daily-show fallback (S2026E<i>day</i>)",
+    "epg.rec_movie_hint": "Movie: Movies/<Title>/ (year added only for duplicates)",
+    "epg.search_tmdb": "🎬 Search on TMDB →", "epg.search_tvdb": "📺 Search on TVDB →",
+    // Favoriten
+    "fav.title": "Favorites", "fav.all_channels": "ALL CHANNELS", "fav.group": "— Group —",
+    "fav.category": "— Category —", "fav.added": "Added to favorites",
+    "fav.saved": "Favorites saved", "fav.already": "Already a favorite",
+    "fav.add_hint": "Add", "fav.export_m3u": "↓ M3U Favorites",
+    // Settings — Tabs
+    "set.title": "Settings", "set.tab_config": "Configuration", "set.tab_maint": "Maintenance",
+    "set.tab_epg": "EPG", "set.tab_rec": "Recordings", "set.tab_api": "API",
+    // Settings — Konfiguration
+    "set.receivers": "Receivers", "set.add_receiver": "Add receiver",
+    "set.transcode": "Transcode Profiles", "set.device_profiles": "Device Profiles",
+    "set.api_keys": "API Keys & Tokens", "set.language": "Language",
+    "set.lang_hint": "Interface language. Applies immediately.",
+    "set.about": "About e2proxy", "set.general": "General",
+    // Settings — Wartung
+    "set.maintenance": "Maintenance", "set.update_logos": "🖼 Update logos",
+    "set.live_logs": "Live Logs", "set.log_level": "Log Level",
+    "set.api_access_log": "API Access Log", "set.load_more": "⬆ Load more",
+    "set.live": "↺ Live", "set.clear": "🗑 Clear", "set.logo_check": "Logo Check",
+    "set.log_retention": "Log Retention", "set.days": "days",
+    // Settings — EPG
+    "set.epg_sources": "EPG Sources", "set.epg_schedule": "EPG Schedule",
+    "set.epg_run_now": "Run EPG now", "set.epg_status": "EPG Status",
+    "set.epg_history": "EPG Run History",
+    // Settings — Aufnahmen
+    "set.rec_path": "Recording Path", "set.rec_profile": "Recording Profile",
+    "set.max_duration": "Max Duration", "set.plex_integration": "Plex Integration",
+    "set.plex_url": "Plex URL", "set.plex_token": "Plex Token", "set.plex_sections": "Plex Libraries",
+    // Toast-Meldungen
+    "toast.saved": "✓ Saved", "toast.error": "Error", "toast.deleted": "✓ Deleted",
+    "toast.cleared": "✓ Cleared", "toast.lang_changed": "✓ Language changed",
+    // Status
+    "status.online": "Online", "status.offline": "Offline",
+    "status.epg_updating": "EPG updating…",
+    // Settings — Detail-Strings
+    "set.rec_settings": "Recording Settings", "set.tuner_status": "Tuner Status",
+    "set.switch_tuning": "Switch Tuning", "set.switch_stats": "Per-Channel Statistics",
+    "set.switch_hint": "Speeds up channel switching (e.g. Plex). NoLatency starts ffmpeg with minimal probing; the zap wait is the pause after switching. Values act as global defaults — each channel is learned automatically (see table).",
+    "set.switch_nolatency": "NoLatency (global)",
+    "set.switch_nolatency_hint": "Start ffmpeg without heavy probing (faster, auto-raises on failures)",
+    "set.switch_zapwait": "Zap wait (s)", "set.switch_monitor": "Monitor window (s)",
+    "set.switch_retries": "Max restarts", "set.switch_nolat_probe": "NoLatency probesize",
+    "set.switch_fail_thresh": "Fail threshold (probesize↑)", "set.switch_reset_all": "Reset all",
+    "set.active_recordings": "Active Recordings", "set.quick_rec": "Quick Record",
+    "set.quick_rec_hint": "Select channel → current program shown → start recording.",
+    "set.start_rec": "▶ Start recording", "set.receivers_card": "Receivers",
+    "set.transcode_card": "Transcode Profiles", "set.device_card": "Device Profiles",
+    "set.api_keys_hint": "API keys for external services. Stored securely in the config.",
+    "set.config_editor": "Config Editor", "set.advanced": "ADVANCED",
+    "set.config_editor_hint": "Direct editing of the full configuration as JSON. For advanced settings.",
+    "set.reset": "↺ Reset", "set.maint_actions": "Maintenance Actions",
+    "set.maint_notify": "Maintenance Notifications",
+    "set.maint_notify_hint": "Sends an HTTP call to another system at a scheduled time, e.g. to trigger maintenance tasks. Optionally only when idle (no recording running and nobody watching).",
+    "set.maint_notify_enable": "Enable maintenance notifications",
+    "set.maint_notify_url": "Target URL", "set.maint_notify_time": "Time",
+    "set.maint_notify_days": "Weekdays", "set.maint_notify_idle": "Trigger condition",
+    "set.maint_notify_idle_always": "Always at the scheduled time",
+    "set.maint_notify_idle_only": "Only when idle (no recording / nobody watching)",
+    "set.maint_notify_test": "Send test",
+    "set.update_logos_card": "Update logos", "set.update_logos_hint": "Reloads all channel logos into the local cache.",
+    "set.reload_channels": "Reload channel list", "set.reload_channels_hint": "Reloads all channels and bouquets from the receiver.",
+    "set.restart_service": "Restart service", "set.restart_hint": "Restarts the e2proxy service. Active streams will be interrupted.",
+    "set.epg_update": "EPG Update", "set.epg_run_now_btn": "▶ Update now",
+    "set.schedule": "Schedule", "set.schedule_hint": "Time for the daily automatic EPG run. Should be before the Plex fetch (4-5 AM).",
+    "set.last_run": "Last Run", "set.run_history": "Run History (last 30)",
+    "set.run_history_hint": "Bars = duration in seconds. Red = outlier (>2× average).",
+    "set.epg_run_log": "EPG Run Log", "set.logo_check_card": "Logo Check",
+    "set.logo_check_hint": "Checks whether the favorite channel logos are reachable.",
+    "set.fav_logos": "Favorite logos", "set.fav_logos_hint": "Set a custom logo for each favorite — upload an image or enter a URL. The image is converted to the correct format automatically. Reset falls back to the automatic logo.",
+    "set.fav_logos_empty": "No favorites found. Add favorites first.", "set.fav_logos_custom": "custom",
+    "set.fav_logos_url_ph": "Logo URL (https://…)", "set.fav_logos_save_url": "Save URL",
+    "set.fav_logos_upload": "Upload", "set.fav_logos_done": "Logo saved",
+    "set.fav_logos_working": "Working…", "set.fav_logos_need_url": "Please enter a URL",
+    "set.fav_logos_too_big": "Image too large (max 8 MB)",
+    "set.fav_logos_zoom": "Click to enlarge",
+    "set.appearance": "Appearance", "set.appearance_hint": "Switch between dark and light theme. Stored in the browser.",
+    "set.log_level_hint": "Controls which log entries are shown. Applies immediately without restart. The RAM buffer always keeps the last 500 entries.",
+    "set.api_log_hint": "Logs all API requests persistently in",
+    "set.api_ref": "API Reference", "set.update": "↺ Update",
+    "set.timestamp": "Time", "set.duration": "Duration", "set.result": "Result",
+    "set.get_token": "Get token", "set.api_log_persist": "Logs all API requests persistently in",
+    "set.theme_dark": "🌙 Dark", "set.theme_light": "☀ Light",
+    "set.connection_failed": "Connection failed",
+    "rec.path": "Recording Path", "rec.default_profile": "Default Profile",
+    "rec.max_duration": "Max Duration (Watchdog)", "rec.seconds": "seconds",
+    "rec.plex_url": "Plex URL", "rec.plex_token": "Plex Token", "rec.plex_sections": "Plex Sections",
+    "rec.via_login": "🔑 Generate via login", "rec.load_sections": "📁 Load sections",
+    "rec.plex_verify": "Verify in Plex",
+    "rec.plex_verify_hint": "After recording/conversion, check via Plex token whether the file was actually indexed (logs result)",
+    "epg.plex_dvr_title": "Plex DVR Guide",
+    "epg.plex_dvr_desc": "Reloads the guide of the e2proxy DVR in Plex so new EPG data is picked up. Requires Plex URL + token (configured under Recordings). Only the e2proxy DVR is touched.",
+    "epg.plex_dvr_auto": "Automatically reload the Plex guide after each EPG run",
+    "epg.plex_dvr_now": "Update guide now",
+    "rec.select_channel": "— Select channel —", "rec.min": "min",
+    "rec.no_active": "No active recordings.", "rec.duration_label": "Duration:",
+    "epg.update_hint": "Fetches the program guide from both receivers, loads missing channels via zap and adds from the online source (Rytec). Runs daily automatically or manually.",
+    "epg.progress": "Progress:", "epg.completed": "Completed", "epg.oclock": "h",
+    "epg.jetzt_aktualisieren": "Update now",
+    "set.timestamp": "Time", "set.duration": "Duration", "set.result": "Result",
+    "set.get_token": "Get token",
+    "help.live_tv": "Live TV Streaming", "help.api_overview": "API Overview",
+    "help.recordings": "Recordings",
+    "maint.execute": "Execute", "maint.restart_btn": "Restart",
+    "epg.outlier": "Outlier", "epg.outliers": "Outliers",
+    "log.tip": "Tip: For normal operation we recommend <b>INFO</b> or <b>WARNING</b> — DEBUG logs a lot (SSDP requests etc.)",
+    "apilog.status_label": "active", "apilog.status_off": "inactive",
+    "apilog.hint": "Logs all API requests persistently in",
+    "apilog.activated": "API Logging activated", "apilog.deactivated": "API Logging deactivated",
+    "apilog.clear_confirm": "Clear API log?",
+    "apilog.no_entries": "No entries yet.",
+    "rec.tuner_free": "free", "rec.tuner_busy": "busy",
+    "help.live_tv_desc": "Select a channel on the left → stream starts in the browser. Profile (Web-SD / Web-HD) top right. Fullscreen button maximizes. Each stream uses one receiver — the header status shows who is currently streaming. Kill button (✕) ends a session.",
+    "help.epg_desc": "28-hour program guide as a timeline grid. Channel labels stay visible when scrolling horizontally (sticky). Click on a show → details + TMDB link. Automatically updated daily at 3:00 AM. Manual: <b>Settings → EPG → Update now</b>. Startup run without TMDB (fast) — nightly run with TMDB posters.",
+    "help.fav_desc": "Channel list for Plex DVR, EPG and M3U. Reorder via drag & drop. Per channel: group + EPG category (series/movie/news/sports…) for Kodi color coding in the EPG grid. Changes saved immediately.",
+    "help.rec_desc": "Recordings with ffmpeg (video copy + audio AC3 transcode). Structured in <code>Show/Season/Episode</code> with NFO metadata for Plex/Kodi. Watchdog terminates stuck recordings after <code>max_duration</code>. Plex library refresh after completion.",
+    "help.tmdb_desc": "Posters for EPG shows ≥20 min via TMDB API. Similarity check (45%) prevents wrong matches. Cache: 30 days (found) / 7 days (not found). XMLTV categories + DVB genre IDs for Kodi.",
+    "help.settings_desc": "<b>Configuration:</b> Receivers, transcode profiles, device profiles, TMDB API key, e2recorder URL.<br><b>Maintenance:</b> Live logs, log level, service restart, logo update.<br><b>EPG:</b> Manual run, schedule, run history as bar chart, outlier detection.<br><b>Recordings:</b> Path, profile, Plex integration, tuner status, quick record.",
+    "help.plex_desc": "HDHomeRun emulation (SSDP UDP multicast). Plex automatically discovers e2proxy as a DVR device. No Threadfin needed.",
+    "help.docker_desc": "<code>python:3.11-slim</code> + ffmpeg. Persistent data in <code>/data</code>. <code>network_mode: host</code> required for SSDP and LAN access to receivers.",
+    "comp.title": "Compression",
+    "comp.desc": "Compresses .ts recordings to .mkv to save disk space. Runs during off-hours so it doesn't compete with live streaming for CPU.",
+    "comp.enabled": "Enabled", "comp.profile": "Profile",
+    "comp.window": "Time Window", "comp.window_hint": "When compression may run",
+    "comp.delete_orig": "Delete original .ts after success",
+    "comp.audio_bitrate": "Audio Bitrate",
+    "comp.status": "Status", "comp.pending": "Pending",
+    "comp.current": "Currently compressing", "comp.history": "Recent Runs",
+    "comp.run_now": "▶ Convert now", "comp.in_window": "In window",
+    "comp.select_all": "Select all", "comp.convert_selected": "▶ Convert selected",
+    "comp.select_hint": "Select at least one recording first.",
+    "comp.pause": "Pause", "comp.resume": "Resume", "comp.cancel": "Cancel",
+    "comp.paused": "Paused", "comp.eta": "ETA", "comp.cancelled": "Conversion cancelled",
+    "comp.cancel_confirm": "Cancel the running conversion? The partial file will be discarded and the recording stays pending.",
+    "comp.cpu_limit": "CPU limit", "comp.cpu_hint": "0 = unlimited · lower = gentler background load",
+    "comp.background": "Run anytime", "comp.background_hint": "Ignore the time window (use with a CPU limit)",
+    "comp.out_window": "Outside window", "comp.backlog_warn": "⚠ Backlog forming — compression isn't keeping up",
+    "comp.no_pending": "No files pending compression.",
+    "comp.no_history": "No compression runs yet.",
+    "comp.started": "Compression started",
+    "comp.profile_fast": "Fast (H.264 veryfast, ~40% smaller)",
+    "comp.profile_balanced": "Balanced (H.264 medium, ~55% smaller)",
+    "comp.profile_quality": "Quality (H.265 medium, ~65% smaller)",
+  },
+  de: {
+    "nav.home": "Startseite", "nav.back": "← Startseite", "nav.settings": "Einstellungen",
+    "nav.favorites": "Favoriten", "nav.epg": "EPG Browser", "nav.help": "Hilfe",
+    "nav.mainpage": "← Hauptseite", "nav.save": "Speichern", "nav.m3u_fav": "↓ M3U Favoriten",
+    "common.save": "Speichern", "common.cancel": "Abbrechen", "common.delete": "Löschen",
+    "common.add": "Hinzufügen", "common.close": "Schließen", "common.refresh": "Aktualisieren",
+    "common.loading": "Lädt…", "common.search": "Suchen…", "common.enabled": "Aktiviert",
+    "common.disabled": "Deenabled", "common.yes": "Ja", "common.no": "Nein",
+    "common.channels": "Sender", "common.none": "— keine —",
+    "main.live_tv": "Live TV", "main.all_channels": "Alle Sender",
+    "main.tuner_status": "Tuner Status", "main.free": "frei", "main.busy": "belegt",
+    "main.quick_record": "Schnellaufnahme", "main.duration_min": "Dauer (Min)",
+    "main.record": "Aufnehmen", "main.stop": "Stoppen", "main.running": "Läuft",
+    "main.play": "Abspielen", "main.no_channels": "Keine Sender gefunden",
+    "main.status": "Stand:", "main.select_channel": "Sender auswählen…",
+    "main.pick_from_list": "Sender aus der Liste wählen",
+    "main.fullscreen": "⤢ Vollbild",
+    "main.connecting": "Verbinde…", "main.device_profile": "Device-Profil",
+    "epg.title": "EPG Browser", "epg.today": "Heute", "epg.tomorrow": "Morgen",
+    "epg.now": "▶ Jetzt", "epg.search": "Suche…", "epg.no_desc": "(Keine Beschreibung)",
+    "epg.recording": "AUFNAHME", "epg.record_series": "📺 Serie aufnehmen",
+    "epg.record_movie": "🎬 Als Film aufnehmen", "epg.starting": "Starte Aufnahme…",
+    "epg.rec_series_hint": "Serie: TVDB-Lookup für echte S/E, Daily-Show-Fallback (S2026E<i>tag</i>)",
+    "epg.rec_movie_hint": "Film: Movies/<Titel>/ (Jahr nur bei Duplikaten)",
+    "epg.search_tmdb": "🎬 Auf TMDB suchen →", "epg.search_tvdb": "📺 Auf TVDB suchen →",
+    "fav.title": "Favoriten", "fav.all_channels": "ALLE SENDER", "fav.group": "— Gruppe —",
+    "fav.category": "— Kategorie —", "fav.added": "Zu Favoriten hinzugefügt",
+    "fav.saved": "Favoriten gespeichert", "fav.already": "Bereits Favorit",
+    "fav.add_hint": "Hinzufügen", "fav.export_m3u": "↓ M3U Favoriten",
+    "set.title": "Einstellungen", "set.tab_config": "Konfiguration", "set.tab_maint": "Wartung",
+    "set.tab_epg": "EPG", "set.tab_rec": "Aufnahmen", "set.tab_api": "API",
+    "set.receivers": "Receiver", "set.add_receiver": "Receiver hinzufügen",
+    "set.transcode": "Transcode-Profile", "set.device_profiles": "Device-Profile",
+    "set.api_keys": "API-Keys & Tokens", "set.language": "Sprache",
+    "set.lang_hint": "Sprache der Oberfläche. Wirkt sofort.",
+    "set.about": "Über e2proxy", "set.general": "Allgemein",
+    "set.maintenance": "Wartung", "set.update_logos": "🖼 Logos aktualisieren",
+    "set.live_logs": "Live Logs", "set.log_level": "Log-Level",
+    "set.api_access_log": "API Access Log", "set.load_more": "⬆ Reload",
+    "set.live": "↺ Live", "set.clear": "🗑 Leeren", "set.logo_check": "Logo-Prüfung",
+    "set.log_retention": "Log Aufbewahrung", "set.days": "Tage",
+    "set.epg_sources": "EPG-Quellen", "set.epg_schedule": "EPG-Zeitplan",
+    "set.epg_run_now": "EPG jetzt starten", "set.epg_status": "EPG Status",
+    "set.epg_history": "EPG-Run Historie",
+    "set.rec_path": "Aufnahme-Pfad", "set.rec_profile": "Aufnahme-Profil",
+    "set.max_duration": "Max. Dauer", "set.plex_integration": "Plex Integration",
+    "set.plex_url": "Plex URL", "set.plex_token": "Plex Token", "set.plex_sections": "Plex Mediatheken",
+    "toast.saved": "✓ Gespeichert", "toast.error": "Fehler", "toast.deleted": "✓ Gelöscht",
+    "toast.cleared": "✓ Geleert", "toast.lang_changed": "✓ Sprache geändert",
+    "status.online": "Online", "status.offline": "Offline",
+    "status.epg_updating": "EPG wird aktualisiert…",
+    "set.rec_settings": "Aufnahme-Einstellungen", "set.tuner_status": "Tuner-Status",
+    "set.switch_tuning": "Umschalt-Tuning", "set.switch_stats": "Per-Sender-Statistik",
+    "set.switch_hint": "Beschleunigt das Umschalten (z.B. Plex). NoLatency startet ffmpeg mit minimalem Probing; die Zap-Wartezeit ist die Pause nach dem Umschalten. Werte gelten global als Default — pro Sender wird automatisch gelernt (siehe Tabelle).",
+    "set.switch_nolatency": "NoLatency (global)",
+    "set.switch_nolatency_hint": "ffmpeg ohne großes Probing starten (schneller, lernt bei Fehlern automatisch hoch)",
+    "set.switch_zapwait": "Zap-Wartezeit (s)", "set.switch_monitor": "Monitor-Fenster (s)",
+    "set.switch_retries": "Max. Neustarts", "set.switch_nolat_probe": "NoLatency Probesize",
+    "set.switch_fail_thresh": "Fehler-Schwelle (Probesize↑)", "set.switch_reset_all": "Reset alle",
+    "set.active_recordings": "Aktive Aufnahmen", "set.quick_rec": "Schnell-Aufnahme",
+    "set.quick_rec_hint": "Kanal wählen → aktuelle Sendung wird angezeigt → Aufnahme starten.",
+    "set.start_rec": "▶ Aufnahme starten", "set.receivers_card": "Receiver",
+    "set.transcode_card": "Transcode-Profile", "set.device_card": "Device-Profile",
+    "set.api_keys_hint": "API-Keys für externe Dienste. Werden sicher in der Config gespeichert.",
+    "set.config_editor": "Config Editor", "set.advanced": "ERWEITERT",
+    "set.config_editor_hint": "Direkte Bearbeitung der vollständigen Konfiguration als JSON. Für fortgeschrittene Einstellungen.",
+    "set.reset": "↺ Zurücksetzen", "set.maint_actions": "Wartungs-Aktionen",
+    "set.maint_notify": "Wartungs-Benachrichtigungen",
+    "set.maint_notify_hint": "Sendet zu einem geplanten Zeitpunkt einen HTTP-Call an ein anderes System, z.B. um Wartungsarbeiten anzustoßen. Optional nur im Leerlauf (keine Aufnahme läuft und niemand schaut fern).",
+    "set.maint_notify_enable": "Wartungs-Benachrichtigungen aktivieren",
+    "set.maint_notify_url": "Ziel-URL", "set.maint_notify_time": "Uhrzeit",
+    "set.maint_notify_days": "Wochentage", "set.maint_notify_idle": "Auslöse-Bedingung",
+    "set.maint_notify_idle_always": "Immer zur geplanten Zeit",
+    "set.maint_notify_idle_only": "Nur im Leerlauf (keine Aufnahme / niemand schaut)",
+    "set.maint_notify_test": "Test senden",
+    "set.update_logos_card": "Logos aktualisieren", "set.update_logos_hint": "Lädt alle Senderlogos neu in den lokalen Cache.",
+    "set.reload_channels": "Senderliste neu laden", "set.reload_channels_hint": "Lädt alle Sender und Bouquets neu vom Receiver.",
+    "set.restart_service": "Service neu starten", "set.restart_hint": "Startet den e2proxy Service neu. Aktive Streams werden unterbrochen.",
+    "set.epg_update": "EPG-Aktualisierung", "set.epg_run_now_btn": "▶ Jetzt aktualisieren",
+    "set.schedule": "Zeitplan", "set.schedule_hint": "Uhrzeit für den täglichen automatischen EPG-Run. Sollte vor dem Plex-Abruf (4-5 Uhr) liegen.",
+    "set.last_run": "Letzter Run", "set.run_history": "Run-Historie (letzte 30)",
+    "set.run_history_hint": "Balken = Dauer in Sekunden. Rot = Ausreißer (>2× Durchschnitt).",
+    "set.epg_run_log": "EPG-Run Log", "set.logo_check_card": "Logo-Prüfung",
+    "set.logo_check_hint": "Prüft ob die Senderlogos der Favoriten erreichbar sind.",
+    "set.fav_logos": "Sender-Logos", "set.fav_logos_hint": "Hinterlege pro Favorit ein eigenes Logo — Bild hochladen oder URL angeben. Das Bild wird automatisch ins richtige Format konvertiert. Zurücksetzen nutzt wieder das automatische Logo.",
+    "set.fav_logos_empty": "Keine Favoriten gefunden. Zuerst Favoriten anlegen.", "set.fav_logos_custom": "eigen",
+    "set.fav_logos_url_ph": "Logo-URL (https://…)", "set.fav_logos_save_url": "URL speichern",
+    "set.fav_logos_upload": "Hochladen", "set.fav_logos_done": "Logo gespeichert",
+    "set.fav_logos_working": "Wird verarbeitet…", "set.fav_logos_need_url": "Bitte eine URL angeben",
+    "set.fav_logos_too_big": "Bild zu groß (max 8 MB)",
+    "set.fav_logos_zoom": "Zum Vergrößern klicken",
+    "set.appearance": "Darstellung", "set.appearance_hint": "Zwischen dunklem und hellem Design wechseln. Wird im Browser gespeichert.",
+    "set.log_level_hint": "Steuert welche Log-Einträge angezeigt werden. Wirkt sofort ohne Neustart. Im RAM-Buffer werden immer alle 500 letzten Einträge gespeichert.",
+    "set.api_log_hint": "Protokolliert alle API-Anfragen persistent in",
+    "set.api_ref": "API Referenz", "set.update": "↺ Aktualisieren",
+    "set.timestamp": "Zeitpunkt", "set.duration": "Dauer", "set.result": "Ergebnis",
+    "set.get_token": "Token holen", "set.api_log_persist": "Protokolliert alle API-Anfragen persistent in",
+    "set.theme_dark": "🌙 Dunkel", "set.theme_light": "☀ Hell",
+    "set.connection_failed": "Verbindung fehlgeschlagen",
+    "rec.path": "Aufnahme-Pfad", "rec.default_profile": "Default-Profil",
+    "rec.max_duration": "Max. Dauer (Watchdog)", "rec.seconds": "Sekunden",
+    "rec.plex_url": "Plex URL", "rec.plex_token": "Plex Token", "rec.plex_sections": "Plex Sections",
+    "rec.via_login": "🔑 Via Login generieren", "rec.load_sections": "📁 Sections laden",
+    "rec.plex_verify": "In Plex verifizieren",
+    "rec.plex_verify_hint": "Nach Aufnahme/Konvertierung per Plex-Token prüfen, ob die Datei tatsächlich indexiert wurde (Ergebnis im Log)",
+    "epg.plex_dvr_title": "Plex DVR Guide",
+    "epg.plex_dvr_desc": "Lädt den Guide des e2proxy-DVR in Plex neu, damit neue EPG-Daten übernommen werden. Benötigt Plex URL + Token (unter Aufnahmen konfiguriert). Nur der e2proxy-DVR wird angesprochen.",
+    "epg.plex_dvr_auto": "Plex-Guide nach jedem EPG-Run automatisch neu laden",
+    "epg.plex_dvr_now": "Guide jetzt aktualisieren",
+    "rec.select_channel": "— Kanal wählen —", "rec.min": "Min",
+    "rec.no_active": "Keine aktiven Aufnahmen.", "rec.duration_label": "Dauer:",
+    "epg.update_hint": "Holt den Programmführer aus beiden Receivern, lädt fehlende Sender per Zap nach und ergänzt aus der Online-Quelle (Rytec). Läuft täglich automatisch oder manuell.",
+    "epg.progress": "Fortschritt:", "epg.completed": "Abgeschlossen", "epg.oclock": "Uhr",
+    "epg.jetzt_aktualisieren": "Jetzt aktualisieren",
+    "set.timestamp": "Zeitpunkt", "set.duration": "Dauer", "set.result": "Ergebnis",
+    "set.get_token": "Token holen",
+    "help.live_tv": "Live TV streamen", "help.api_overview": "API Kurzübersicht",
+    "help.recordings": "Aufnahmen",
+    "maint.execute": "Ausführen", "maint.restart_btn": "Neu starten",
+    "epg.outlier": "Ausreißer", "epg.outliers": "Ausreißer",
+    "log.tip": "Tipp: Im Normalbetrieb empfehlen wir <b>INFO</b> oder <b>WARNING</b> \u2014 DEBUG loggt sehr viel (SSDP-Anfragen etc.)",
+    "apilog.status_label": "aktiv", "apilog.status_off": "inaktiv",
+    "apilog.hint": "Protokolliert alle API-Anfragen persistent in",
+    "apilog.activated": "API Logging enabled", "apilog.deactivated": "API Logging deenabled",
+    "apilog.clear_confirm": "API Log leeren?",
+    "apilog.no_entries": "Noch keine Einträge.",
+    "rec.tuner_free": "frei", "rec.tuner_busy": "belegt",
+    "help.live_tv_desc": "Sender links wählen → Stream startet im Browser. Profil (Web-SD / Web-HD) oben rechts. Vollbild-Button maximiert. Jeder Stream belegt einen Receiver — der Header-Status zeigt wer gerade streamt. Kill-Button (✕) beendet eine Session.",
+    "help.epg_desc": "28-Stunden Programmführer als Zeitstrahl-Grid. Sender-Labels bleiben beim horizontalen Scrollen sichtbar (sticky). Klick auf Sendung → Details + TMDB-Link. Täglich 3:00 Uhr automatisch aktualisiert. Manuell: <b>Settings → EPG → Jetzt aktualisieren</b>. Startup-Run ohne TMDB (schnell) — nächtlicher Run mit TMDB-Postern.",
+    "help.fav_desc": "Sender-Liste für Plex DVR, EPG und M3U. Reihenfolge per Drag & Drop. Pro Sender: Gruppe + EPG-Kategorie (serie/movie/news/sports…) für Kodi-Farbkodierung im EPG-Grid. Änderungen sofort gespeichert.",
+    "help.rec_desc": "Aufnahmen mit ffmpeg (Video copy + Audio AC3 Transcode). Strukturiert in <code>Sendung/Staffel/Episode</code> mit NFO-Metadaten für Plex/Kodi. Watchdog beendet hängende Aufnahmen nach <code>max_duration</code>. Plex Library Refresh nach Ende.",
+    "help.tmdb_desc": "Poster für EPG-Sendungen ≥20 Min via TMDB API. Ähnlichkeits-Check (45%) verhindert falsche Zuordnung. Cache: 30 Tage (gefunden) / 7 Tage (nicht gefunden). XMLTV-Kategorien + DVB Genre-IDs für Kodi.",
+    "help.settings_desc": "<b>Konfiguration:</b> Receiver, Transcode-Profile, Device-Profile, TMDB API-Key, e2recorder URL.<br><b>Wartung:</b> Live-Logs, Log-Level, Service-Neustart, Logo-Update.<br><b>EPG:</b> Manueller Run, Zeitplan, Run-Historie als Balkengrafik, Ausreißer-Erkennung.<br><b>Aufnahmen:</b> Pfad, Profil, Plex-Integration, Tuner-Status, Schnell-Aufnahme.",
+    "help.plex_desc": "HDHomeRun-Emulation (SSDP UDP Multicast). Plex erkennt e2proxy automatisch als DVR-Gerät. Kein Threadfin nötig.",
+    "help.docker_desc": "<code>python:3.11-slim</code> + ffmpeg. Persistente Daten in <code>/data</code>. <code>network_mode: host</code> nötig für SSDP und LAN-Zugriff auf Receiver.",
+    "comp.title": "Komprimierung",
+    "comp.desc": "Komprimiert .ts Aufnahmen zu .mkv um Speicherplatz zu sparen. Läuft in Off-Hours damit kein CPU-Konflikt mit Live-Streaming entsteht.",
+    "comp.enabled": "Aktiviert", "comp.profile": "Profil",
+    "comp.window": "Zeitfenster", "comp.window_hint": "Wann darf komprimiert werden",
+    "comp.delete_orig": "Original .ts nach Erfolg löschen",
+    "comp.audio_bitrate": "Audio-Bitrate",
+    "comp.status": "Status", "comp.pending": "Wartend",
+    "comp.current": "Wird gerade komprimiert", "comp.history": "Letzte Läufe",
+    "comp.run_now": "▶ Jetzt konvertieren", "comp.in_window": "Im Zeitfenster",
+    "comp.select_all": "Alle auswählen", "comp.convert_selected": "▶ Auswahl konvertieren",
+    "comp.select_hint": "Bitte zuerst mindestens eine Aufnahme auswählen.",
+    "comp.pause": "Pause", "comp.resume": "Fortsetzen", "comp.cancel": "Abbrechen",
+    "comp.paused": "Pausiert", "comp.eta": "Restzeit", "comp.cancelled": "Konvertierung abgebrochen",
+    "comp.cancel_confirm": "Laufende Konvertierung abbrechen? Die Teildatei wird verworfen und die Aufnahme bleibt wartend.",
+    "comp.cpu_limit": "CPU-Limit", "comp.cpu_hint": "0 = unbegrenzt · niedriger = sanftere Hintergrundlast",
+    "comp.background": "Jederzeit ausführen", "comp.background_hint": "Zeitfenster ignorieren (mit CPU-Limit verwenden)",
+    "comp.out_window": "Außerhalb des Zeitfensters", "comp.backlog_warn": "⚠ Rückstand bildet sich — Komprimierung kommt nicht hinterher",
+    "comp.no_pending": "Keine Dateien zur Komprimierung.",
+    "comp.no_history": "Noch keine Komprimierungsläufe.",
+    "comp.started": "Komprimierung gestartet",
+    "comp.profile_fast": "Schnell (H.264 veryfast, ~40% kleiner)",
+    "comp.profile_balanced": "Ausgewogen (H.264 medium, ~55% kleiner)",
+    "comp.profile_quality": "Qualität (H.265 medium, ~65% kleiner)",
+  }
+};
+
+function getLang() {
+  let l = localStorage.getItem('e2proxy-lang');
+  if (!l) {
+    // Browser-Sprache erkennen, sonst Englisch
+    const nav = (navigator.language || 'en').toLowerCase();
+    l = nav.startsWith('de') ? 'de' : 'en';
+  }
+  return (l === 'de') ? 'de' : 'en';
+}
+
+function t(key) {
+  const lang = getLang();
+  return (I18N[lang] && I18N[lang][key]) || (I18N.en[key]) || key;
+}
+
+function applyI18n() {
+  try {
+    const lang = getLang();
+    document.documentElement.lang = lang;
+    const langSel = document.getElementById('lang-sel');
+    if (langSel) langSel.value = lang;
+    document.querySelectorAll('[data-i18n]').forEach(el => {
+      try {
+        const key = el.getAttribute('data-i18n');
+        const val = t(key);
+        if (el.getAttribute('data-i18n-html') === '1') el.innerHTML = val;
+        else el.textContent = val;
+      } catch(e) {}
+    });
+    document.querySelectorAll('[data-i18n-ph]').forEach(el => {
+      try { el.setAttribute('placeholder', t(el.getAttribute('data-i18n-ph'))); } catch(e) {}
+    });
+    document.querySelectorAll('[data-i18n-title]').forEach(el => {
+      try { el.setAttribute('title', t(el.getAttribute('data-i18n-title'))); } catch(e) {}
+    });
+  } catch(e) { console.warn('applyI18n:', e); }
+}
+
+function setLang(lang) {
+  localStorage.setItem('e2proxy-lang', lang === 'de' ? 'de' : 'en');
+  location.reload();   // Voller Reload — alle Texte inkl. dynamisch gerenderte korrekt
+}
+
+document.addEventListener('DOMContentLoaded', applyI18n);
+</script>
+"""
+
+CSS_BASE = """
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@300;400;500&display=swap');
+:root {
+  --bg:#0a0a0f; --surface:#12121a; --surface2:#1a1a26;
+  --border:#2a2a3d; --accent:#6366f1; --accent2:#818cf8;
+  --text:#e2e2f0; --muted:#6b6b8a;
+  --green:#22c55e; --red:#ef4444; --amber:#f59e0b;
+}
+[data-theme="light"] {
+  --bg:#f4f5f7; --surface:#ffffff; --surface2:#f0f1f5;
+  --border:#d1d5db; --accent:#4f46e5; --accent2:#4f46e5;
+  --text:#1a1a2e; --muted:#6b7280;
+  --green:#16a34a; --red:#dc2626; --amber:#d97706;
+}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-weight:300;min-height:100vh;}
+.header{background:var(--surface);border-bottom:1px solid var(--border);padding:14px 24px;display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:100;}
+.logo{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:17px;color:var(--accent2);}
+.logo span{color:var(--muted);font-weight:400;}
+.header-right{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
+.btn{padding:6px 12px;border-radius:6px;font-size:11px;font-family:'JetBrains Mono',monospace;cursor:pointer;border:1px solid var(--border);color:var(--text);background:var(--surface2);text-decoration:none;display:inline-block;transition:all 0.15s;white-space:nowrap;}
+.btn:hover{border-color:var(--accent);color:var(--accent2);}
+.btn-primary{background:var(--accent);border-color:var(--accent);color:white;}
+.btn-primary:hover{background:var(--accent2);border-color:var(--accent2);color:white;}
+.btn-danger{color:var(--red);border-color:var(--red);}
+.btn-danger:hover{background:var(--red);color:white;}
+.select{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer;outline:none;}
+.select:focus{border-color:var(--accent);}
+.toast{position:fixed;bottom:20px;right:20px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:9px 14px;border-radius:7px;font-size:12px;font-family:'JetBrains Mono',monospace;opacity:0;transform:translateY(8px);transition:all 0.25s;z-index:9999;}
+.toast.show{opacity:1;transform:translateY(0);}
+.toast.success{border-color:var(--green);color:var(--green);}
+.toast.error{border-color:var(--red);color:var(--red);}
+.theme-toggle{background:none;border:1px solid var(--border);color:var(--muted);padding:4px 8px;border-radius:5px;cursor:pointer;font-size:13px;transition:all 0.15s;}
+.theme-toggle:hover{border-color:var(--accent);color:var(--accent2);}
+"""
+
+def html_page(title, body, head_extra=""):
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>e2proxy · {title}</title>
+<script>(function(){{var t=localStorage.getItem('e2proxy-theme');if(t==='light')document.documentElement.setAttribute('data-theme','light');}})();</script>
+<style>{CSS_BASE}{head_extra}</style>
+{I18N_JS}
+</head>
+<body>
+<div id="epg-status-bar" style="display:none;position:sticky;top:0;z-index:200;background:#f59e0b;color:#1a1200;padding:5px 20px;font-family:'JetBrains Mono',monospace;font-size:11px;align-items:center;gap:8px;">
+  <span style="animation:pulse 1s infinite">⟳</span>
+  <span id="epg-status-text" data-i18n="status.epg_updating">EPG updating…</span>
+</div>
+<style>@keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:0.5}}}}</style>
+{body}
+<div class="toast" id="toast"></div>
+<script>
+function showToast(msg, type) {{
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show' + (type ? ' ' + type : '');
+  setTimeout(() => t.className = 'toast', 3000);
+}}
+function apiPost(url, data) {{
+  return fetch(url, {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(data)}}).then(r=>r.json());
+}}
+function toggleTheme() {{
+  const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+  if (isLight) {{
+    document.documentElement.removeAttribute('data-theme');
+    localStorage.setItem('e2proxy-theme', 'dark');
+  }} else {{
+    document.documentElement.setAttribute('data-theme', 'light');
+    localStorage.setItem('e2proxy-theme', 'light');
+  }}
+  const btn = document.getElementById('theme-toggle-btn');
+  if (btn) btn.textContent = isLight ? '☀' : '🌙';
+}}
+
+// ── EPG Status Indicator ─────────────────────────────
+(function() {{
+  function checkEpg() {{
+    fetch('/api/epg/status').then(r=>r.json()).then(d=>{{
+      const el = document.getElementById('epg-status-bar');
+      if (!el) return;
+      if (d.running) {{
+        el.style.display = 'flex';
+        el.querySelector('#epg-status-text').textContent =
+          (typeof t === 'function' ? t('status.epg_updating') : 'EPG updating…') + ' ' + (d.phase||'') + (d.progress ? ' ' + d.progress + '%' : '');
+      }} else {{
+        el.style.display = 'none';
+      }}
+    }}).catch(()=>{{}});
+  }}
+  setInterval(checkEpg, 5000);
+  checkEpg();
+}})();
+</script>
+</body>
+</html>"""
+
+
+# ── WebUI self-check ───────────────────────────────────────────────────────────
+# Guards against the recurring class of bug where JS embedded in Python f-strings
+# gets corrupted (e.g. a literal "\n" inside a '...' string becomes a real newline
+# and breaks the whole <script> block, silently disabling every tab/button on the
+# page). This renders each UI page and scans its <script> blocks for quoted string
+# literals that run across a physical newline — a reliable, dependency-free signal
+# for exactly that breakage. Call at startup and via `--selfcheck` before rollout.
+import re as _re_selfcheck
+
+_SCRIPT_RE = _re_selfcheck.compile(r"<script\b[^>]*>(.*?)</script>", _re_selfcheck.S | _re_selfcheck.I)
+
+def _scan_js_broken_strings(code):
+    """Return a list of (line_no, reason, snippet) for '/" string literals that
+    are not closed before a raw newline. Handles // and /* */ comments, backtick
+    template literals (which may legally span lines) and /regex/ literals."""
+    problems = []
+    i, n = 0, len(code)
+    line = 1
+    quote = None          # currently open ' or " string
+    q_start_line = 0
+    prev_sig = ""         # last significant char in normal code (for regex/division)
+    while i < n:
+        c = code[i]
+        if c == "\n":
+            if quote is not None:
+                problems.append((q_start_line,
+                                 f"unterminated {quote!r} string literal spans a newline",
+                                 code[max(0, i - 40):i].split("\n")[-1]))
+                quote = None
+            line += 1
+            i += 1
+            continue
+        if quote is not None:
+            if c == "\\":       # escape (incl. legal line-continuation) → skip next char
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        # not inside a ' or " string
+        if c == "/" and i + 1 < n and code[i + 1] == "/":
+            j = code.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if c == "/" and i + 1 < n and code[i + 1] == "*":
+            j = code.find("*/", i + 2)
+            if j < 0:
+                break
+            line += code.count("\n", i, j)
+            i = j + 2
+            continue
+        if c == "/" and prev_sig in "(,=:[!&|?{};~+-*%<>^" or (c == "/" and prev_sig == "" ):
+            # regex literal — skip to the closing unescaped '/', honouring [char classes]
+            i += 1
+            in_class = False
+            while i < n and code[i] != "\n":
+                if code[i] == "\\":
+                    i += 2
+                    continue
+                if code[i] == "[":
+                    in_class = True
+                elif code[i] == "]":
+                    in_class = False
+                elif code[i] == "/" and not in_class:
+                    i += 1
+                    break
+                i += 1
+            prev_sig = "/"
+            continue
+        if c == "`":            # template literal — may span lines legally
+            i += 1
+            while i < n:
+                if code[i] == "\\":
+                    i += 2
+                    continue
+                if code[i] == "\n":
+                    line += 1
+                elif code[i] == "`":
+                    i += 1
+                    break
+                i += 1
+            prev_sig = "`"
+            continue
+        if c in "'\"":
+            quote = c
+            q_start_line = line
+            i += 1
+            continue
+        if not c.isspace():
+            prev_sig = c
+        i += 1
+    return problems
+
+def webui_selfcheck():
+    """Render every UI page and validate its embedded JavaScript. Returns a list
+    of human-readable problem strings (empty == all good)."""
+    problems = []
+    try:
+        chans = get_channels()
+    except Exception:
+        chans = []
+    pages = {
+        "/ (Live TV)":   lambda: build_web_ui(chans),
+        "/help":         build_help_ui,
+        "/favorites":    lambda: build_favorites_ui(chans),
+        "/epg":          build_epg_browser,
+        "/settings":     build_settings_ui,
+    }
+    for name, builder in pages.items():
+        try:
+            html = builder()
+        except Exception as e:
+            problems.append(f"{name}: failed to render ({e})")
+            continue
+        for si, m in enumerate(_SCRIPT_RE.finditer(html), 1):
+            for ln, reason, snippet in _scan_js_broken_strings(m.group(1)):
+                problems.append(
+                    f"{name}: <script> #{si} line ~{ln}: {reason} → ...{snippet.strip()!r}"
+                )
+    return problems
+
+
 def build_web_ui(channels):
     cfg = get_config()
     proxy_host = cfg.get("proxy_host", "127.0.0.1")
@@ -4916,127 +5179,6 @@ setInterval(refreshStatus, 5000);
     return html_page("Live TV", body, css)
 
 
-# ── API Access Log ─────────────────────────────────────────────────────────────
-API_ACCESS_LOG_FILE = f"{DATA_DIR}/api_access.log"
-API_ACCESS_LOG_MAX  = 1000  # max Einträge
-
-def is_api_logging_enabled():
-    return get_config().get("api_logging", False)
-
-def write_access_log(method, path, client_ip, status, duration_ms, params=""):
-    if not is_api_logging_enabled():
-        return
-    try:
-        # Tägliche Rotation: am Mitternacht-Wechsel rotieren
-        _rotate_access_log_if_needed()
-        entry = json.dumps({
-            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "method": method,
-            "path": path,
-            "params": params[:200] if params else "",
-            "ip": client_ip,
-            "status": status,
-            "ms": duration_ms,
-        }, ensure_ascii=False)
-        # Reines Append — kein Read-Modify-Write
-        os.makedirs(os.path.dirname(API_ACCESS_LOG_FILE), exist_ok=True)
-        with open(API_ACCESS_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(entry + "\n")
-    except Exception as e:
-        log.debug(f"Access-Log Fehler: {e}")
-
-_access_log_last_rotate = [None]  # Datum des letzten Rotate-Checks
-
-def _rotate_access_log_if_needed():
-    """Bei Datumswechsel: aktuelle Datei in api_access.log.YYYY-MM-DD umbenennen.
-    Löscht alte Dateien gemäß log_retention_days."""
-    import datetime as _dt, glob
-    today = _dt.date.today()
-    if _access_log_last_rotate[0] == today:
-        return
-    _access_log_last_rotate[0] = today
-    try:
-        if not os.path.exists(API_ACCESS_LOG_FILE):
-            return
-        # Datum der ersten Zeile prüfen → wenn nicht heute, rotieren
-        with open(API_ACCESS_LOG_FILE, encoding="utf-8") as f:
-            first_line = f.readline().strip()
-        if not first_line:
-            return
-        try:
-            entry = json.loads(first_line)
-            file_date = entry["ts"][:10]  # YYYY-MM-DD
-        except Exception:
-            return
-        if file_date != today.strftime("%Y-%m-%d"):
-            # Rotieren: aktuelle Datei → api_access.log.<file_date>
-            rotated = f"{API_ACCESS_LOG_FILE}.{file_date}"
-            os.rename(API_ACCESS_LOG_FILE, rotated)
-            log.info(f"API access log rotated: {os.path.basename(rotated)}")
-        # Alte Dateien löschen
-        retention = int(get_config().get("log_retention_days", 5))
-        cutoff = today - _dt.timedelta(days=retention)
-        for fp in glob.glob(f"{API_ACCESS_LOG_FILE}.*"):
-            try:
-                date_str = fp.split(".")[-1]
-                fd = _dt.datetime.strptime(date_str, "%Y-%m-%d").date()
-                if fd < cutoff:
-                    os.remove(fp)
-                    log.info(f"API access log deleted (älter als {retention} Tage): {os.path.basename(fp)}")
-            except Exception:
-                pass
-    except Exception as e:
-        log.debug(f"Access-Log Rotation Fehler: {e}")
-
-
-def read_access_log(n=200, since_unix=None):
-    """Liest API Access Log inkl. rotierter Dateien. 
-    
-    n: max Anzahl (None = alle)
-    since_unix: nur Einträge nach diesem Timestamp
-    """
-    import datetime as _dt, glob
-    try:
-        # Wenn since_unix gesetzt → alle rotierten Dateien einbeziehen
-        # Sonst nur die aktuelle (für Live-Polling)
-        if since_unix is not None:
-            files = sorted(glob.glob(f"{API_ACCESS_LOG_FILE}*"))
-        else:
-            files = [API_ACCESS_LOG_FILE] if os.path.exists(API_ACCESS_LOG_FILE) else []
-        all_lines = []
-        for fp in files:
-            try:
-                with open(fp, encoding="utf-8") as f:
-                    all_lines.extend(f.readlines())
-            except Exception:
-                continue
-        entries = []
-        for line in reversed(all_lines):
-            try:
-                e = json.loads(line.strip())
-                if since_unix is not None:
-                    try:
-                        ts_unix = _dt.datetime.strptime(e["ts"], "%Y-%m-%d %H:%M:%S").timestamp()
-                        if ts_unix < since_unix:
-                            continue
-                        e["ts_unix"] = ts_unix
-                    except Exception:
-                        continue
-                else:
-                    try:
-                        e["ts_unix"] = _dt.datetime.strptime(e["ts"], "%Y-%m-%d %H:%M:%S").timestamp()
-                    except Exception:
-                        e["ts_unix"] = 0
-                entries.append(e)
-                if n is not None and len(entries) >= n:
-                    break
-            except Exception:
-                pass
-        return entries
-    except Exception:
-        return []
-
-
 def build_help_ui():
     css = """
 .help-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:24px;}
@@ -5128,7 +5270,14 @@ def build_help_ui():
       <div style="display:flex;flex-direction:column;gap:12px">
 
         <div style="border-left:3px solid var(--accent);padding-left:14px">
-          <b style="color:var(--accent);font-family:monospace;font-size:11px">v3.8.0</b>
+          <b style="color:var(--accent);font-family:monospace;font-size:11px">v4.1</b>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-07-20</span>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">Settings tab fix · WebUI self-check · WebUI consolidation</span>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Fixed the Settings page where the <b>Maintenance / EPG / Recordings / API</b> tabs could not be opened: a stray escape in the embedded JavaScript broke the whole script block so <code>switchTab()</code> was never defined (only the Configuration tab, which is active by default, still worked). Tab switching is now also independent of the deprecated global <code>event</code> object. To stop this class of bug from ever shipping silently again, a built-in <b>WebUI self-check</b> now validates every page's embedded JavaScript at startup (logged) and via <code>python3 e2proxy.py --selfcheck</code> as a pre-deploy gate. All browser-facing code has been consolidated into one delimited <code>WEBUI</code> block with a documented extraction contract, preparing it to be split into its own service later.</div>
+        </div>
+
+        <div style="border-left:3px solid var(--border);padding-left:14px">
+          <b style="font-family:monospace;font-size:11px">v3.8.0</b>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-07-13</span>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">Editable favorite logos</span>
           <div style="font-size:11px;margin-top:4px;color:var(--muted)">Favorite channel logos can now be edited under <b>Settings → Maintenance</b>. For each favorite you can upload an image or enter a URL; the image is converted with ffmpeg to the correct format (PNG, max 400px wide, aspect preserved) and stored locally. Custom logos take precedence over the built-in logo database and cache for both the M3U playlist and the XMLTV EPG, and can be reset to fall back to the automatic logo. New endpoints <code>/api/favorites/logos</code>, <code>/api/favorites/logo</code> and <code>/api/favorites/logo/reset</code>; custom logos are served at <code>/custom_logos/</code> and stored in <code>/data/custom_logos/</code>. Custom logos are now also injected into the cached XMLTV EPG immediately (on change and at startup), so they show up in Plex without waiting for the next full EPG run.</div>
@@ -6052,11 +6201,11 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
 <div class="settings-wrap">
 
   <div class="tabs">
-    <button class="tab-btn active" onclick="switchTab('config')">⚙ <span data-i18n="set.tab_config">Configuration</span></button>
-    <button class="tab-btn" onclick="switchTab('maintenance')">🔧 <span data-i18n="set.tab_maint">Maintenance</span></button>
-    <button class="tab-btn" onclick="switchTab('epg')">📅 EPG</button>
-    <button class="tab-btn" onclick="switchTab('recording')">📹 <span data-i18n="set.tab_rec">Recordings</span></button>
-    <button class="tab-btn" onclick="switchTab('help')">📖 <span data-i18n="set.tab_api">API</span> / <span data-i18n="nav.help">Help</span></button>
+    <button class="tab-btn active" onclick="switchTab('config', this)">⚙ <span data-i18n="set.tab_config">Configuration</span></button>
+    <button class="tab-btn" onclick="switchTab('maintenance', this)">🔧 <span data-i18n="set.tab_maint">Maintenance</span></button>
+    <button class="tab-btn" onclick="switchTab('epg', this)">📅 EPG</button>
+    <button class="tab-btn" onclick="switchTab('recording', this)">📹 <span data-i18n="set.tab_rec">Recordings</span></button>
+    <button class="tab-btn" onclick="switchTab('help', this)">📖 <span data-i18n="set.tab_api">API</span> / <span data-i18n="nav.help">Help</span></button>
   </div>
 
   <!-- ── TAB: AUFNAHMEN ────────────────────────────────── -->
@@ -6791,11 +6940,12 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
 <script>
 const ORIGINAL_CONFIG = {cfg_json};
 
-function switchTab(name) {{
+function switchTab(name, btn) {{
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
-  event.target.classList.add('active');
+  const tabBtn = btn || (typeof event !== 'undefined' && event.currentTarget) || null;
+  if (tabBtn && tabBtn.closest) tabBtn.closest('.tab-btn').classList.add('active');
   if (name === 'maintenance') {{ refreshLogs(); initApiLogToggle(); initMaintNotify(); loadFavLogos(); }}
   else {{
     if (_logPollTimer) {{ clearInterval(_logPollTimer); _logPollTimer = null; }}
@@ -7024,7 +7174,7 @@ function saveApiKey(key, inputId) {{
 function saveOwif() {{
   const fb = document.getElementById('owif-fb');
   const overrides = [];
-  document.getElementById('owif-ua').value.split('\n').forEach(line => {{
+  document.getElementById('owif-ua').value.split('\\n').forEach(line => {{
     const t = line.trim();
     if (!t) return;
     const idx = t.indexOf('=>');
@@ -8163,6 +8313,11 @@ function resetFavLogo(btn) {{
 </script>
 """ 
     return html_page("Settings", body, css)
+
+# ==============================================================================
+# END WEBUI
+# ==============================================================================
+
 
 # ── HDHomeRun Emulation ───────────────────────────────────
 
@@ -10605,6 +10760,18 @@ def run():
     log.info(f"SSDP:      UDP {SSDP_MCAST_ADDR}:{SSDP_PORT} (auto-discovery)")
     log.info("=" * 55)
 
+    # WebUI self-check — catches corrupted embedded JS before users hit a dead UI
+    try:
+        _ui_problems = webui_selfcheck()
+        if _ui_problems:
+            log.error("WebUI self-check FAILED (%d problem(s)) — the UI may be broken:", len(_ui_problems))
+            for _p in _ui_problems:
+                log.error("  UI: %s", _p)
+        else:
+            log.info("WebUI self-check: OK (all pages' JavaScript parses cleanly)")
+    except Exception as _e:
+        log.warning(f"WebUI self-check could not run: {_e}")
+
     def shutdown(sig, frame):
         log.info("Proxy stopping...")
         threading.Thread(target=server.shutdown, daemon=True).start()
@@ -10620,4 +10787,20 @@ def run():
 
 
 if __name__ == "__main__":
+    if "--selfcheck" in sys.argv:
+        # Offline pre-deploy check: validate the embedded WebUI JavaScript without
+        # starting the server. Exits non-zero on any problem (CI / rollout gate).
+        os.makedirs(DATA_DIR, exist_ok=True)
+        try:
+            load_config()
+        except Exception:
+            pass
+        problems = webui_selfcheck()
+        if problems:
+            print(f"WebUI self-check FAILED — {len(problems)} problem(s):")
+            for p in problems:
+                print(f"  - {p}")
+            sys.exit(1)
+        print(f"WebUI self-check OK — internal version {INTERNAL_VERSION}")
+        sys.exit(0)
     run()
