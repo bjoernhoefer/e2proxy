@@ -116,6 +116,37 @@ All configuration stored in `/data/config.json`.
 | Settings | `/settings` | Configuration, maintenance, EPG, recordings |
 | Help | `/help` | Feature overview, API reference, changelog |
 
+### WebUI internals (self-check + extraction boundary)
+
+All browser-facing code lives in one clearly delimited block in `e2proxy.py`, between
+the `# === WEBUI ===` / `# === END WEBUI ===` markers: the i18n engine (`I18N_JS`), base
+stylesheet (`CSS_BASE`), the shared page shell (`html_page`), and the page builders
+(`build_web_ui`, `build_help_ui`, `build_favorites_ui`, `build_epg_browser`,
+`build_settings_ui`). The block header documents the exact external symbols it depends
+on, so it can later be lifted into its own service/module as a clean cut. Keep new UI
+code inside these markers.
+
+Because the UI markup/JS is embedded in Python f-strings, a stray escape (e.g. a literal
+`\n` inside a `'...'` JS string) can silently corrupt a whole `<script>` block and break
+every tab/button on a page. A built-in **self-check** guards against this:
+
+```bash
+# Validate all pages' embedded JavaScript without starting the server
+python3 e2proxy.py --selfcheck   # exit 0 = OK, exit 1 = broken (use as a pre-deploy gate)
+```
+
+The same check runs automatically at startup and logs `WebUI self-check: OK` (or a loud
+`ERROR` listing the offending page/script/line).
+
+## Versioning
+
+- **Official version** (`VERSION`) follows major/minor and is only bumped when a Pull
+  Request is opened.
+- **Internal build id** (`INTERNAL_VERSION = <VERSION>+<branch>.<seq>`) uniquely identifies
+  the deployed branch/state during testing. Bump `BUILD_SEQ` on every test rollout; it is
+  reported by `/api/version` and printed in the startup log so you always know exactly which
+  build is running on a host.
+
 ## API
 
 ### Channels & EPG
