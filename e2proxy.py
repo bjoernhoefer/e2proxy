@@ -39,13 +39,13 @@ from datetime import datetime
 # ── Pfade ─────────────────────────────────────────────────
 # Datenpfad: via Env-Variable überschreibbar (für Docker)
 DATA_DIR       = os.environ.get("E2PROXY_DATA_DIR", "/var/lib/e2proxy")
-VERSION        = "4.0"   # Offizielle Version — nur beim Pull Request erhöhen (major/minor)
+VERSION        = "4.1"   # Offizielle Version — nur beim Pull Request erhöhen (major/minor)
 # ── Interne Build-/Versionskennung ────────────────────────
 # Identifiziert eindeutig den ausgerollten Branch/Stand bei Tests, OHNE die
 # offizielle VERSION zu verändern (die steigt erst beim PR). Bei jedem Test-
 # Rollout eines neuen Standes BUILD_SEQ erhöhen.
 BUILD_BRANCH     = "bug/ui_issue_01"
-BUILD_SEQ        = "2"
+BUILD_SEQ        = "3"
 INTERNAL_VERSION = f"{VERSION}+{BUILD_BRANCH.split('/')[-1]}.{BUILD_SEQ}"
 CONFIG_FILE    = f"{DATA_DIR}/config.json"
 FAVORITES_FILE = f"{DATA_DIR}/favorites.json"
@@ -5270,7 +5270,14 @@ def build_help_ui():
       <div style="display:flex;flex-direction:column;gap:12px">
 
         <div style="border-left:3px solid var(--accent);padding-left:14px">
-          <b style="color:var(--accent);font-family:monospace;font-size:11px">v3.8.0</b>
+          <b style="color:var(--accent);font-family:monospace;font-size:11px">v4.1</b>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-07-20</span>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">Settings tab fix · WebUI self-check · WebUI consolidation</span>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Fixed the Settings page where the <b>Maintenance / EPG / Recordings / API</b> tabs could not be opened: a stray escape in the embedded JavaScript broke the whole script block so <code>switchTab()</code> was never defined (only the Configuration tab, which is active by default, still worked). Tab switching is now also independent of the deprecated global <code>event</code> object. To stop this class of bug from ever shipping silently again, a built-in <b>WebUI self-check</b> now validates every page's embedded JavaScript at startup (logged) and via <code>python3 e2proxy.py --selfcheck</code> as a pre-deploy gate. All browser-facing code has been consolidated into one delimited <code>WEBUI</code> block with a documented extraction contract, preparing it to be split into its own service later.</div>
+        </div>
+
+        <div style="border-left:3px solid var(--border);padding-left:14px">
+          <b style="font-family:monospace;font-size:11px">v3.8.0</b>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-07-13</span>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">Editable favorite logos</span>
           <div style="font-size:11px;margin-top:4px;color:var(--muted)">Favorite channel logos can now be edited under <b>Settings → Maintenance</b>. For each favorite you can upload an image or enter a URL; the image is converted with ffmpeg to the correct format (PNG, max 400px wide, aspect preserved) and stored locally. Custom logos take precedence over the built-in logo database and cache for both the M3U playlist and the XMLTV EPG, and can be reset to fall back to the automatic logo. New endpoints <code>/api/favorites/logos</code>, <code>/api/favorites/logo</code> and <code>/api/favorites/logo/reset</code>; custom logos are served at <code>/custom_logos/</code> and stored in <code>/data/custom_logos/</code>. Custom logos are now also injected into the cached XMLTV EPG immediately (on change and at startup), so they show up in Plex without waiting for the next full EPG run.</div>
