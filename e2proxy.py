@@ -39,13 +39,13 @@ from datetime import datetime
 # ── Pfade ─────────────────────────────────────────────────
 # Datenpfad: via Env-Variable überschreibbar (für Docker)
 DATA_DIR       = os.environ.get("E2PROXY_DATA_DIR", "/var/lib/e2proxy")
-VERSION        = "4.1"   # Offizielle Version — nur beim Pull Request erhöhen (major/minor)
+VERSION        = "4.2"   # Offizielle Version — nur beim Pull Request erhöhen (major/minor)
 # ── Interne Build-/Versionskennung ────────────────────────
 # Identifiziert eindeutig den ausgerollten Branch/Stand bei Tests, OHNE die
 # offizielle VERSION zu verändern (die steigt erst beim PR). Bei jedem Test-
 # Rollout eines neuen Standes BUILD_SEQ erhöhen.
-BUILD_BRANCH     = "bug/ui_issue_01"
-BUILD_SEQ        = "3"
+BUILD_BRANCH     = "feature/stream-info"
+BUILD_SEQ        = "a8e6c1b0"
 INTERNAL_VERSION = f"{VERSION}+{BUILD_BRANCH.split('/')[-1]}.{BUILD_SEQ}"
 CONFIG_FILE    = f"{DATA_DIR}/config.json"
 FAVORITES_FILE = f"{DATA_DIR}/favorites.json"
@@ -920,6 +920,11 @@ receiver_lock = threading.Lock()
 _receiver_state = {}   # receiver_id → None | dict(info)
 stream_processes = {}  # receiver_id → subprocess.Popen
 stream_processes_lock = threading.Lock()
+# Passthrough-Streams laufen als reine Socket-Schleife ohne Subprozess. Damit ein
+# /kill sie tatsächlich beendet (und nicht nur den Receiver-State freigibt), wird
+# der Upstream-Socket je Receiver hier registriert und beim Kill hart geschlossen.
+stream_sockets = {}    # receiver_id → upstream socket (passthrough)
+stream_sockets_lock = threading.Lock()
 
 # Client dedup - prevent Kodi parallel probe requests
 client_stream_lock = threading.Lock()
@@ -967,7 +972,8 @@ def get_ref_lock(service_ref):
         return _stream_ref_locks[service_ref]
 
 
-def acquire_receiver(rid, client_ip, service_ref="", channel_name=""):
+def acquire_receiver(rid, client_ip, service_ref="", channel_name="",
+                     user_agent="", profile="", transcode=None):
     with receiver_lock:
         _receiver_state[rid] = {
             "client_ip": client_ip,
@@ -975,9 +981,115 @@ def acquire_receiver(rid, client_ip, service_ref="", channel_name=""):
             "channel_name": channel_name,
             "started": datetime.now().strftime("%H:%M:%S"),
             "started_ts": time.time(),
+            "user_agent": user_agent or "",
+            "profile": profile or "",
+            "transcode": transcode or {"active": False},
+            "bytes_sent": 0,
         }
     r = get_receiver_by_id(rid)
     log.info(f"Receiver '{rid}' ({r['name'] if r else rid}) busy from {client_ip}")
+
+
+def note_stream_bytes(rid, total):
+    """Aktualisiert live den übertragenen Byte-Zähler eines aktiven Streams.
+
+    Wird aus den Stream-Schleifen (passthrough/transcode) gerufen, damit die
+    Stream-Info in der UI zeigen kann, wie viele Daten bereits geflossen sind.
+    Bewusst ohne Lock (nur Anzeige): ein Dict-Item-Write ist unter dem GIL
+    atomar; zeigt der lokale State-Verweis auf einen bereits freigegebenen
+    Receiver, ist der Write harmlos.
+    """
+    st = _receiver_state.get(rid)
+    if isinstance(st, dict):
+        st["bytes_sent"] = total
+
+
+def human_bytes(n):
+    """Formatiert eine Byte-Zahl menschenlesbar (B/KB/MB/GB)."""
+    try:
+        n = float(n or 0)
+    except (TypeError, ValueError):
+        return "0 B"
+    if n >= 1024 ** 3:
+        return f"{n / 1024 ** 3:.2f} GB"
+    if n >= 1024 ** 2:
+        return f"{n / 1024 ** 2:.1f} MB"
+    if n >= 1024:
+        return f"{n / 1024:.0f} KB"
+    return f"{int(n)} B"
+
+
+def describe_client(ua):
+    """Leitet aus dem User-Agent eine kurze, menschenlesbare Software-Kennung ab.
+
+    Reicht für die typischen e2proxy-Clients (Browser, Kodi, VLC, Dream Player,
+    Plex, Jellyfin, ffmpeg, Android). Ist nichts erkennbar, wird der erste
+    Token des User-Agents bzw. "Unbekannt" zurückgegeben.
+    """
+    if not ua:
+        return "Unbekannt"
+    u = ua.lower()
+    checks = [
+        ("vlc", "VLC"),
+        ("kodi", "Kodi"),
+        ("exoplayer", "ExoPlayer (Dream Player)"),
+        ("dreamplayer", "Dream Player"),
+        ("plex", "Plex"),
+        ("jellyfin", "Jellyfin"),
+        ("threadfin", "Threadfin/Plex"),
+        ("infuse", "Infuse"),
+        ("mpv", "mpv"),
+        ("gstreamer", "GStreamer"),
+        ("lavf", "ffmpeg/Lavf"),
+        ("ffmpeg", "ffmpeg"),
+        ("libcurl", "libcurl"),
+        ("e2proxy", "e2proxy (intern)"),
+        ("stagefright", "Android"),
+        ("dalvik", "Android"),
+        ("edg", "Edge (Browser)"),
+        ("chrome", "Chrome (Browser)"),
+        ("firefox", "Firefox (Browser)"),
+        ("safari", "Safari (Browser)"),
+        ("mozilla", "Browser"),
+    ]
+    for needle, label in checks:
+        if needle in u:
+            return label
+    return ua.split("/")[0].split()[0][:32] or "Unbekannt"
+
+
+def stream_info_public(state):
+    """Baut ein angereichertes, UI-taugliches Stream-Info-Objekt aus dem State.
+
+    Ergänzt Rohdaten (User-Agent, Bytes, Startzeit) um abgeleitete Felder:
+    erkannte Software, menschenlesbare Datenmenge, Laufzeit und
+    Transcode-Zusammenfassung. Gibt None zurück, wenn kein Stream aktiv ist.
+    """
+    if not isinstance(state, dict):
+        return None
+    ua = state.get("user_agent", "") or ""
+    bytes_sent = state.get("bytes_sent", 0) or 0
+    started_ts = state.get("started_ts")
+    duration = int(time.time() - started_ts) if started_ts else 0
+    tc = state.get("transcode") or {}
+    active = bool(tc.get("active"))
+    return {
+        "channel_name": state.get("channel_name", ""),
+        "client_ip": state.get("client_ip", ""),
+        "started": state.get("started", ""),
+        "service_ref": state.get("service_ref", ""),
+        "user_agent": ua,
+        "software": describe_client(ua),
+        "profile": state.get("profile", ""),
+        "bytes": bytes_sent,
+        "bytes_human": human_bytes(bytes_sent),
+        "duration_sec": duration,
+        "transcode": {
+            "active": active,
+            "codec": tc.get("codec", "") or "",
+            "label": tc.get("label", "") or "",
+        },
+    }
 
 
 def release_receiver(rid):
@@ -1016,6 +1128,19 @@ def kill_stream(rid):
     with stream_processes_lock:
         proc = stream_processes.get(rid)
     kill_proc_robust(proc, label=f"Stream '{rid}'")
+    # Passthrough-Streams haben keinen Subprozess: Upstream-Socket hart schließen,
+    # damit die recv()-Schleife bricht und der Tuner der Box wirklich frei wird.
+    with stream_sockets_lock:
+        sock = stream_sockets.get(rid)
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
     release_receiver(rid)
     log.info(f"Stream auf Receiver '{rid}' abgebrochen")
 
@@ -1177,6 +1302,9 @@ def stream_passthrough(rid, service_ref, wfile, use_chunked=False):
         header_data += chunk
     sock.settimeout(30)
     bytes_sent = 0
+    _last_note = 0.0
+    with stream_sockets_lock:
+        stream_sockets[rid] = sock
     try:
         while True:
             chunk = sock.recv(CHUNK_SIZE)
@@ -1188,10 +1316,21 @@ def stream_passthrough(rid, service_ref, wfile, use_chunked=False):
                 wfile.write(chunk)
                 wfile.flush()
             bytes_sent += len(chunk)
+            now = time.time()
+            if now - _last_note >= 1.0:
+                note_stream_bytes(rid, bytes_sent)
+                _last_note = now
     except (BrokenPipeError, ConnectionResetError, OSError):
         pass
     finally:
-        sock.close()
+        with stream_sockets_lock:
+            if stream_sockets.get(rid) is sock:
+                stream_sockets.pop(rid, None)
+        try:
+            sock.close()
+        except Exception:
+            pass
+        note_stream_bytes(rid, bytes_sent)
     return bytes_sent
 
 
@@ -1421,6 +1560,7 @@ def stream_transcoded(rid, service_ref, tp, wfile, use_chunked=False, channel_na
         # ── Phase 2: Daten erhalten → Erfolg werten & normal streamen ────────
         record_stream_start(service_ref, True, attempts, no_latency, channel_name)
         chunk = first_chunk
+        _last_note = 0.0
         while chunk:
             if use_chunked:
                 write_chunked(wfile, chunk)
@@ -1428,6 +1568,10 @@ def stream_transcoded(rid, service_ref, tp, wfile, use_chunked=False, channel_na
                 wfile.write(chunk)
                 wfile.flush()
             bytes_sent += len(chunk)
+            now = time.time()
+            if now - _last_note >= 1.0:
+                note_stream_bytes(rid, bytes_sent)
+                _last_note = now
             chunk = proc.stdout.read(CHUNK_SIZE)
 
     except ScrambledStreamError:
@@ -1439,7 +1583,7 @@ def stream_transcoded(rid, service_ref, tp, wfile, use_chunked=False, channel_na
             stream_processes.pop(rid, None)
         if proc:
             _kill(proc)
-
+        note_stream_bytes(rid, bytes_sent)
     log.info(f"ffmpeg END: {service_ref} — {bytes_sent/1024/1024:.1f} MB")
     return bytes_sent, content_type
 
@@ -3541,7 +3685,10 @@ def start_recording(service_ref, title, duration=None, profile=None,
     # Receiver sofort acquiren um Race-Condition zu verhindern
     # ABER: bei shared_tuner ist Receiver schon belegt → nicht doppelt acquiren
     if not shared_tuner:
-        acquire_receiver(rid, client_ip, service_ref, title or "Aufnahme")
+        acquire_receiver(rid, client_ip, service_ref, title or "Aufnahme",
+                         user_agent="e2proxy (Aufnahme)", profile=rec_profile,
+                         transcode={"active": True, "codec": "record",
+                                    "label": f"Aufnahme ({rec_profile})"})
 
     # Stream-URL bauen:
     # - shared_tuner: direkt vom Receiver (umgeht ref_lock 429, parallele Aufnahmen möglich)
@@ -3878,6 +4025,7 @@ def get_tuner_status():
             "channel": state.get("channel_name", "") if state else "",
             "client_ip": state.get("client_ip", "") if state else "",
             "since": state.get("started", "") if state else "",
+            "stream": stream_info_public(state),
         })
     return {"total": total, "busy": busy, "free": total - busy, "receivers": result}
 
@@ -4207,6 +4355,14 @@ const I18N = {
     "common.loading": "Loading…", "common.search": "Search…", "common.enabled": "Enabled",
     "common.disabled": "Disabled", "common.yes": "Yes", "common.no": "No",
     "common.channels": "channels", "common.none": "— none —",
+    // Stream-Info
+    "sm.receiver": "Receiver", "sm.channel": "Channel", "sm.device": "Device",
+    "sm.software": "Software", "sm.profile": "Profile", "sm.data": "Data streamed",
+    "sm.transcode": "Transcoding", "sm.runtime": "Runtime", "sm.recording": "Recording",
+    "sm.stop": "Stop stream", "sm.yes": "Yes", "sm.no_passthrough": "No (passthrough)",
+    "sm.no_stream": "No active stream", "sm.locked": "Locked (excluded)",
+    "sm.confirm_stop": "Stop stream?", "sm.details": "Details", "sm.expand": "Show details",
+    "sm.active_streams": "Active streams", "sm.no_active": "No active streams",
     // Hauptseite
     "main.live_tv": "Live TV", "main.all_channels": "All Channels",
     "main.tuner_status": "Tuner Status", "main.free": "free", "main.busy": "busy",
@@ -4377,6 +4533,14 @@ const I18N = {
     "common.loading": "Lädt…", "common.search": "Suchen…", "common.enabled": "Aktiviert",
     "common.disabled": "Deenabled", "common.yes": "Ja", "common.no": "Nein",
     "common.channels": "Sender", "common.none": "— keine —",
+    // Stream-Info
+    "sm.receiver": "Receiver", "sm.channel": "Sender", "sm.device": "Gerät",
+    "sm.software": "Software", "sm.profile": "Profil", "sm.data": "Übertragene Daten",
+    "sm.transcode": "Transcodierung", "sm.runtime": "Laufzeit", "sm.recording": "Aufnahme",
+    "sm.stop": "Stream beenden", "sm.yes": "Ja", "sm.no_passthrough": "Nein (Passthrough)",
+    "sm.no_stream": "Kein aktiver Stream", "sm.locked": "Gesperrt (ausgeschlossen)",
+    "sm.confirm_stop": "Stream beenden?", "sm.details": "Details", "sm.expand": "Details anzeigen",
+    "sm.active_streams": "Aktive Streams", "sm.no_active": "Keine aktiven Streams",
     "main.live_tv": "Live TV", "main.all_channels": "Alle Sender",
     "main.tuner_status": "Tuner Status", "main.free": "frei", "main.busy": "belegt",
     "main.quick_record": "Schnellaufnahme", "main.duration_min": "Dauer (Min)",
@@ -4817,20 +4981,18 @@ def build_web_ui(channels):
         if is_receiver_locked(r):
             color = "#64748b"
             status = "🔒 gesperrt"
-            kill_btn = ""
             rx_items.append(
                 f'<div class="rx-item">'
                 f'<span class="rx-dot" id="rx-dot-{r["id"]}" style="background:{color}"></span>'
                 f'<span>{r["name"]}</span>'
-                f'<span class="rx-status" id="rx-status-{r["id"]}">{status}</span>'
-                f'{kill_btn}'
+                f'<span class="rx-status" id="rx-status-{r["id"]}" '
+                f'onclick="openStreamModal(\'{r["id"]}\')" title="Details">{status}</span>'
                 f'</div>'
             )
             continue
         if state is None:
             color = "#22c55e" if online else "#ef4444"
             status = "free"
-            kill_btn = ""
         else:
             # Check if this receiver has an active recording
             is_rec = False
@@ -4854,13 +5016,12 @@ def build_web_ui(channels):
                 client = state.get("client_ip", "?")
                 since = state.get("started", "?")
                 status = f"{ch} · {client} · {since}"
-            kill_btn = f'<button class="rx-kill" onclick="killReceiver(\'{r["id"]}\')" title="Stop stream">✕</button>'
         rx_items.append(
             f'<div class="rx-item">'
             f'<span class="{dot_class if state else "rx-dot"}" id="rx-dot-{r["id"]}" style="background:{color}"></span>'
             f'<span>{r["name"]}</span>'
-            f'<span class="rx-status" id="rx-status-{r["id"]}">{status}</span>'
-            f'{kill_btn}'
+            f'<span class="rx-status" id="rx-status-{r["id"]}" '
+            f'onclick="openStreamModal(\'{r["id"]}\')" title="Details">{status}</span>'
             f'</div>'
         )
     rx_html = "\n".join(rx_items)
@@ -4912,9 +5073,22 @@ def build_web_ui(channels):
 .rx-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;transition:background 0.3s;}
 .rx-dot.recording{background:#ef4444 !important;animation:rec-blink 1s infinite;}
 @keyframes rec-blink{0%,100%{opacity:1;box-shadow:0 0 4px #ef4444}50%{opacity:0.3;box-shadow:none}}
-.rx-status{color:var(--muted);}
+.rx-status{color:var(--muted);cursor:pointer;border-bottom:1px dotted transparent;}
+.rx-status:hover{color:var(--text);border-bottom-color:var(--muted);}
 .rx-kill{background:none;border:1px solid var(--red);color:var(--red);width:16px;height:16px;border-radius:3px;cursor:pointer;font-size:9px;display:inline-flex;align-items:center;justify-content:center;margin-left:2px;}
 .rx-kill:hover{background:var(--red);color:white;}
+.sm-overlay{position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.7);display:none;align-items:center;justify-content:center;padding:20px;}
+.sm-overlay.show{display:flex;}
+.sm-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;max-width:440px;width:100%;box-shadow:0 12px 48px rgba(0,0,0,0.5);overflow:hidden;}
+.sm-head{display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--border);}
+.sm-title{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--accent2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.sm-close{background:none;border:1px solid var(--border);color:var(--text);width:26px;height:26px;border-radius:5px;cursor:pointer;font-size:13px;flex-shrink:0;}
+.sm-close:hover{border-color:var(--accent);}
+.sm-body{padding:14px 18px;display:flex;flex-direction:column;gap:9px;}
+.sm-row{display:flex;gap:10px;font-size:12px;align-items:flex-start;}
+.sm-key{font-family:'JetBrains Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);width:120px;flex-shrink:0;padding-top:1px;}
+.sm-val{color:var(--text);flex:1;word-break:break-word;}
+.sm-foot{padding:12px 18px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;}
 .main{display:flex;flex:1;overflow:hidden;height:calc(100vh - 80px);}
 .sidebar{width:320px;flex-shrink:0;display:flex;flex-direction:column;border-right:1px solid var(--border);overflow:hidden;}
 .search-bar{padding:10px 12px;border-bottom:1px solid var(--border);background:var(--surface);}
@@ -4977,6 +5151,17 @@ video{width:100%;height:100%;object-fit:contain;}
 <div class="rx-bar">
   {rx_html}
   <span style="margin-left:auto;color:var(--muted);font-size:10px"><span data-i18n="main.status">Status:</span> {now}</span>
+</div>
+
+<div class="sm-overlay" id="stream-modal" onclick="if(event.target===this)closeStreamModal()">
+  <div class="sm-card">
+    <div class="sm-head">
+      <span class="sm-title" id="sm-title">Stream</span>
+      <button class="sm-close" onclick="closeStreamModal()" title="Close">✕</button>
+    </div>
+    <div class="sm-body" id="sm-body"></div>
+    <div class="sm-foot" id="sm-foot"></div>
+  </div>
 </div>
 
 <div class="main">
@@ -5123,23 +5308,96 @@ function filterChannels(q) {{
   document.getElementById('stats').textContent = ql ? `${{visible}} von {total}` : `{total} Sender`;
 }}
 
+let _lastStatus = [];
+let _modalRxId = null;
+
 function killReceiver(id) {{
-  if (!confirm('Stream abbrechen?')) return;
+  if (!confirm(t('sm.confirm_stop'))) return;
   fetch('/kill?receiver=' + id).then(r=>r.json()).then(d => {{
     showToast(d.message || 'Stream stopped', d.ok ? 'success' : 'error');
+    closeStreamModal();
     refreshStatus();
   }});
 }}
 
+function _fmtDur(sec) {{
+  sec = Math.max(0, parseInt(sec||0, 10));
+  const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), s = sec%60;
+  const p = n => String(n).padStart(2,'0');
+  return h > 0 ? `${{h}}:${{p(m)}}:${{p(s)}}` : `${{m}}:${{p(s)}}`;
+}}
+
+function _smRow(key, val) {{
+  return `<div class="sm-row"><span class="sm-key">${{key}}</span><span class="sm-val">${{val}}</span></div>`;
+}}
+
+function _esc(s) {{
+  return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}}
+
+function openStreamModal(id) {{
+  _modalRxId = id;
+  document.getElementById('stream-modal').classList.add('show');
+  renderStreamModal();
+}}
+
+function closeStreamModal() {{
+  _modalRxId = null;
+  document.getElementById('stream-modal').classList.remove('show');
+}}
+
+function renderStreamModal() {{
+  if (_modalRxId == null) return;
+  const rx = _lastStatus.find(r => r.id === _modalRxId);
+  const titleEl = document.getElementById('sm-title');
+  const bodyEl = document.getElementById('sm-body');
+  const footEl = document.getElementById('sm-foot');
+  if (!rx) {{ closeStreamModal(); return; }}
+  const s = rx.stream;
+  if (!s) {{
+    titleEl.textContent = rx.name;
+    const msg = rx.locked ? t('sm.locked') : t('sm.no_stream');
+    bodyEl.innerHTML = `<div class="sm-row"><span class="sm-val" style="color:var(--muted)">${{_esc(msg)}}</span></div>`;
+    footEl.innerHTML = '';
+    return;
+  }}
+  const isRec = !!rx.recording;
+  titleEl.textContent = (isRec ? '🔴 ' : '') + (s.channel_name || rx.name);
+  let tc;
+  if (s.transcode && s.transcode.active) {{
+    const parts = [];
+    if (s.transcode.label) parts.push(_esc(s.transcode.label));
+    if (s.transcode.codec) parts.push('<code>'+_esc(s.transcode.codec)+'</code>');
+    tc = '✅ ' + t('sm.yes') + (parts.length ? ' · ' + parts.join(' · ') : '');
+  }} else {{
+    tc = '➖ ' + t('sm.no_passthrough');
+  }}
+  let rows = '';
+  rows += _smRow(t('sm.receiver'), _esc(rx.name));
+  rows += _smRow(t('sm.channel'), _esc(s.channel_name || '?'));
+  if (isRec) rows += _smRow(t('sm.recording'), '🔴 ' + _esc(rx.recording.title||''));
+  rows += _smRow(t('sm.device'), _esc(s.client_ip || '?'));
+  rows += _smRow(t('sm.software'), _esc(s.software || '?') + (s.user_agent ? ` <span style="color:var(--muted);font-size:10px">(${{_esc(s.user_agent)}})</span>` : ''));
+  if (s.profile) rows += _smRow(t('sm.profile'), _esc(s.profile));
+  rows += _smRow(t('sm.data'), _esc(s.bytes_human || '0 B'));
+  rows += _smRow(t('sm.transcode'), tc);
+  rows += _smRow(t('sm.runtime'), _fmtDur(s.duration_sec) + (s.started ? ` <span style="color:var(--muted);font-size:10px">(${{_esc(s.started)}})</span>` : ''));
+  bodyEl.innerHTML = rows;
+  footEl.innerHTML = `<button class="btn btn-danger" onclick="killReceiver('${{rx.id}}')">⏹ ${{t('sm.stop')}}</button>`;
+}}
+
 function refreshStatus() {{
   fetch('/api/status').then(r=>r.json()).then(data => {{
-    (data.receivers||[]).forEach(rx => {{
+    _lastStatus = data.receivers || [];
+    _lastStatus.forEach(rx => {{
       const dot = document.getElementById('rx-dot-' + rx.id);
       const st  = document.getElementById('rx-status-' + rx.id);
       if (!dot || !st) return;
-      // Kill-Button suchen (nächstes Geschwister-Element nach rx-status)
-      const killBtn = st.nextElementSibling;
-      if (rx.busy && rx.stream) {{
+      if (rx.locked) {{
+        dot.style.background = '#64748b';
+        dot.className = 'rx-dot';
+        st.textContent = '🔒 gesperrt';
+      }} else if (rx.busy && rx.stream) {{
         const isRec = !!rx.recording;
         dot.style.background = isRec ? '#ef4444' : '#f59e0b';
         dot.className = isRec ? 'rx-dot recording' : 'rx-dot';
@@ -5147,27 +5405,14 @@ function refreshStatus() {{
         const cl = rx.stream.client_ip || '?';
         const since = rx.stream.started || '?';
         const recLabel = isRec ? '🔴 REC ' + (rx.recording.title||'') + ' · ' : '';
-        st.innerHTML = recLabel + ch + ' · ' + cl + ' · ' + since;
-        // Kill-Button einblenden oder erstellen
-        if (!killBtn || !killBtn.classList.contains('rx-kill')) {{
-          const btn = document.createElement('button');
-          btn.className = 'rx-kill'; btn.title = 'Stream abbrechen';
-          btn.textContent = '✕';
-          btn.onclick = () => killReceiver(rx.id);
-          st.parentNode.appendChild(btn);
-        }} else {{
-          killBtn.style.display = '';
-        }}
+        st.textContent = recLabel + ch + ' · ' + cl + ' · ' + since;
       }} else {{
         dot.style.background = rx.online ? '#22c55e' : '#ef4444';
         dot.className = 'rx-dot';
         st.textContent = t('rec.tuner_free');
-        // Kill-Button entfernen
-        if (killBtn && killBtn.classList.contains('rx-kill')) {{
-          killBtn.remove();
-        }}
       }}
     }});
+    if (_modalRxId != null) renderStreamModal();
   }}).catch(()=>{{}});
 }}
 
@@ -6643,6 +6888,15 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
   <div class="tab-panel" id="tab-maintenance">
 
     <div class="card">
+      <div class="card-title">📡 <span data-i18n="sm.active_streams">Active streams</span>
+        <button class="btn" style="margin-left:auto;font-size:10px" onclick="loadStreamInfo()">↺ <span data-i18n="common.refresh">Refresh</span></button>
+      </div>
+      <div id="stream-info-list" style="display:flex;flex-direction:column;gap:8px">
+        <span style="color:var(--muted);font-size:11px;font-family:monospace" data-i18n="common.loading">Loading…</span>
+      </div>
+    </div>
+
+    <div class="card">
       <div class="card-title">🔧 <span data-i18n="set.maint_actions">Maintenance Actions</span></div>
       <div class="action-grid">
 
@@ -6946,7 +7200,7 @@ function switchTab(name, btn) {{
   document.getElementById('tab-' + name).classList.add('active');
   const tabBtn = btn || (typeof event !== 'undefined' && event.currentTarget) || null;
   if (tabBtn && tabBtn.closest) tabBtn.closest('.tab-btn').classList.add('active');
-  if (name === 'maintenance') {{ refreshLogs(); initApiLogToggle(); initMaintNotify(); loadFavLogos(); }}
+  if (name === 'maintenance') {{ refreshLogs(); initApiLogToggle(); initMaintNotify(); loadFavLogos(); loadStreamInfo(); }}
   else {{
     if (_logPollTimer) {{ clearInterval(_logPollTimer); _logPollTimer = null; }}
     if (_apiLogPollTimer) {{ clearInterval(_apiLogPollTimer); _apiLogPollTimer = null; }}
@@ -7459,12 +7713,93 @@ function copyUrl(btn, url) {{
 }}
 
 // Logs beim Start laden wenn Maintenance-Tab aktiv
-if (document.getElementById('tab-maintenance').classList.contains('active')) {{ refreshLogs(); initApiLogToggle(); initMaintNotify(); loadFavLogos(); }}
+if (document.getElementById('tab-maintenance').classList.contains('active')) {{ refreshLogs(); initApiLogToggle(); initMaintNotify(); loadFavLogos(); loadStreamInfo(); }}
 
 // ── Recording ─────────────────────────────────────────
 let _quickRecId = null;
 let _epgChannels = [];
 let _testRecId = null;
+
+// ── Stream-Info (Wartung) ─────────────────────────────
+let _streamInfoData = [];
+
+function _siEsc(s) {{
+  return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}}
+
+function _siDur(sec) {{
+  sec = Math.max(0, parseInt(sec||0, 10));
+  const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), s = sec%60;
+  const p = n => String(n).padStart(2,'0');
+  return h > 0 ? `${{h}}:${{p(m)}}:${{p(s)}}` : `${{m}}:${{p(s)}}`;
+}}
+
+function loadStreamInfo() {{
+  const el = document.getElementById('stream-info-list');
+  if (!el) return;
+  fetch('/api/status').then(r=>r.json()).then(data => {{
+    _streamInfoData = data.receivers || [];
+    const enabled = _streamInfoData;
+    if (!enabled.length) {{ el.innerHTML = `<span style="color:var(--muted);font-size:11px;font-family:monospace">${{t('sm.no_active')}}</span>`; return; }}
+    el.innerHTML = enabled.map(rx => {{
+      const s = rx.stream;
+      const isRec = !!rx.recording;
+      const busy = rx.busy && s;
+      const dot = rx.locked ? 'var(--red)' : (isRec ? 'var(--red)' : (busy ? 'var(--amber)' : 'var(--green)'));
+      const line = rx.locked ? '🔒 gesperrt'
+        : (busy ? _siEsc((isRec?'🔴 ':'') + (s.channel_name||'?') + ' · ' + (s.client_ip||'?')) : t('sm.no_stream'));
+      const plusBtn = busy ? `<button class="btn" style="font-size:10px;padding:2px 7px" onclick="toggleStreamDetail('${{rx.id}}')" title="${{t('sm.expand')}}" id="si-plus-${{rx.id}}">+</button>` : '';
+      const killBtn = busy ? `<button onclick="killStreamInfo('${{rx.id}}')" title="${{t('sm.stop')}}" style="background:none;border:1px solid var(--red);color:var(--red);width:22px;height:22px;border-radius:4px;cursor:pointer;font-size:11px;display:inline-flex;align-items:center;justify-content:center">✕</button>` : '';
+      let detail = '';
+      if (busy) {{
+        let tc;
+        if (s.transcode && s.transcode.active) {{
+          const parts = [];
+          if (s.transcode.label) parts.push(_siEsc(s.transcode.label));
+          if (s.transcode.codec) parts.push(_siEsc(s.transcode.codec));
+          tc = '✅ ' + t('sm.yes') + (parts.length ? ' · ' + parts.join(' · ') : '');
+        }} else {{ tc = '➖ ' + t('sm.no_passthrough'); }}
+        const rows = [
+          [t('sm.device'), _siEsc(s.client_ip||'?')],
+          [t('sm.software'), _siEsc(s.software||'?') + (s.user_agent ? ` (${{_siEsc(s.user_agent)}})` : '')],
+          s.profile ? [t('sm.profile'), _siEsc(s.profile)] : null,
+          [t('sm.data'), _siEsc(s.bytes_human||'0 B')],
+          [t('sm.transcode'), tc],
+          [t('sm.runtime'), _siDur(s.duration_sec) + (s.started ? ` (${{_siEsc(s.started)}})` : '')],
+          isRec ? [t('sm.recording'), '🔴 ' + _siEsc(rx.recording.title||'')] : null,
+        ].filter(Boolean);
+        detail = `<div id="si-detail-${{rx.id}}" style="display:none;margin-top:8px;padding-top:8px;border-top:1px dashed var(--border);font-size:11px;font-family:monospace">` +
+          rows.map(r => `<div style="display:flex;gap:8px;margin:2px 0"><span style="color:var(--muted);min-width:130px">${{r[0]}}</span><span>${{r[1]}}</span></div>`).join('') +
+          `</div>`;
+      }}
+      return `<div style="border:1px solid var(--border);border-radius:6px;padding:8px 10px">
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="width:8px;height:8px;border-radius:50%;background:${{dot}};flex-shrink:0"></span>
+          <b style="font-size:12px">${{_siEsc(rx.name)}}</b>
+          <span style="color:var(--muted);font-size:11px;font-family:monospace;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${{line}}</span>
+          ${{plusBtn}}${{killBtn}}
+        </div>${{detail}}
+      </div>`;
+    }}).join('');
+  }}).catch(()=>{{ el.textContent = 'Fehler.'; }});
+}}
+
+function toggleStreamDetail(id) {{
+  const d = document.getElementById('si-detail-' + id);
+  const b = document.getElementById('si-plus-' + id);
+  if (!d) return;
+  const open = d.style.display !== 'none' && d.style.display !== '';
+  d.style.display = open ? 'none' : 'block';
+  if (b) b.textContent = open ? '+' : '−';
+}}
+
+function killStreamInfo(id) {{
+  if (!confirm(t('sm.confirm_stop'))) return;
+  fetch('/kill?receiver=' + id).then(r=>r.json()).then(d => {{
+    showToast(d.message || 'Stream stopped', d.ok ? 'success' : 'error');
+    setTimeout(loadStreamInfo, 400);
+  }});
+}}
 
 function loadTunerStatus() {{
   fetch('/api/tuners').then(r=>r.json()).then(d=>{{
@@ -9106,8 +9441,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     "id": r["id"],
                     "name": r["name"],
                     "busy": state is not None,
+                    "locked": is_receiver_locked(r),
                     "online": is_receiver_online(r["id"]),
-                    "stream": state,
+                    "stream": stream_info_public(state),
                     "recording": rec_by_receiver.get(r["id"]),
                 })
             self.send_json({"receivers": rx_status})
@@ -9760,7 +10096,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     log.warning(f"Duplicate request for {service_ref} — rejected (429)")
                     self.send_text("Stream für diesen Sender läuft bereits", 429)
                     return
-                acquire_receiver(rid, client_ip, service_ref, channel_name)
+                acquire_receiver(rid, client_ip, service_ref, channel_name,
+                                 user_agent=ua, profile=profile_name,
+                                 transcode={
+                                     "active": tp.get("codec") != "pass",
+                                     "codec": tp.get("codec", ""),
+                                     "label": tp.get("label", profile_name),
+                                 })
 
             try:
                 if not do_zap(rid, service_ref, channel_name):
@@ -10579,7 +10921,13 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
                  f"[{ua[:40]}] (receiver={rid}, shared={shared})")
 
         if not shared:
-            acquire_receiver(rid, client_ip, sref, channel_name)
+            acquire_receiver(rid, client_ip, sref, channel_name,
+                             user_agent=ua, profile=profile_id,
+                             transcode={
+                                 "active": not passthrough,
+                                 "codec": (tp.get("codec", "") if tp else "pass"),
+                                 "label": (tp.get("label", profile_id) if tp else "Passthrough"),
+                             })
         try:
             if not shared:
                 if not do_zap(rid, sref, channel_name):
