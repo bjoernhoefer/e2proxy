@@ -14,6 +14,8 @@ Single Python file, runs in Docker, manages two SAT receivers with automatic tun
 - **TVDB + TMDB** — Automatic series/episode detection, daily-show fallback numbering
 - **Shared Tuner** — Parallel recordings on the same channel without tuner conflicts
 - **Fast Switching** — Per-channel switch tuning (NoLatency probing, configurable zap wait) with self-learning probesize and zap/start statistics
+- **Switch Analysis** — An *Analyze* button turns the collected zap/start statistics into concrete per-channel tuning suggestions (tighten flaky channels, loosen reliable ones), shown as a preview before you apply them
+- **Usage Report** — Aggregated statistics on which device streams most, which channel is watched most, which programmes are worth recording, and which interfaces are used
 - **Tuner Lock** — Temporarily lock a tuner in Settings so e2proxy won't use it (handy in exceptional situations)
 - **Favorites** — Drag & drop channel ordering with group/category assignments
 - **Editable Logos** — Set a custom logo per favorite (upload or URL), auto-converted to PNG via ffmpeg
@@ -113,8 +115,35 @@ All configuration stored in `/data/config.json`.
 | Main | `/` | Channel list, player, tuner status |
 | EPG Browser | `/epg-browser` | Interactive timeline with recording buttons |
 | Favorites | `/favorites` | Drag & drop channel ordering |
-| Settings | `/settings` | Configuration, maintenance, EPG, recordings |
+| Settings | `/settings` | Configuration, maintenance, EPG, recordings, usage report |
 | Help | `/help` | Feature overview, API reference, changelog |
+
+### Switch analysis & usage report
+
+The Settings page has a **📊 Auswertung / Usage** tab combining two things.
+
+**Switch tuning analysis.** Every zap and stream start is recorded as ok/fail per channel.
+The *Analyze* button turns that history into concrete suggestions — tighten channels that
+fail too often (more zap wait, larger probesize, or NoLatency off), loosen channels that are
+provably reliable. Suggestions are shown as a preview table and only written when you apply
+them.
+
+Rather than a fixed failure-rate threshold, the heuristic uses a **Wilson score interval**,
+so the sample size decides how much a rate is trusted: 1 failure out of 20 (lower bound 0.9 %)
+does *not* trigger, 2 out of 20 (lower bound 2.8 %) does. A channel needs at least 10 starts
+resp. 10 zaps before any rule fires, and zap rules and start rules are gated separately —
+otherwise a channel with many zaps but few starts triggers a start rule on a 3-sample basis.
+Because a channel you watch often will accumulate more failures in absolute terms, exposure
+(watch sessions, watch time, failures per hour) is reported alongside the rate.
+
+Note that a perfectly reliable channel produces *no* suggestion when the global config is
+already at its most aggressive — there is simply nothing left to loosen.
+
+**Usage report.** Stream sessions are aggregated into a persistent store (`usage_stats.json`)
+answering: which device streams most, which channel is watched most, which programmes are
+watched repeatedly (i.e. worth a recording timer), and which interfaces (proxy, OpenWebif,
+Plex DVR, EPG, API) are actually used, plus a distribution over hours and weekdays. Programme
+titles are resolved from the EPG cache at the time of viewing.
 
 ### WebUI internals (self-check + extraction boundary)
 
@@ -135,8 +164,36 @@ every tab/button on a page. A built-in **self-check** guards against this:
 python3 e2proxy.py --selfcheck   # exit 0 = OK, exit 1 = broken (use as a pre-deploy gate)
 ```
 
+It renders every page and reports four classes of defect that have each caused a dead UI
+before:
+
+| Check | Catches |
+|-------|---------|
+| unterminated string literals | a `'…`/`"…` that runs into a newline |
+| nested/escaped quotes | `onclick="f('a', 'b\'c')"` — string followed by a bare identifier |
+| unbalanced `()`, `[]`, `{}` | a `function x() {` declaration line lost while editing |
+| unresolved references | `escHtml(…)` called on a page that never defines it, and inline `onclick="foo()"` handlers with no `foo` |
+
+The last class is the important one: such code is *syntactically perfect* and only fails at
+runtime, so a parser alone never sees it. String, template, regex and comment content is
+masked out first (`${…}` inside template literals stays visible, since it is real code), then
+all declarations — `function`, `class`, `const/let/var`, parameter lists, arrow parameters,
+`catch (e)`, destructuring and `window.X =` — are collected and compared against every call
+site. Browser globals are allow-listed. Note that helper availability differs per page
+(`escHtml` exists on the main page but not on Settings), which is exactly what this catches.
+
 The same check runs automatically at startup and logs `WebUI self-check: OK` (or a loud
-`ERROR` listing the offending page/script/line).
+`ERROR` listing the offending page/script/line). Use it as a **deploy gate** so a broken
+build can never replace a running one:
+
+```bash
+python3 -m py_compile e2proxy.py                    || exit 1   # Python syntax
+E2PROXY_DATA_DIR=$(mktemp -d) python3 e2proxy.py --selfcheck || exit 1   # WebUI
+cp e2proxy.py "$TARGET" && docker compose restart              # only now
+```
+
+Static analysis has limits — it finds missing functions and broken syntax, not logic errors
+(e.g. a wrong API field name). A browser click-through remains the final stage.
 
 ## Versioning
 
@@ -144,8 +201,8 @@ The same check runs automatically at startup and logs `WebUI self-check: OK` (or
   Request is opened.
 - **Internal build id** (`INTERNAL_VERSION = <VERSION>+<branch>.<seq>`) uniquely identifies
   the deployed branch/state during testing. Bump `BUILD_SEQ` on every test rollout; it is
-  reported by `/api/version` and printed in the startup log so you always know exactly which
-  build is running on a host.
+  reported by `/api/version`, printed in the startup log **and shown in the UI** (Settings →
+  About, and the Help page header) so you always know exactly which build is running on a host.
 
 ## API
 
@@ -185,6 +242,9 @@ The same check runs automatically at startup and logs `WebUI self-check: OK` (or
 | `/api/switch/stats` | GET | Switch-tuning stats (global + per-channel) |
 | `/api/switch/settings` | POST | Global defaults and/or per-channel override (`{global, ref, no_latency, zap_wait, probesize}`) |
 | `/api/switch/reset` | POST | Reset learned values/stats (`{ref}` or all) |
+| `/api/switch/analyze` | POST | Derive tuning suggestions from the collected statistics. `{"apply": false}` returns a preview, `{"apply": true}` writes the per-channel overrides |
+| `/api/usage/stats` | GET | Aggregated usage report (devices, channels, programmes, interfaces, hours/weekdays) |
+| `/api/usage/reset` | POST | Clear the usage store |
 | `/api/logs` | GET | Live logs (`?level=INFO&since=<unix>&n=100`) |
 | `/api/logs/history` | GET | Historical logs from disk (`?hours=6`) |
 
@@ -270,6 +330,7 @@ e2proxy can impersonate an Enigma2 receiver on its **standard ports** so any nat
 | `/data/api_access.log` | API access log |
 | `/data/epg_cache.xml` | EPG disk cache |
 | `/data/switch_stats.json` | Per-channel switch tuning + zap/start statistics |
+| `/data/usage_stats.json` | Aggregated usage report (devices, channels, programmes, interfaces) |
 | `/data/tmdb_cache.json` | TMDB poster cache |
 | `/data/tvdb_cache.json` | TVDB series cache |
 | `/data/logos/` | Channel logo cache |
@@ -277,14 +338,28 @@ e2proxy can impersonate an Enigma2 receiver on its **standard ports** so any nat
 
 ## Update
 
-```bash
-# Copy new version and restart
-scp e2proxy.py user@server:~/e2proxy/
-docker compose -f ~/e2proxy/docker-compose.e2proxy.yml restart
+Never copy an unverified file over a running deployment — run the self-check first and
+abort on failure, so a broken build cannot replace a working one:
 
-# Verify
+```bash
+scp e2proxy.py user@server:~/e2proxy.py
+
+ssh user@server '
+  set -e
+  SC=$(mktemp -d)
+  python3 -m py_compile ~/e2proxy.py
+  E2PROXY_DATA_DIR="$SC" python3 ~/e2proxy.py --selfcheck
+  cp ~/e2proxy/e2proxy.py ~/e2proxy/e2proxy.py.bak.$(date +%Y%m%d-%H%M%S)
+  cp ~/e2proxy.py ~/e2proxy/e2proxy.py
+  docker compose -f ~/e2proxy/docker-compose.e2proxy.yml restart
+'
+
+# Verify — the build id must match the one you deployed
 curl -s http://server:8888/api/version
 ```
+
+The build id is also visible in the UI under Settings → About and in the Help page header,
+so you can confirm a rollout without shell access.
 
 ## License
 

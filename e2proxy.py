@@ -32,20 +32,21 @@ import re
 import json
 import signal
 import copy
+import math
 import struct
 import gzip
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 # ── Pfade ─────────────────────────────────────────────────
 # Datenpfad: via Env-Variable überschreibbar (für Docker)
 DATA_DIR       = os.environ.get("E2PROXY_DATA_DIR", "/var/lib/e2proxy")
-VERSION        = "4.3"   # Offizielle Version — nur beim Pull Request erhöhen (major/minor)
+VERSION        = "4.4"   # Offizielle Version — nur beim Pull Request erhöhen (major/minor)
 # ── Interne Build-/Versionskennung ────────────────────────
 # Identifiziert eindeutig den ausgerollten Branch/Stand bei Tests, OHNE die
 # offizielle VERSION zu verändern (die steigt erst beim PR). Bei jedem Test-
 # Rollout eines neuen Standes BUILD_SEQ erhöhen.
-BUILD_BRANCH     = "feature/dreamplayer-recordings"
-BUILD_SEQ        = "c3395c34"
+BUILD_BRANCH     = "feature/switch-analyze"
+BUILD_SEQ        = "6ff20bfa"
 INTERNAL_VERSION = f"{VERSION}+{BUILD_BRANCH.split('/')[-1]}.{BUILD_SEQ}"
 CONFIG_FILE    = f"{DATA_DIR}/config.json"
 FAVORITES_FILE = f"{DATA_DIR}/favorites.json"
@@ -714,6 +715,50 @@ _SWITCH_RETRIES_DEFAULT = 2          # zusätzliche ffmpeg-Startversuche
 _NOLAT_FAIL_THRESHOLD   = 3          # ab so vielen Fehlern Probesize erhöhen
 _PROBE_MAX              = 15000000   # Obergrenze für gelernten Probesize
 
+# ── Analyse (Profil-Empfehlungen aus der Statistik) ───────
+# Statt einer festen Fehlerquote wird das Wilson-Score-Konfidenzintervall
+# benutzt. Grund: eine rohe Quote ignoriert die Stichprobengröße — 1 Fehler
+# aus 2 Versuchen (50%) sieht dramatischer aus als 4 aus 43 (9%), obwohl nur
+# Letzteres belastbar ist. Das Intervall trennt Rauschen von echter Evidenz:
+#   • Untergrenze hoch  → gesichert zu viele Fehler  → verschärfen
+#   • Obergrenze niedrig → gesichert stabil          → lockern
+_ANALYZE_MIN_STARTS    = 10          # min. Stream-Starts für Start-Regeln
+_ANALYZE_MIN_ZAPS      = 10          # min. Zaps für Zap-Regeln
+_ANALYZE_TIGHTEN_LO    = 0.02        # Wilson-Untergrenze, ab der verschärft wird
+_ANALYZE_LOOSEN_HI     = 0.10        # Wilson-Obergrenze, unter der gelockert wird
+_ANALYZE_Z             = 1.96        # 95%-Konfidenz
+_ANALYZE_ZAP_WAIT_STEP = 0.5         # Schrittweite Zap-Wait
+_ANALYZE_ZAP_WAIT_MAX  = 3.0         # Obergrenze empfohlener Zap-Wait
+_ANALYZE_MIN_SAMPLES   = _ANALYZE_MIN_STARTS   # Rückwärtskompatibler Alias
+
+
+def _fmt_ps(n):
+    """Probesize kompakt und sprachneutral (die UI-Tabelle formatiert lokalisiert,
+    darum hier keine Tausenderpunkte, die je nach Sprache anders aussehen)."""
+    n = int(n or 0)
+    if n >= 1_000_000 and n % 100_000 == 0:
+        return f"{n / 1_000_000:g}M"
+    if n >= 1_000 and n % 1_000 == 0:
+        return f"{n // 1_000}k"
+    return str(n)
+
+def wilson_interval(fails, total, z=_ANALYZE_Z):
+    """Wilson-Score-Intervall für eine Fehlerquote.
+
+    Liefert (untergrenze, obergrenze). Bei total=0 → (0.0, 1.0), also
+    'wir wissen nichts'. Robust auch bei 0 Fehlern und kleinen Stichproben
+    (anders als die normale Approximation, die dort 0±0 liefert).
+    """
+    n = int(total or 0)
+    if n <= 0:
+        return 0.0, 1.0
+    p = float(fails) / n
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    center = (p + z2 / (2 * n)) / denom
+    margin = (z / denom) * math.sqrt(p * (1 - p) / n + z2 / (4 * n * n))
+    return max(0.0, center - margin), min(1.0, center + margin)
+
 def get_switch_global():
     """Globale Umschalt-Defaults aus der Config (mit Fallbacks)."""
     c = get_config()
@@ -884,6 +929,510 @@ def reset_switch_stats(service_ref=None):
         else:
             stats.pop(_norm_ref(service_ref), None)
         _save_switch_stats()
+
+
+def analyze_switch_stats(apply=False, min_samples=None):
+    """Leitet aus der gesammelten Statistik pro Sender ein empfohlenes
+    Umschalt-Profil ab (no_latency / zap_wait / probesize).
+
+    Bewertet wird nicht die rohe Fehlerquote, sondern das Wilson-Score-
+    Konfidenzintervall — dadurch zählt Evidenz statt Zufall:
+      • Untergrenze ≥ 2%  → gesichert zu viele Fehler → verschärfen
+        (Probesize hoch; am Limit stattdessen NoLatency aus)
+      • Obergrenze ≤ 10%  → gesichert stabil → lockern
+        (Probesize senken bzw. NoLatency wieder an)
+    Zap- und Start-Regeln haben getrennte Mindest-Stichproben, damit eine
+    Start-Regel nicht auf Basis von Zap-Zählern feuert.
+
+    Zusätzlich wird die Nutzung (Sessions/Sehdauer) als Exposure ausgewiesen:
+    wer viel schaut, sammelt zwangsläufig mehr absolute Fehler — verglichen
+    werden deshalb Raten, nicht Summen.
+
+    apply=False liefert nur Empfehlungen (Dry-Run). apply=True setzt die
+    empfohlenen Per-Sender-Overrides.
+    """
+    g = get_switch_global()
+    min_starts = int(min_samples) if min_samples else _ANALYZE_MIN_STARTS
+    min_zaps   = int(min_samples) if min_samples else _ANALYZE_MIN_ZAPS
+    usage = get_usage_snapshot().get("channels", {})
+    recs = []
+    with _switch_stats_lock:
+        stats = _load_switch_stats()
+        for ref, e in stats.items():
+            z = e.get("zap", {}) or {}
+            s = e.get("start", {}) or {}
+            z_fail, s_fail = z.get("fail", 0), s.get("fail", 0)
+            zt = z.get("ok", 0) + z_fail
+            st = s.get("ok", 0) + s_fail
+
+            cur_nl = g["no_latency"] if e.get("no_latency") is None else bool(e.get("no_latency"))
+            cur_zw = g["zap_wait"]   if e.get("zap_wait")   is None else float(e.get("zap_wait"))
+            cur_ps = e.get("probesize")
+            eff_ps = int(cur_ps) if cur_ps else (g["nolat_probesize"] if cur_nl else g["probe_default"])
+
+            s_lo, s_hi = wilson_interval(s_fail, st)
+            z_lo, z_hi = wilson_interval(z_fail, zt)
+            sfr = (s_fail / st) if st else 0.0
+            zfr = (z_fail / zt) if zt else 0.0
+
+            rec_nl, rec_zw, rec_ps = cur_nl, cur_zw, cur_ps
+            reasons = []
+
+            # ── NoLatency / Probesize (nur mit genug Stream-Starts) ──
+            if st >= min_starts:
+                if s_lo >= _ANALYZE_TIGHTEN_LO:
+                    if cur_nl and eff_ps < _PROBE_MAX:
+                        rec_ps = min(_PROBE_MAX, int(eff_ps * 2))
+                        reasons.append(
+                            f"{s_fail}/{st} Start-Fehler ({sfr*100:.0f}%, gesichert "
+                            f"≥{s_lo*100:.1f}%) → Probesize {_fmt_ps(eff_ps)}→{_fmt_ps(rec_ps)}")
+                    elif cur_nl:
+                        rec_nl, rec_ps = False, None
+                        reasons.append(
+                            f"{s_fail}/{st} Start-Fehler ({sfr*100:.0f}%) bei max. "
+                            f"Probesize → NoLatency aus")
+                    elif rec_zw < _ANALYZE_ZAP_WAIT_MAX:
+                        # NoLatency ist bereits aus und der Probesize am Limit —
+                        # der einzige verbleibende Hebel ist mehr Settle-Zeit
+                        # für den Receiver, bevor ffmpeg zu lesen beginnt.
+                        rec_zw = min(_ANALYZE_ZAP_WAIT_MAX,
+                                     round(cur_zw + _ANALYZE_ZAP_WAIT_STEP, 1))
+                        reasons.append(
+                            f"{s_fail}/{st} Start-Fehler ({sfr*100:.0f}%) trotz vollem "
+                            f"Probing → Zap-Wait {cur_zw}→{rec_zw}s")
+                elif s_hi <= _ANALYZE_LOOSEN_HI:
+                    if not cur_nl:
+                        rec_nl, rec_ps = True, None
+                        reasons.append(
+                            f"{st}× Start, {s_fail} Fehler (gesichert ≤{s_hi*100:.1f}%) "
+                            f"→ NoLatency an")
+                    elif cur_ps and eff_ps > g["nolat_probesize"]:
+                        new = max(g["nolat_probesize"], int(eff_ps / 2))
+                        rec_ps = None if new <= g["nolat_probesize"] else new
+                        reasons.append(
+                            f"stabil ({st}× Start, gesichert ≤{s_hi*100:.1f}% Fehler) "
+                            f"→ Probesize {_fmt_ps(eff_ps)}→{_fmt_ps(new)}")
+
+            # ── Zap-Wait (nur mit genug Zaps) ────────────────
+            if zt >= min_zaps:
+                if z_lo >= _ANALYZE_TIGHTEN_LO:
+                    new_zw = min(_ANALYZE_ZAP_WAIT_MAX, round(cur_zw + _ANALYZE_ZAP_WAIT_STEP, 1))
+                    if new_zw > cur_zw:
+                        rec_zw = new_zw
+                        reasons.append(
+                            f"{z_fail}/{zt} Zap-Fehler ({zfr*100:.0f}%, gesichert "
+                            f"≥{z_lo*100:.1f}%) → Zap-Wait {cur_zw}→{new_zw}s")
+                elif z_hi <= _ANALYZE_LOOSEN_HI and cur_zw > g["zap_wait"]:
+                    rec_zw = max(g["zap_wait"], round(cur_zw - _ANALYZE_ZAP_WAIT_STEP, 1))
+                    reasons.append(
+                        f"{zt}× Zap, {z_fail} Fehler → Zap-Wait {cur_zw}→{rec_zw}s")
+
+            if rec_nl == cur_nl and rec_zw == cur_zw and (rec_ps or 0) == (cur_ps or 0):
+                continue
+
+            if rec_ps is not None:
+                ps_apply = int(rec_ps)
+            elif cur_ps:
+                ps_apply = 0          # gelernten Override löschen
+            else:
+                ps_apply = None       # keine Änderung
+            rec_eff_ps = int(rec_ps) if rec_ps else (g["nolat_probesize"] if rec_nl else g["probe_default"])
+
+            uc = usage.get(_norm_ref(ref), {})
+            watch_sec = uc.get("seconds", 0)
+            recs.append({
+                "ref": ref,
+                "name": e.get("name") or ref[:40],
+                "zap_total": zt, "start_total": st,
+                "samples": max(zt, st),
+                "zap_fail_rate": round(zfr, 3),
+                "start_fail_rate": round(sfr, 3),
+                "start_fail_lo": round(s_lo, 4), "start_fail_hi": round(s_hi, 4),
+                "watch_sessions": uc.get("sessions", 0),
+                "watch_seconds": watch_sec,
+                "watch_human": _fmt_duration(watch_sec),
+                "fails_per_hour": (round(s_fail / (watch_sec / 3600.0), 2)
+                                   if watch_sec >= 600 else None),
+                "current":     {"no_latency": cur_nl, "zap_wait": cur_zw, "probesize": eff_ps},
+                "recommended": {"no_latency": rec_nl, "zap_wait": rec_zw, "probesize": rec_eff_ps},
+                "reasons": reasons,
+                "_apply": {"no_latency": rec_nl, "zap_wait": rec_zw, "probesize": ps_apply},
+            })
+
+    recs.sort(key=lambda r: r["start_total"] + r["zap_total"], reverse=True)
+    applied = 0
+    if apply:
+        for r in recs:
+            a  = r["_apply"]
+            nl = None if a["no_latency"] == g["no_latency"] else a["no_latency"]
+            zw = None if abs(a["zap_wait"] - g["zap_wait"]) < 1e-6 else a["zap_wait"]
+            set_switch_override(r["ref"], no_latency=nl, zap_wait=zw,
+                                probesize=a["probesize"], channel_name=r["name"])
+            applied += 1
+        log.info(f"Switch-Analyse angewendet: {applied} Sender-Profile aktualisiert")
+
+    for r in recs:
+        r.pop("_apply", None)
+    return {"min_samples": min_starts, "min_starts": min_starts, "min_zaps": min_zaps,
+            "count": len(recs), "applied": applied, "recommendations": recs}
+
+
+# ── Nutzungsstatistik (Usage / Auswertung) ────────────────
+# Erfasst, WIE der e2proxy tatsächlich benutzt wird: welches Gerät streamt,
+# welcher Sender wird geschaut, welche Sendungen wiederholt sich angesehen
+# werden (→ Aufnahme-Vorschläge) und welche Schnittstellen wie oft laufen.
+#
+# Bewusst nur AGGREGIERTE Zähler (kein Roh-Eventlog): die Datei bleibt klein
+# und es entsteht keine minutengenaue Verlaufsakte. Die Sehdauer dient
+# zusätzlich als Exposure-Maß für die Umschalt-Analyse (mehr Nutzung → mehr
+# absolute Fehler; erst die Normalisierung macht Sender vergleichbar).
+
+USAGE_STATS_FILE = f"{DATA_DIR}/usage_stats.json"
+
+_USAGE_MIN_SESSION_SEC = 5      # kürzere Zugriffe = Probe/Zapping, nicht "geschaut"
+_USAGE_MAX_PROGRAMS    = 400    # Obergrenze Sendungs-Aggregat (älteste fliegen raus)
+
+_usage_lock = threading.Lock()
+_usage = None
+_usage_dirty = [False]
+
+def _usage_empty():
+    return {
+        "since": datetime.now().isoformat(timespec="seconds"),
+        "channels": {}, "devices": {}, "interfaces": {},
+        "endpoints": {}, "programs": {},
+        "hours": {}, "weekday": {},
+        "totals": {"sessions": 0, "seconds": 0, "bytes": 0},
+    }
+
+def _load_usage():
+    global _usage
+    if _usage is not None:
+        return _usage
+    try:
+        if os.path.exists(USAGE_STATS_FILE):
+            with open(USAGE_STATS_FILE, encoding="utf-8") as f:
+                _usage = json.load(f)
+            for k, v in _usage_empty().items():
+                _usage.setdefault(k, v)
+        else:
+            _usage = _usage_empty()
+    except Exception as e:
+        log.warning(f"Usage-Stats laden fehlgeschlagen: {e}")
+        _usage = _usage_empty()
+    return _usage
+
+def _save_usage():
+    try:
+        os.makedirs(os.path.dirname(USAGE_STATS_FILE), exist_ok=True)
+        tmp = USAGE_STATS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_usage, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, USAGE_STATS_FILE)
+        _usage_dirty[0] = False
+    except Exception as e:
+        log.warning(f"Usage-Stats speichern fehlgeschlagen: {e}")
+
+
+def _xmltv_to_ts(digits, offset=None):
+    """XMLTV-Zeitstempel ('20260729201500' + optional '+0000') → Unix-Zeit.
+    e2proxy schreibt UTC — ohne Offset-Auswertung läge der Titel-Lookup
+    um die lokale Zeitzone daneben."""
+    dt = datetime.strptime(digits, "%Y%m%d%H%M%S")
+    if offset:
+        sign = 1 if offset[0] == "+" else -1
+        delta = timedelta(hours=int(offset[1:3]), minutes=int(offset[3:5]))
+        return (dt.replace(tzinfo=timezone.utc) - sign * delta).timestamp()
+    return dt.timestamp()
+
+
+def epg_title_at(service_ref, ts):
+    """Titel der Sendung, die zum Zeitpunkt `ts` auf diesem Sender lief.
+
+    Liest den XMLTV-Cache (dieselbe Quelle wie EPG/Plex). Liefert "" wenn kein
+    EPG vorliegt — die Auswertung funktioniert dann ohne Sendungsbezug weiter.
+    """
+    try:
+        with epg_cache_lock:
+            xml = epg_cache.get("xml")
+        if not xml:
+            return ""
+        cid = _norm_ref(service_ref).replace(":", "_")
+        # Nur den relevanten Ausschnitt scannen — XMLTV kann sehr groß sein.
+        needle = f'channel="{cid}"'
+        pos = 0
+        best = ""
+        while True:
+            i = xml.find(needle, pos)
+            if i < 0:
+                break
+            s = xml.rfind("<programme", 0, i)
+            e = xml.find("</programme>", i)
+            if s < 0 or e < 0:
+                break
+            pos = e
+            block = xml[s:e]
+            m_start = re.search(r'start="(\d{14})\s*([+-]\d{4})?', block)
+            m_stop  = re.search(r'stop="(\d{14})\s*([+-]\d{4})?', block)
+            if not (m_start and m_stop):
+                continue
+            try:
+                t0 = _xmltv_to_ts(m_start.group(1), m_start.group(2))
+                t1 = _xmltv_to_ts(m_stop.group(1), m_stop.group(2))
+            except Exception:
+                continue
+            if t0 <= ts < t1:
+                m_t = re.search(r"<title[^>]*>(.*?)</title>", block, re.S)
+                if m_t:
+                    best = re.sub(r"<[^>]+>", "", m_t.group(1)).strip()
+                    best = (best.replace("&amp;", "&").replace("&lt;", "<")
+                                .replace("&gt;", ">").replace("&quot;", '"'))
+                break
+        return best[:120]
+    except Exception as e:
+        log.debug(f"EPG-Titel-Lookup fehlgeschlagen: {e}")
+        return ""
+
+
+def _device_key(ua, client_ip):
+    """Ein 'Gerät' = erkannte Software + IP. Genau genug, um Plex vom Handy zu
+    trennen, ohne einzelne Requests fingerprinten zu müssen."""
+    return f"{describe_client(ua)}@{client_ip or '?'}"
+
+
+def record_usage_session(service_ref, channel_name, user_agent="", client_ip="",
+                         profile="", source="stream", started_ts=None,
+                         duration_sec=0, bytes_sent=0):
+    """Eine abgeschlossene Stream-Sitzung in die Nutzungsstatistik einbuchen."""
+    try:
+        duration_sec = int(duration_sec or 0)
+        if duration_sec < _USAGE_MIN_SESSION_SEC:
+            return
+        bytes_sent = int(bytes_sent or 0)
+        started_ts = started_ts or time.time()
+        ref = _norm_ref(service_ref)
+        dt = datetime.fromtimestamp(started_ts)
+        dev = _device_key(user_agent, client_ip)
+        title = epg_title_at(ref, started_ts + duration_sec / 2)
+
+        with _usage_lock:
+            u = _load_usage()
+            t = u["totals"]
+            t["sessions"] += 1
+            t["seconds"] += duration_sec
+            t["bytes"]   += bytes_sent
+
+            c = u["channels"].setdefault(ref, {"name": channel_name or ref[:40],
+                                               "sessions": 0, "seconds": 0, "bytes": 0,
+                                               "last": None})
+            if channel_name:
+                c["name"] = channel_name
+            c["sessions"] += 1
+            c["seconds"]  += duration_sec
+            c["bytes"]    += bytes_sent
+            c["last"] = dt.isoformat(timespec="seconds")
+
+            d = u["devices"].setdefault(dev, {"label": describe_client(user_agent),
+                                              "ip": client_ip or "", "ua": (user_agent or "")[:120],
+                                              "sessions": 0, "seconds": 0, "bytes": 0,
+                                              "last": None, "profiles": {}})
+            d["sessions"] += 1
+            d["seconds"]  += duration_sec
+            d["bytes"]    += bytes_sent
+            d["last"] = dt.isoformat(timespec="seconds")
+            if profile:
+                d["profiles"][profile] = d["profiles"].get(profile, 0) + 1
+
+            i = u["interfaces"].setdefault(source, {"sessions": 0, "seconds": 0, "bytes": 0})
+            i["sessions"] += 1
+            i["seconds"]  += duration_sec
+            i["bytes"]    += bytes_sent
+
+            u["hours"][str(dt.hour)]      = u["hours"].get(str(dt.hour), 0) + duration_sec
+            u["weekday"][str(dt.weekday())] = u["weekday"].get(str(dt.weekday()), 0) + duration_sec
+
+            if title:
+                pk = f"{ref}|{title}"
+                p = u["programs"].setdefault(pk, {"ref": ref, "channel": channel_name or ref[:40],
+                                                  "title": title, "count": 0, "seconds": 0,
+                                                  "last": None, "slots": {}})
+                p["count"]   += 1
+                p["seconds"] += duration_sec
+                p["last"] = dt.isoformat(timespec="seconds")
+                slot = f"{dt.weekday()}-{dt.hour}"
+                p["slots"][slot] = p["slots"].get(slot, 0) + 1
+                if len(u["programs"]) > _USAGE_MAX_PROGRAMS:
+                    oldest = sorted(u["programs"].items(),
+                                    key=lambda kv: kv[1].get("last") or "")[:50]
+                    for k, _ in oldest:
+                        u["programs"].pop(k, None)
+            _save_usage()
+        log.debug(f"Usage: {channel_name} {duration_sec}s via {source} ({dev})")
+    except Exception as e:
+        log.debug(f"Usage-Erfassung fehlgeschlagen: {e}")
+
+
+def note_endpoint(category):
+    """Schnittstellen-Nutzung zählen (billig, im Speicher; Flush periodisch)."""
+    if not category:
+        return
+    try:
+        with _usage_lock:
+            u = _load_usage()
+            u["endpoints"][category] = u["endpoints"].get(category, 0) + 1
+            _usage_dirty[0] = True
+    except Exception:
+        pass
+
+
+def flush_usage_stats():
+    """Gepufferte Endpoint-Zähler auf Platte schreiben (periodisch/beim Beenden)."""
+    with _usage_lock:
+        if _usage_dirty[0] and _usage is not None:
+            _save_usage()
+
+
+def usage_flush_loop(interval=60):
+    """Schreibt die im Speicher gezählten Endpoint-Aufrufe periodisch weg.
+    Einzelne Requests sollen keine Datei-I/O auslösen."""
+    while True:
+        time.sleep(interval)
+        try:
+            flush_usage_stats()
+        except Exception as e:
+            log.debug(f"Usage-Flush fehlgeschlagen: {e}")
+
+
+def classify_endpoint(path, source="proxy"):
+    """Ordnet einen Request-Pfad einer Schnittstellen-Kategorie zu."""
+    p = (path or "").split("?")[0].lower().rstrip("/")
+    if source == "openwebif":
+        if "/picon" in p or p.endswith((".png", ".jpg", ".jpeg", ".gif", ".ico")):
+            return None                      # Bild-Rauschen nicht zählen
+        if "epg" in p:
+            return "OpenWebif: EPG"
+        if "getservices" in p or "bouquet" in p or "getallservices" in p:
+            return "OpenWebif: Senderliste"
+        if "movielist" in p:
+            return "OpenWebif: Aufnahmen"
+        if p.startswith("/1:") or p.startswith("/live"):
+            return "OpenWebif: Streaming"
+        return "OpenWebif: sonstige"
+    if p.startswith("/stream"):
+        return "Streaming (/stream)"
+    if p in ("/discover.json", "/lineup.json", "/lineup_status.json",
+             "/lineup_post", "/device.xml", "/capability", "/auto"):
+        return "Plex/HDHomeRun"
+    if p.startswith("/playlist") or p.endswith(".m3u"):
+        return "M3U-Playlist"
+    if p.startswith("/epg.xml") or p.startswith("/xmltv"):
+        return "EPG (XMLTV)"
+    if p.startswith("/api/"):
+        return "REST-API"
+    if p.startswith("/picon") or p.startswith("/logos") or p.startswith("/logo") \
+            or p.endswith((".png", ".jpg", ".ico", ".css", ".js")):
+        return None
+    if p in ("", "/settings", "/favorites", "/epg", "/help", "/usage"):
+        return "Web-UI"
+    return None
+
+
+def get_usage_snapshot():
+    with _usage_lock:
+        return copy.deepcopy(_load_usage())
+
+
+def reset_usage_stats():
+    global _usage
+    with _usage_lock:
+        _usage = _usage_empty()
+        _save_usage()
+
+
+def _fmt_duration(sec):
+    sec = int(sec or 0)
+    h, m = divmod(sec // 60, 60)
+    if h >= 24:
+        return f"{h // 24}d {h % 24}h"
+    return f"{h}h {m:02d}m" if h else f"{m} Min"
+
+
+_WEEKDAYS_DE = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+
+def build_usage_report(top=10):
+    """Wertet die Rohzähler zu den vier Kernfragen aus."""
+    u = get_usage_snapshot()
+    tot = u.get("totals", {})
+
+    channels = sorted(
+        ({"ref": r, **v} for r, v in u.get("channels", {}).items()),
+        key=lambda c: c.get("seconds", 0), reverse=True)
+    devices = sorted(
+        ({"key": k, **v} for k, v in u.get("devices", {}).items()),
+        key=lambda d: d.get("seconds", 0), reverse=True)
+    interfaces = sorted(
+        ({"name": k, **v} for k, v in u.get("interfaces", {}).items()),
+        key=lambda i: i.get("seconds", 0), reverse=True)
+    endpoints = sorted(
+        ({"name": k, "count": v} for k, v in u.get("endpoints", {}).items()),
+        key=lambda e: e["count"], reverse=True)
+
+    total_sec = max(1, tot.get("seconds", 0))
+    for c in channels:
+        c["share"]        = round(100.0 * c.get("seconds", 0) / total_sec, 1)
+        c["duration_human"] = _fmt_duration(c.get("seconds", 0))
+    for d in devices:
+        d["share"]        = round(100.0 * d.get("seconds", 0) / total_sec, 1)
+        d["duration_human"] = _fmt_duration(d.get("seconds", 0))
+        d["top_profile"]  = max(d.get("profiles", {}).items(),
+                                key=lambda kv: kv[1])[0] if d.get("profiles") else ""
+    for i in interfaces:
+        i["duration_human"] = _fmt_duration(i.get("seconds", 0))
+
+    # Aufnahme-Vorschläge: mehrfach geschaute Sendungen, gewichtet nach
+    # Häufigkeit UND Sehdauer; zusätzlich der typische Sendeplatz.
+    suggestions = []
+    for p in u.get("programs", {}).values():
+        if p.get("count", 0) < 2:
+            continue
+        slots = p.get("slots", {})
+        slot_txt = ""
+        if slots:
+            best_slot, hits = max(slots.items(), key=lambda kv: kv[1])
+            try:
+                wd, hr = best_slot.split("-")
+                slot_txt = f"{_WEEKDAYS_DE[int(wd)]} ~{int(hr):02d}:00"
+                if hits >= 2:
+                    slot_txt += f" ({hits}×)"
+            except Exception:
+                slot_txt = ""
+        suggestions.append({
+            "title": p.get("title", ""), "channel": p.get("channel", ""),
+            "ref": p.get("ref", ""), "count": p.get("count", 0),
+            "seconds": p.get("seconds", 0),
+            "duration_human": _fmt_duration(p.get("seconds", 0)),
+            "slot": slot_txt, "last": p.get("last"),
+            "score": round(p.get("count", 0) * (p.get("seconds", 0) / 3600.0), 2),
+        })
+    suggestions.sort(key=lambda s: s["score"], reverse=True)
+
+    return {
+        "since": u.get("since"),
+        "totals": {
+            "sessions": tot.get("sessions", 0),
+            "seconds":  tot.get("seconds", 0),
+            "bytes":    tot.get("bytes", 0),
+            "duration_human": _fmt_duration(tot.get("seconds", 0)),
+            "bytes_human":    human_bytes(tot.get("bytes", 0)),
+        },
+        "channels":    channels[:top],
+        "devices":     devices[:top],
+        "interfaces":  interfaces,
+        "endpoints":   endpoints[:top],
+        "suggestions": suggestions[:top],
+        "hours":       u.get("hours", {}),
+        "weekday":     u.get("weekday", {}),
+    }
 
 
 # ── Favorites Management ──────────────────────────────────
@@ -4424,6 +4973,24 @@ const I18N = {
     "set.switch_zapwait": "Zap wait (s)", "set.switch_monitor": "Monitor window (s)",
     "set.switch_retries": "Max restarts", "set.switch_nolat_probe": "NoLatency probesize",
     "set.switch_fail_thresh": "Fail threshold (probesize↑)", "set.switch_reset_all": "Reset all",
+    "set.switch_analyze": "Analyze", "set.switch_analyze_apply": "Apply",
+    // Usage / Auswertung
+    "set.tab_usage": "Usage",
+    "usage.title": "Usage report", "usage.reset": "Reset",
+    "usage.hint": "Aggregated usage since tracking started: which device streams the most, which channel is watched most often, which interfaces are used.",
+    "usage.top_channels": "Most watched channels", "usage.top_devices": "Device usage",
+    "usage.rec_suggest": "Recording suggestions",
+    "usage.rec_suggest_hint": "Programmes watched more than once — a recording (or series timer) is probably worthwhile here.",
+    "usage.interfaces": "Interface usage", "usage.by_hour": "Usage by time of day",
+    "usage.sessions": "Sessions", "usage.watchtime": "Watch time", "usage.volume": "Data volume",
+    "usage.since": "Since", "usage.channel": "Channel", "usage.share": "Share",
+    "usage.last": "Last", "usage.device": "Device", "usage.profile": "Profile",
+    "usage.program": "Programme", "usage.times": "Watched", "usage.slot": "Time slot",
+    "usage.interface": "Interface", "usage.endpoint": "Category", "usage.calls": "Calls",
+    "usage.if_stream": "Streaming interfaces", "usage.if_api": "API calls by category",
+    "usage.nodata": "No data yet — the report appears as soon as streaming happens.",
+    "usage.no_suggest": "No programme has been watched more than once yet — no suggestions (yet).",
+    "usage.reset_confirm": "Really reset the entire usage statistics?",
     "set.active_recordings": "Active Recordings", "set.quick_rec": "Quick Record",
     "set.quick_rec_hint": "Select channel → current program shown → start recording.",
     "set.start_rec": "▶ Start recording", "set.receivers_card": "Receivers",
@@ -4591,6 +5158,24 @@ const I18N = {
     "set.switch_zapwait": "Zap-Wartezeit (s)", "set.switch_monitor": "Monitor-Fenster (s)",
     "set.switch_retries": "Max. Neustarts", "set.switch_nolat_probe": "NoLatency Probesize",
     "set.switch_fail_thresh": "Fehler-Schwelle (Probesize↑)", "set.switch_reset_all": "Reset alle",
+    "set.switch_analyze": "Analysieren", "set.switch_analyze_apply": "Anwenden",
+    // Usage / Auswertung
+    "set.tab_usage": "Auswertung",
+    "usage.title": "Nutzungs-Auswertung", "usage.reset": "Zurücksetzen",
+    "usage.hint": "Aggregierte Nutzung seit Aufzeichnungsbeginn: welches Gerät streamt am meisten, welcher Sender wird am häufigsten geschaut, welche Schnittstellen werden verwendet.",
+    "usage.top_channels": "Meistgeschaute Sender", "usage.top_devices": "Geräte-Nutzung",
+    "usage.rec_suggest": "Aufnahme-Vorschläge",
+    "usage.rec_suggest_hint": "Sendungen, die mehrfach geschaut wurden — eine Aufnahme (bzw. Serien-Timer) lohnt sich hier vermutlich.",
+    "usage.interfaces": "Schnittstellen-Nutzung", "usage.by_hour": "Nutzung nach Tageszeit",
+    "usage.sessions": "Sitzungen", "usage.watchtime": "Sehdauer", "usage.volume": "Datenvolumen",
+    "usage.since": "Seit", "usage.channel": "Sender", "usage.share": "Anteil",
+    "usage.last": "Zuletzt", "usage.device": "Gerät", "usage.profile": "Profil",
+    "usage.program": "Sendung", "usage.times": "Gesehen", "usage.slot": "Sendeplatz",
+    "usage.interface": "Schnittstelle", "usage.endpoint": "Kategorie", "usage.calls": "Aufrufe",
+    "usage.if_stream": "Streaming-Schnittstellen", "usage.if_api": "API-Aufrufe nach Kategorie",
+    "usage.nodata": "Noch keine Daten — sobald gestreamt wird, erscheint hier die Auswertung.",
+    "usage.no_suggest": "Noch keine Sendung wurde mehrfach geschaut — daher (noch) keine Vorschläge.",
+    "usage.reset_confirm": "Wirklich die gesamte Nutzungsstatistik zurücksetzen?",
     "set.active_recordings": "Aktive Aufnahmen", "set.quick_rec": "Schnell-Aufnahme",
     "set.quick_rec_hint": "Kanal wählen → aktuelle Sendung wird angezeigt → Aufnahme starten.",
     "set.start_rec": "▶ Aufnahme starten", "set.receivers_card": "Receiver",
@@ -4852,16 +5437,139 @@ import re as _re_selfcheck
 
 _SCRIPT_RE = _re_selfcheck.compile(r"<script\b[^>]*>(.*?)</script>", _re_selfcheck.S | _re_selfcheck.I)
 
+# Attribut-Start in eingebettetem HTML, z.B.  onclick="  oder  style='
+_ATTR_RE = _re_selfcheck.compile(r"""([A-Za-z_:][-\w:.]*)\s*=\s*(["'])""")
+
+# Nach einem String-Literal legal folgende Wort-Operatoren ('x' in obj)
+_STR_FOLLOW_OK = {"in", "instanceof"}
+
+def _token_after_string(code, i, n):
+    """Nächstes signifikantes Zeichen nach einem String-Literal auf DERSELBEN
+    Zeile (Zeilenumbruch → ASI, dann ist alles erlaubt). Liefert (char, wort)."""
+    while i < n and code[i] in " \t":
+        i += 1
+    if i >= n or code[i] == "\n":
+        return None, ""
+    c = code[i]
+    if c.isalpha() or c == "_" or c == "$":
+        j = i
+        while j < n and (code[j].isalnum() or code[j] in "_$"):
+            j += 1
+        return c, code[i:j]
+    return c, ""
+
+
+def _skip_template(code, i, n, line):
+    """Überspringt ein Template-Literal ab code[i] == '`' — inklusive
+    ${…}-Ausdrücken, die ihrerseits Strings und verschachtelte Template-
+    Literale enthalten dürfen. Liefert (index_nach_backtick, zeile)."""
+    i += 1
+    while i < n:
+        c = code[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "\n":
+            line += 1
+            i += 1
+            continue
+        if c == "`":
+            return i + 1, line
+        if c == "$" and i + 1 < n and code[i + 1] == "{":
+            i, line = _skip_template_expr(code, i + 2, n, line)
+            continue
+        i += 1
+    return i, line
+
+
+def _skip_template_expr(code, i, n, line):
+    """Überspringt den Ausdruck in ${…} bis zur passenden schließenden Klammer."""
+    depth = 1
+    prev_sig = ""
+    while i < n:
+        c = code[i]
+        if c == "\n":
+            line += 1
+            i += 1
+            continue
+        if c == "`":
+            i, line = _skip_template(code, i, n, line)
+            prev_sig = "`"
+            continue
+        if c in "'\"":
+            q = c
+            i += 1
+            while i < n and code[i] != "\n":
+                if code[i] == "\\":
+                    i += 2
+                    continue
+                if code[i] == q:
+                    i += 1
+                    break
+                i += 1
+            prev_sig = q
+            continue
+        if c == "/" and i + 1 < n and code[i + 1] == "/":
+            j = code.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if c == "/" and i + 1 < n and code[i + 1] == "*":
+            j = code.find("*/", i + 2)
+            if j < 0:
+                return n, line
+            line += code.count("\n", i, j)
+            i = j + 2
+            continue
+        if c == "/" and (prev_sig in "(,=:[!&|?{};~+-*%<>^" or prev_sig == ""):
+            # Regex-Literal (z.B. .replace(/'/g, …)) — bis zum schließenden '/'
+            i += 1
+            in_class = False
+            while i < n and code[i] != "\n":
+                if code[i] == "\\":
+                    i += 2
+                    continue
+                if code[i] == "[":
+                    in_class = True
+                elif code[i] == "]":
+                    in_class = False
+                elif code[i] == "/" and not in_class:
+                    i += 1
+                    break
+                i += 1
+            prev_sig = "/"
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1, line
+        if not c.isspace():
+            prev_sig = c
+        i += 1
+    return i, line
+
 def _scan_js_broken_strings(code):
     """Return a list of (line_no, reason, snippet) for '/" string literals that
     are not closed before a raw newline. Handles // and /* */ comments, backtick
-    template literals (which may legally span lines) and /regex/ literals."""
+    template literals (which may legally span lines) and /regex/ literals.
+
+    Zusätzlich (seit v4.4) werden zwei weitere Fehlerklassen erkannt, die schon
+    einmal eine tote UI verursacht haben:
+      • unbalancierte (), [], {} — z.B. wenn eine `function x() {`-Zeile beim
+        Editieren verloren geht und ein Rumpf frei im Script hängt
+      • verschachtelte Quotes in eingebettetem HTML (siehe _html_attr_left_open)
+    """
     problems = []
     i, n = 0, len(code)
     line = 1
     quote = None          # currently open ' or " string
     q_start_line = 0
+    q_start_idx = 0
     prev_sig = ""         # last significant char in normal code (for regex/division)
+    depth = {"(": 0, "[": 0, "{": 0}
+    _closer = {")": "(", "]": "[", "}": "{"}
+    neg_reported = set()
     while i < n:
         c = code[i]
         if c == "\n":
@@ -4878,6 +5586,15 @@ def _scan_js_broken_strings(code):
                 i += 2
                 continue
             if c == quote:
+                nxt, word = _token_after_string(code, i + 1, n)
+                if nxt is not None and (
+                    (nxt.isalpha() or nxt in "_$") and word not in _STR_FOLLOW_OK
+                    or nxt.isdigit() or nxt in "'\"`"
+                ):
+                    problems.append((line,
+                                     f"string literal is followed directly by {(word or nxt)!r} "
+                                     f"without an operator (nested/escaped quote bug?)",
+                                     code[q_start_idx:i][-60:]))
                 quote = None
             i += 1
             continue
@@ -4912,28 +5629,241 @@ def _scan_js_broken_strings(code):
             prev_sig = "/"
             continue
         if c == "`":            # template literal — may span lines legally
-            i += 1
-            while i < n:
-                if code[i] == "\\":
-                    i += 2
-                    continue
-                if code[i] == "\n":
-                    line += 1
-                elif code[i] == "`":
-                    i += 1
-                    break
-                i += 1
+            i, line = _skip_template(code, i, n, line)
             prev_sig = "`"
             continue
         if c in "'\"":
             quote = c
             q_start_line = line
+            q_start_idx = i + 1
             i += 1
+            continue
+        if c in depth:
+            depth[c] += 1
+        elif c in _closer:
+            o = _closer[c]
+            depth[o] -= 1
+            if depth[o] < 0 and o not in neg_reported:
+                neg_reported.add(o)
+                problems.append((line,
+                                 f"unbalanced {c!r} — more closing than opening {o!r} "
+                                 f"(a declaration line may have been deleted)",
+                                 code[max(0, i - 60):i].split("\n")[-1]))
+                depth[o] = 0
+        if not c.isspace():
+            prev_sig = c
+        i += 1
+    for o, d in depth.items():
+        if d > 0:
+            problems.append((line, f"unbalanced {o!r} — {d} never closed", ""))
+    return problems
+
+# ── Referenz-Prüfung: aufgerufene, aber nirgends definierte Funktionen ──
+# Der Syntax-Scan oben findet nur kaputte Zeichen. Ein Aufruf wie escHtml(…)
+# in einer Seite, die escHtml gar nicht ausliefert, ist syntaktisch perfekt und
+# stirbt erst zur Laufzeit — genau so ist der Auswertung-Tab beim ersten Anlauf
+# leer geblieben. Darum hier zusätzlich die Namen abgleichen.
+
+# Browser-/Sprach-Globals, die nie im Seiten-JS deklariert werden.
+_JS_GLOBALS = {
+    # Sprache
+    "if", "for", "while", "switch", "return", "catch", "function", "typeof", "new",
+    "await", "delete", "void", "throw", "else", "do", "try", "finally", "case",
+    "yield", "in", "of", "instanceof", "class", "extends", "super", "this", "async",
+    # Built-ins
+    "Object", "Array", "String", "Number", "Boolean", "Math", "JSON", "Date",
+    "RegExp", "Error", "TypeError", "Promise", "Map", "Set", "WeakMap", "WeakSet",
+    "Symbol", "BigInt", "Proxy", "Reflect", "Intl", "parseInt", "parseFloat",
+    "isNaN", "isFinite", "encodeURIComponent", "decodeURIComponent", "encodeURI",
+    "decodeURI", "escape", "unescape", "eval", "structuredClone",
+    # DOM / BOM
+    "window", "document", "console", "alert", "confirm", "prompt", "fetch",
+    "setTimeout", "setInterval", "clearTimeout", "clearInterval", "requestAnimationFrame",
+    "cancelAnimationFrame", "localStorage", "sessionStorage", "navigator", "location",
+    "history", "screen", "getComputedStyle", "matchMedia", "atob", "btoa",
+    "FormData", "URL", "URLSearchParams", "Blob", "File", "FileReader", "Image",
+    "Audio", "Event", "CustomEvent", "AbortController", "Headers", "Request",
+    "Response", "WebSocket", "EventSource", "IntersectionObserver", "MutationObserver",
+    "ResizeObserver", "Notification", "queueMicrotask", "reportError",
+    # CSS-Funktion in Style-Strings (var(--x)) und häufige Attribut-Namen
+    "var", "calc", "url", "rgb", "rgba", "hsl", "translate", "scale", "rotate",
+}
+
+_JS_IDENT = _re_selfcheck.compile(r"[A-Za-z_$][\w$]*")
+# Aufruf: name(  — aber nicht  obj.name(  und nicht  new Foo(
+_JS_CALL_RE = _re_selfcheck.compile(r"(?<![.\w$])([A-Za-z_$][\w$]*)\s*\(")
+_JS_DECL_RES = [
+    _re_selfcheck.compile(r"\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)"),       # function foo()
+    _re_selfcheck.compile(r"\bclass\s+([A-Za-z_$][\w$]*)"),                # class Foo
+    _re_selfcheck.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)"),    # const foo =
+    _re_selfcheck.compile(r"\bwindow\.([A-Za-z_$][\w$]*)\s*="),            # window.foo =
+    _re_selfcheck.compile(r"\bcatch\s*\(\s*([A-Za-z_$][\w$]*)"),           # catch (e)
+]
+# Parameterlisten: function f(a, b), (a, b) =>, a =>
+_JS_PARAMS_RES = [
+    _re_selfcheck.compile(r"\bfunction\s*\*?\s*[A-Za-z_$][\w$]*\s*\(([^)]*)\)"),
+    _re_selfcheck.compile(r"\bfunction\s*\(([^)]*)\)"),
+    _re_selfcheck.compile(r"\(([^()]*)\)\s*=>"),
+    _re_selfcheck.compile(r"(?<![.\w$])([A-Za-z_$][\w$]*)\s*=>"),
+]
+
+
+def _js_strip_literals(code):
+    """Blendet String-/Template-/Regex-Literale und Kommentare aus, damit die
+    Namensanalyse nicht über Text in Anführungszeichen stolpert. Länge und
+    Zeilenstruktur bleiben erhalten (Leerzeichen statt Inhalt)."""
+    out = list(code)
+    i, n = 0, len(code)
+    prev_sig = ""
+
+    def blank(a, b):
+        for k in range(a, min(b, n)):
+            if out[k] != "\n":
+                out[k] = " "
+
+    while i < n:
+        c = code[i]
+        if c == "/" and i + 1 < n and code[i + 1] == "/":
+            j = code.find("\n", i)
+            j = n if j < 0 else j
+            blank(i, j)
+            i = j
+            continue
+        if c == "/" and i + 1 < n and code[i + 1] == "*":
+            j = code.find("*/", i + 2)
+            if j < 0:
+                blank(i, n)
+                break
+            blank(i, j + 2)
+            i = j + 2
+            continue
+        if c in "'\"":
+            j = i + 1
+            while j < n:
+                if code[j] == "\\":
+                    j += 2
+                    continue
+                if code[j] == c or code[j] == "\n":
+                    break
+                j += 1
+            blank(i, j + 1)
+            i = j + 1
+            prev_sig = "'"
+            continue
+        if c == "`":
+            # Template-Literal: ${…} muss sichtbar bleiben (dort steht echter Code)
+            j = i + 1
+            blank(i, i + 1)
+            while j < n:
+                if code[j] == "\\":
+                    blank(j, j + 2)
+                    j += 2
+                    continue
+                if code[j] == "`":
+                    blank(j, j + 1)
+                    j += 1
+                    break
+                if code[j] == "$" and j + 1 < n and code[j + 1] == "{":
+                    depth = 1
+                    blank(j, j + 2)
+                    k = j + 2
+                    while k < n and depth:
+                        if code[k] == "{":
+                            depth += 1
+                        elif code[k] == "}":
+                            depth -= 1
+                            if not depth:
+                                blank(k, k + 1)
+                                break
+                        k += 1
+                    j = k + 1
+                    continue
+                blank(j, j + 1)
+                j += 1
+            i = j
+            prev_sig = "`"
+            continue
+        if c == "/" and (prev_sig in "(,=:[!&|?{};~+-*%<>^" or prev_sig == ""):
+            j = i + 1
+            in_class = False
+            while j < n and code[j] != "\n":
+                if code[j] == "\\":
+                    j += 2
+                    continue
+                if code[j] == "[":
+                    in_class = True
+                elif code[j] == "]":
+                    in_class = False
+                elif code[j] == "/" and not in_class:
+                    j += 1
+                    break
+                j += 1
+            blank(i, j)
+            i = j
+            prev_sig = "/"
             continue
         if not c.isspace():
             prev_sig = c
         i += 1
-    return problems
+    return "".join(out)
+
+
+def _js_declared_names(code):
+    """Alle Namen, die in diesem JS deklariert werden (Funktionen, Variablen,
+    Parameter, Klassen, window.X)."""
+    names = set()
+    for rx in _JS_DECL_RES:
+        names.update(rx.findall(code))
+    for rx in _JS_PARAMS_RES:
+        for grp in rx.findall(code):
+            for part in grp.split(","):
+                # Default-Werte, Rest/Spread und Destructuring auflösen
+                part = part.split("=")[0]
+                names.update(_JS_IDENT.findall(part))
+    # Destructuring-Deklarationen: const {a, b} = x  /  const [a, b] = y
+    for m in _re_selfcheck.finditer(r"\b(?:const|let|var)\s*[\{\[]([^\}\]]*)[\}\]]", code):
+        for part in m.group(1).split(","):
+            part = part.split(":")[-1].split("=")[0]
+            names.update(_JS_IDENT.findall(part))
+    return names
+
+
+def _scan_js_undefined_calls(code, extra_defined=frozenset()):
+    """Liefert [(name, zeile)] für Funktionen, die aufgerufen, aber weder im
+    Seiten-JS noch als Browser-Global definiert sind."""
+    stripped = _js_strip_literals(code)
+    defined = _js_declared_names(stripped) | set(extra_defined) | _JS_GLOBALS
+    seen = {}
+    for m in _JS_CALL_RE.finditer(stripped):
+        name = m.group(1)
+        if name in defined or name in seen:
+            continue
+        seen[name] = stripped.count("\n", 0, m.start()) + 1
+    return sorted(seen.items(), key=lambda kv: kv[1])
+
+
+_HTML_HANDLER_RE = _re_selfcheck.compile(
+    r'\bon(click|change|input|submit|keyup|keydown|keypress|focus|blur|mouseover|'
+    r'mouseout|dblclick|contextmenu)\s*=\s*"([^"]*)"', _re_selfcheck.I)
+
+
+def _scan_html_handler_calls(html, page_js):
+    """Liefert [(name, attribut)] für onclick="foo()"-Handler, deren Funktion
+    auf dieser Seite nicht existiert. Genau diese Klasse hat schon einmal alle
+    Settings-Tabs unklickbar gemacht."""
+    defined = _js_declared_names(_js_strip_literals(page_js)) | _JS_GLOBALS
+    bad = {}
+    for m in _HTML_HANDLER_RE.finditer(html):
+        attr, body = "on" + m.group(1).lower(), m.group(2)
+        # Handler-Body wie JS behandeln: Literale ausblenden, dann Aufrufe suchen
+        body_code = _js_strip_literals(body)
+        local = _js_declared_names(body_code)
+        for c in _JS_CALL_RE.finditer(body_code):
+            fn = c.group(1)
+            if fn not in defined and fn not in local and fn not in bad:
+                bad[fn] = attr
+    return sorted(bad.items())
+
 
 def webui_selfcheck():
     """Render every UI page and validate its embedded JavaScript. Returns a list
@@ -4956,11 +5886,23 @@ def webui_selfcheck():
         except Exception as e:
             problems.append(f"{name}: failed to render ({e})")
             continue
-        for si, m in enumerate(_SCRIPT_RE.finditer(html), 1):
-            for ln, reason, snippet in _scan_js_broken_strings(m.group(1)):
+        blocks = [m.group(1) for m in _SCRIPT_RE.finditer(html)]
+        for si, code in enumerate(blocks, 1):
+            for ln, reason, snippet in _scan_js_broken_strings(code):
                 problems.append(
                     f"{name}: <script> #{si} line ~{ln}: {reason} → ...{snippet.strip()!r}"
                 )
+        # Namensprüfung über ALLE Blöcke der Seite zusammen (ein Block darf
+        # eine Funktion aus einem anderen aufrufen).
+        alljs = "\n".join(blocks)
+        for fn, ln in _scan_js_undefined_calls(alljs):
+            problems.append(
+                f"{name}: JS line ~{ln}: calls {fn}() which is not defined on this page"
+            )
+        for fn, attr in _scan_html_handler_calls(html, alljs):
+            problems.append(
+                f"{name}: inline {attr} handler calls {fn}() which is not defined on this page"
+            )
     return problems
 
 
@@ -5441,6 +6383,7 @@ def build_help_ui():
       <h1 style="font-family:'JetBrains Mono',monospace;font-size:16px;color:var(--accent);margin:0">e2proxy — <span data-i18n="nav.help">Help</span></h1>
       <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--muted);margin-top:4px">
         Version <span style="color:var(--accent2)">{VERSION}</span>
+        <span style="color:var(--muted)" title="Interne Build-Kennung — wechselt bei jedem Test-Rollout">&nbsp;·&nbsp;Build {INTERNAL_VERSION}</span>
       </div>
     </div>
     <a class="btn" href="/" style="font-size:11px" data-i18n="nav.mainpage">← Main page</a>
@@ -6457,6 +7400,7 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
     <button class="tab-btn" onclick="switchTab('maintenance', this)">🔧 <span data-i18n="set.tab_maint">Maintenance</span></button>
     <button class="tab-btn" onclick="switchTab('epg', this)">📅 EPG</button>
     <button class="tab-btn" onclick="switchTab('recording', this)">📹 <span data-i18n="set.tab_rec">Recordings</span></button>
+    <button class="tab-btn" onclick="switchTab('usage', this)">📊 <span data-i18n="set.tab_usage">Auswertung</span></button>
     <button class="tab-btn" onclick="switchTab('help', this)">📖 <span data-i18n="set.tab_api">API</span> / <span data-i18n="nav.help">Help</span></button>
   </div>
 
@@ -6528,57 +7472,6 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
         <button class="btn btn-primary" onclick="saveRecordingSettings()">💾 <span data-i18n="common.save">Save</span></button>
         <span id="rec-save-fb" style="font-size:12px;font-family:monospace;opacity:0;transition:opacity 0.2s"></span>
       </div>
-    </div>
-
-    <div class="card">
-      <div class="card-title">⚡ <span data-i18n="set.switch_tuning">Umschalt-Tuning</span></div>
-      <p class="card-desc" data-i18n="set.switch_hint">Beschleunigt das Umschalten (z.B. Plex). NoLatency startet ffmpeg mit minimalem Probing; die Zap-Wartezeit ist die Pause nach dem Umschalten. Werte gelten global als Default — pro Sender wird automatisch gelernt (siehe Tabelle).</p>
-      <table style="font-size:12px;border-collapse:collapse">
-        <tbody>
-          <tr>
-            <td style="color:var(--muted);padding:6px 12px 6px 0"><span data-i18n="set.switch_nolatency">NoLatency (global)</span></td>
-            <td>
-              <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text)">
-                <input type="checkbox" id="sw-no-latency">
-                <span data-i18n="set.switch_nolatency_hint">ffmpeg ohne großes Probing starten (schneller, lernt bei Fehlern automatisch hoch)</span>
-              </label>
-            </td>
-          </tr>
-          <tr>
-            <td style="color:var(--muted);padding:6px 12px 6px 0"><span data-i18n="set.switch_zapwait">Zap-Wartezeit (s)</span></td>
-            <td><input class="input" id="sw-zap-wait" type="number" step="0.1" min="0" style="width:100px"></td>
-          </tr>
-          <tr>
-            <td style="color:var(--muted);padding:6px 12px 6px 0"><span data-i18n="set.switch_monitor">Monitor-Fenster (s)</span></td>
-            <td><input class="input" id="sw-monitor" type="number" step="0.5" min="1" style="width:100px"></td>
-          </tr>
-          <tr>
-            <td style="color:var(--muted);padding:6px 12px 6px 0"><span data-i18n="set.switch_retries">Max. Neustarts</span></td>
-            <td><input class="input" id="sw-retries" type="number" step="1" min="0" style="width:100px"></td>
-          </tr>
-          <tr>
-            <td style="color:var(--muted);padding:6px 12px 6px 0"><span data-i18n="set.switch_nolat_probe">NoLatency Probesize</span></td>
-            <td><input class="input" id="sw-nolat-probe" type="number" step="100000" min="32" style="width:140px"></td>
-          </tr>
-          <tr>
-            <td style="color:var(--muted);padding:6px 12px 6px 0"><span data-i18n="set.switch_fail_thresh">Fehler-Schwelle (Probesize↑)</span></td>
-            <td><input class="input" id="sw-fail-thresh" type="number" step="1" min="1" style="width:100px"></td>
-          </tr>
-        </tbody>
-      </table>
-      <div class="flex" style="margin-top:12px;align-items:center;gap:10px">
-        <button class="btn btn-primary" onclick="saveSwitchGlobal()">💾 <span data-i18n="common.save">Save</span></button>
-        <span id="sw-save-fb" style="font-size:12px;font-family:monospace;opacity:0;transition:opacity 0.2s"></span>
-      </div>
-
-      <div style="margin-top:18px;display:flex;align-items:center;justify-content:space-between;gap:10px">
-        <div class="card-title" style="margin:0;font-size:13px">📊 <span data-i18n="set.switch_stats">Per-Sender-Statistik</span></div>
-        <div style="display:flex;gap:8px">
-          <button class="btn" onclick="loadSwitchStats()">↺ <span data-i18n="common.refresh">Refresh</span></button>
-          <button class="btn" onclick="resetSwitch(null)">🗑 <span data-i18n="set.switch_reset_all">Reset alle</span></button>
-        </div>
-      </div>
-      <div id="sw-stats" style="margin-top:10px;overflow-x:auto">Lade…</div>
     </div>
 
     <div class="card">
@@ -6891,6 +7784,102 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
 
   </div>
 
+  <!-- ── TAB: AUSWERTUNG / USAGE ──────────────────── -->
+  <div class="tab-panel" id="tab-usage">
+
+    <div class="card">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
+        <div class="card-title" style="margin:0">📊 <span data-i18n="usage.title">Nutzungs-Auswertung</span></div>
+        <div style="display:flex;gap:8px">
+          <button class="btn" onclick="loadUsage()">↺ <span data-i18n="common.refresh">Refresh</span></button>
+          <button class="btn" onclick="resetUsage()">🗑 <span data-i18n="usage.reset">Zurücksetzen</span></button>
+        </div>
+      </div>
+      <p class="card-desc" data-i18n="usage.hint">Aggregierte Nutzung seit Aufzeichnungsbeginn: welches Gerät streamt am meisten, welcher Sender wird am häufigsten geschaut, welche Schnittstellen werden verwendet.</p>
+      <div id="usage-totals" style="margin-top:10px">Lade…</div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">📺 <span data-i18n="usage.top_channels">Meistgeschaute Sender</span></div>
+      <div id="usage-channels" style="overflow-x:auto">Lade…</div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">💻 <span data-i18n="usage.top_devices">Geräte-Nutzung</span></div>
+      <div id="usage-devices" style="overflow-x:auto">Lade…</div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">⏺ <span data-i18n="usage.rec_suggest">Aufnahme-Vorschläge</span></div>
+      <p class="card-desc" data-i18n="usage.rec_suggest_hint">Sendungen, die mehrfach geschaut wurden — eine Aufnahme (bzw. Serien-Timer) lohnt sich hier vermutlich.</p>
+      <div id="usage-programs" style="overflow-x:auto">Lade…</div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">🔌 <span data-i18n="usage.interfaces">Schnittstellen-Nutzung</span></div>
+      <div id="usage-interfaces" style="overflow-x:auto">Lade…</div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">🕒 <span data-i18n="usage.by_hour">Nutzung nach Tageszeit</span></div>
+      <div id="usage-hours" style="overflow-x:auto">Lade…</div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">⚡ <span data-i18n="set.switch_tuning">Umschalt-Tuning</span></div>
+      <p class="card-desc" data-i18n="set.switch_hint">Beschleunigt das Umschalten (z.B. Plex). NoLatency startet ffmpeg mit minimalem Probing; die Zap-Wartezeit ist die Pause nach dem Umschalten. Werte gelten global als Default — pro Sender wird automatisch gelernt (siehe Tabelle).</p>
+      <table style="font-size:12px;border-collapse:collapse">
+        <tbody>
+          <tr>
+            <td style="color:var(--muted);padding:6px 12px 6px 0"><span data-i18n="set.switch_nolatency">NoLatency (global)</span></td>
+            <td>
+              <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text)">
+                <input type="checkbox" id="sw-no-latency">
+                <span data-i18n="set.switch_nolatency_hint">ffmpeg ohne großes Probing starten (schneller, lernt bei Fehlern automatisch hoch)</span>
+              </label>
+            </td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);padding:6px 12px 6px 0"><span data-i18n="set.switch_zapwait">Zap-Wartezeit (s)</span></td>
+            <td><input class="input" id="sw-zap-wait" type="number" step="0.1" min="0" style="width:100px"></td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);padding:6px 12px 6px 0"><span data-i18n="set.switch_monitor">Monitor-Fenster (s)</span></td>
+            <td><input class="input" id="sw-monitor" type="number" step="0.5" min="1" style="width:100px"></td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);padding:6px 12px 6px 0"><span data-i18n="set.switch_retries">Max. Neustarts</span></td>
+            <td><input class="input" id="sw-retries" type="number" step="1" min="0" style="width:100px"></td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);padding:6px 12px 6px 0"><span data-i18n="set.switch_nolat_probe">NoLatency Probesize</span></td>
+            <td><input class="input" id="sw-nolat-probe" type="number" step="100000" min="32" style="width:140px"></td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);padding:6px 12px 6px 0"><span data-i18n="set.switch_fail_thresh">Fehler-Schwelle (Probesize↑)</span></td>
+            <td><input class="input" id="sw-fail-thresh" type="number" step="1" min="1" style="width:100px"></td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="flex" style="margin-top:12px;align-items:center;gap:10px">
+        <button class="btn btn-primary" onclick="saveSwitchGlobal()">💾 <span data-i18n="common.save">Save</span></button>
+        <span id="sw-save-fb" style="font-size:12px;font-family:monospace;opacity:0;transition:opacity 0.2s"></span>
+      </div>
+
+      <div style="margin-top:18px;display:flex;align-items:center;justify-content:space-between;gap:10px">
+        <div class="card-title" style="margin:0;font-size:13px">📊 <span data-i18n="set.switch_stats">Per-Sender-Statistik</span></div>
+        <div style="display:flex;gap:8px">
+          <button class="btn" onclick="analyzeSwitch()">🔍 <span data-i18n="set.switch_analyze">Analyze</span></button>
+          <button class="btn" onclick="loadSwitchStats()">↺ <span data-i18n="common.refresh">Refresh</span></button>
+          <button class="btn" onclick="resetSwitch(null)">🗑 <span data-i18n="set.switch_reset_all">Reset alle</span></button>
+        </div>
+      </div>
+      <div id="sw-analyze-box" style="margin-top:10px"></div>
+      <div id="sw-stats" style="margin-top:10px;overflow-x:auto">Lade…</div>
+    </div>
+
+  </div>
+
   <!-- ── TAB: WARTUNG ──────────────────────────────── -->
   <div class="tab-panel" id="tab-maintenance">
 
@@ -7188,6 +8177,7 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
       <div class="card-title">ℹ <span data-i18n="set.about">About e2proxy</span></div>
       <div class="card-desc" style="line-height:2.2;font-family:'JetBrains Mono',monospace;font-size:11px">
         <span style="color:var(--muted);font-size:10px">VERSION&nbsp;&nbsp;</span> <span style="color:var(--accent)">{version}</span><br>
+        <span style="color:var(--muted);font-size:10px">BUILD&nbsp;&nbsp;&nbsp;&nbsp;</span> <span style="color:var(--accent2)" title="Interne Build-Kennung — wechselt bei jedem Test-Rollout">{INTERNAL_VERSION}</span><br>
         <span style="color:var(--muted);font-size:10px">PROXY&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span> http://{proxy_host}:{proxy_port}<br>
         <span style="color:var(--muted);font-size:10px">PLEX DVR&nbsp;</span> http://{proxy_host}:{proxy_port}/plex<br>
         <span style="color:var(--muted);font-size:10px">EPG&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span> http://{proxy_host}:{proxy_port}/epg.xml
@@ -7200,6 +8190,191 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
 
 <script>
 const ORIGINAL_CONFIG = {cfg_json};
+
+// ── Usage / Auswertung ──────────────────────────────────
+// Eigene Helfer, damit dieser Tab nicht von Funktionen anderer Seiten abhaengt.
+function _uEsc(s) {{
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}}
+function _uBytes(b) {{
+  b = Number(b) || 0;
+  if (b >= 1024*1024*1024) return (b/(1024*1024*1024)).toFixed(2)+' GB';
+  if (b >= 1024*1024) return (b/(1024*1024)).toFixed(1)+' MB';
+  if (b >= 1024) return (b/1024).toFixed(1)+' KB';
+  return b+' B';
+}}
+function _uBar(pct) {{
+  const w = Math.max(0, Math.min(100, pct || 0));
+  return `<div style="background:var(--border);border-radius:3px;height:6px;width:80px;display:inline-block;vertical-align:middle">`
+       + `<div style="background:var(--accent);height:6px;border-radius:3px;width:${{w}}%"></div></div>`;
+}}
+function _uEmpty(msg) {{
+  return `<div style="color:var(--muted);font-size:12px">${{msg}}</div>`;
+}}
+function _uHead(cols) {{
+  let h = '<thead><tr style="text-align:left;color:var(--muted);border-bottom:1px solid var(--border)">';
+  for (const c of cols) h += `<th style="padding:4px 8px 4px 0;font-weight:normal">${{c}}</th>`;
+  return h + '</tr></thead>';
+}}
+
+function loadUsage() {{
+  fetch('/api/usage/stats').then(r=>r.json()).then(d=>{{
+    const noData = t('usage.nodata');
+
+    // Übersicht
+    const tt = d.totals || {{}};
+    const since = d.since ? new Date(d.since).toLocaleString() : '—';
+    const tb = document.getElementById('usage-totals');
+    if (tb) {{
+      tb.innerHTML = `<div style="display:flex;gap:24px;flex-wrap:wrap;font-size:12px;font-family:monospace">`
+        + `<div><div style="color:var(--muted)">${{t('usage.sessions')}}</div><div style="font-size:18px">${{tt.sessions||0}}</div></div>`
+        + `<div><div style="color:var(--muted)">${{t('usage.watchtime')}}</div><div style="font-size:18px">${{tt.duration_human||'0m'}}</div></div>`
+        + `<div><div style="color:var(--muted)">${{t('usage.volume')}}</div><div style="font-size:18px">${{tt.bytes_human||'0 B'}}</div></div>`
+        + `<div><div style="color:var(--muted)">${{t('usage.since')}}</div><div style="font-size:18px">${{since}}</div></div>`
+        + `</div>`;
+    }}
+
+    // Sender
+    const cb = document.getElementById('usage-channels');
+    if (cb) {{
+      const rows = d.channels || [];
+      if (!rows.length) cb.innerHTML = _uEmpty(noData);
+      else {{
+        let h = '<table style="width:100%;border-collapse:collapse;font-size:11px;font-family:monospace">'
+          + _uHead(['#', t('usage.channel'), t('usage.watchtime'), t('usage.share'), t('usage.sessions'), t('usage.last')])
+          + '<tbody>';
+        rows.forEach((c,i)=>{{
+          h += `<tr style="border-bottom:1px solid var(--border)">`
+            + `<td style="padding:4px 8px 4px 0;color:var(--muted)">${{i+1}}</td>`
+            + `<td style="padding:4px 8px 4px 0;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${{_uEsc(c.name||'')}}</td>`
+            + `<td style="padding:4px 8px">${{c.duration_human||''}}</td>`
+            + `<td style="padding:4px 8px">${{_uBar(c.share)}} ${{c.share}}%</td>`
+            + `<td style="padding:4px 8px">${{c.sessions||0}}</td>`
+            + `<td style="padding:4px 8px;color:var(--muted)">${{c.last ? new Date(c.last).toLocaleString() : '—'}}</td>`
+            + `</tr>`;
+        }});
+        cb.innerHTML = h + '</tbody></table>';
+      }}
+    }}
+
+    // Geräte
+    const db = document.getElementById('usage-devices');
+    if (db) {{
+      const rows = d.devices || [];
+      if (!rows.length) db.innerHTML = _uEmpty(noData);
+      else {{
+        let h = '<table style="width:100%;border-collapse:collapse;font-size:11px;font-family:monospace">'
+          + _uHead([t('usage.device'), 'IP', t('usage.watchtime'), t('usage.share'), t('usage.sessions'), t('usage.profile'), t('usage.volume')])
+          + '<tbody>';
+        for (const v of rows) {{
+          h += `<tr style="border-bottom:1px solid var(--border)">`
+            + `<td style="padding:4px 8px 4px 0;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{_uEsc(v.ua||'')}}">${{_uEsc(v.label||'?')}}</td>`
+            + `<td style="padding:4px 8px;color:var(--muted)">${{_uEsc(v.ip||'')}}</td>`
+            + `<td style="padding:4px 8px">${{v.duration_human||''}}</td>`
+            + `<td style="padding:4px 8px">${{_uBar(v.share)}} ${{v.share}}%</td>`
+            + `<td style="padding:4px 8px">${{v.sessions||0}}</td>`
+            + `<td style="padding:4px 8px">${{_uEsc(v.top_profile||'—')}}</td>`
+            + `<td style="padding:4px 8px">${{_uBytes(v.bytes||0)}}</td>`
+            + `</tr>`;
+        }}
+        db.innerHTML = h + '</tbody></table>';
+      }}
+    }}
+
+    // Aufnahme-Vorschläge
+    const pb = document.getElementById('usage-programs');
+    if (pb) {{
+      const rows = d.suggestions || [];
+      if (!rows.length) pb.innerHTML = _uEmpty(t('usage.no_suggest'));
+      else {{
+        let h = '<table style="width:100%;border-collapse:collapse;font-size:11px;font-family:monospace">'
+          + _uHead([t('usage.program'), t('usage.channel'), t('usage.times'), t('usage.watchtime'), t('usage.slot')])
+          + '<tbody>';
+        for (const p of rows) {{
+          h += `<tr style="border-bottom:1px solid var(--border)">`
+            + `<td style="padding:4px 8px 4px 0;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${{_uEsc(p.title||'')}}</td>`
+            + `<td style="padding:4px 8px;color:var(--muted)">${{_uEsc(p.channel||'')}}</td>`
+            + `<td style="padding:4px 8px">${{p.count}}×</td>`
+            + `<td style="padding:4px 8px">${{p.duration_human||''}}</td>`
+            + `<td style="padding:4px 8px">${{_uEsc(p.slot||'—')}}</td>`
+            + `</tr>`;
+        }}
+        pb.innerHTML = h + '</tbody></table>';
+      }}
+    }}
+
+    // Schnittstellen
+    const ib = document.getElementById('usage-interfaces');
+    if (ib) {{
+      const ifs = d.interfaces || [];
+      const eps = d.endpoints || [];
+      let h = '';
+      if (ifs.length) {{
+        h += `<div style="font-size:12px;color:var(--muted);margin-bottom:4px">${{t('usage.if_stream')}}</div>`;
+        h += '<table style="width:100%;border-collapse:collapse;font-size:11px;font-family:monospace">'
+          + _uHead([t('usage.interface'), t('usage.sessions'), t('usage.watchtime'), t('usage.volume')])
+          + '<tbody>';
+        for (const v of ifs) {{
+          h += `<tr style="border-bottom:1px solid var(--border)">`
+            + `<td style="padding:4px 8px 4px 0">${{_uEsc(v.name||'')}}</td>`
+            + `<td style="padding:4px 8px">${{v.sessions||0}}</td>`
+            + `<td style="padding:4px 8px">${{v.duration_human||''}}</td>`
+            + `<td style="padding:4px 8px">${{_uBytes(v.bytes||0)}}</td>`
+            + `</tr>`;
+        }}
+        h += '</tbody></table>';
+      }}
+      if (eps.length) {{
+        h += `<div style="font-size:12px;color:var(--muted);margin:14px 0 4px">${{t('usage.if_api')}}</div>`;
+        h += '<table style="width:100%;border-collapse:collapse;font-size:11px;font-family:monospace">'
+          + _uHead([t('usage.endpoint'), t('usage.calls')])
+          + '<tbody>';
+        const maxC = Math.max.apply(null, eps.map(e=>e.count));
+        for (const e of eps) {{
+          h += `<tr style="border-bottom:1px solid var(--border)">`
+            + `<td style="padding:4px 8px 4px 0">${{_uEsc(e.name||'')}}</td>`
+            + `<td style="padding:4px 8px">${{_uBar(100*e.count/maxC)}} ${{e.count}}</td>`
+            + `</tr>`;
+        }}
+        h += '</tbody></table>';
+      }}
+      ib.innerHTML = h || _uEmpty(noData);
+    }}
+
+    // Tageszeit
+    const hb = document.getElementById('usage-hours');
+    if (hb) {{
+      const hrs = d.hours || {{}};
+      let maxV = 0;
+      for (let i=0;i<24;i++) maxV = Math.max(maxV, hrs[String(i)] || 0);
+      if (!maxV) hb.innerHTML = _uEmpty(noData);
+      else {{
+        let h = '<div style="display:flex;align-items:flex-end;gap:3px;height:90px">';
+        for (let i=0;i<24;i++) {{
+          const v = hrs[String(i)] || 0;
+          const pct = Math.round(100*v/maxV);
+          const mins = Math.round(v/60);
+          h += `<div style="flex:1;text-align:center" title="${{i}}:00 — ${{mins}} min">`
+            + `<div style="background:var(--accent);border-radius:2px 2px 0 0;height:${{Math.max(2,pct*0.7)}}px"></div>`
+            + `<div style="font-size:9px;color:var(--muted);margin-top:2px">${{i}}</div></div>`;
+        }}
+        hb.innerHTML = h + '</div>';
+      }}
+    }}
+  }}).catch(e=>{{
+    const b = document.getElementById('usage-totals');
+    if (b) b.innerHTML = `<div style="color:var(--red)">Fehler: ${{e}}</div>`;
+  }});
+}}
+
+function resetUsage() {{
+  if (!confirm(t('usage.reset_confirm'))) return;
+  apiPost('/api/usage/reset', {{}}).then(d=>{{
+    if (d && d.ok) {{ showToast('✓ Zurückgesetzt','success'); loadUsage(); }}
+    else showToast('Fehler','error');
+  }}).catch(()=>showToast('Fehler','error'));
+}}
 
 function switchTab(name, btn) {{
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -7220,7 +8395,8 @@ function switchTab(name, btn) {{
       if (d.running && !epgPollTimer) startEpgPolling();
     }});
   }}
-  if (name === 'recording') {{ loadTunerStatus(); loadRecordingStatus(); loadRecChannels(); loadCompressionStatus(); loadSwitchStats(); }}
+  if (name === 'recording') {{ loadTunerStatus(); loadRecordingStatus(); loadRecChannels(); loadCompressionStatus(); }}
+  if (name === 'usage') {{ loadUsage(); loadSwitchStats(); }}
 }}
 
 // ── Compression UI ──────────────────────────────────────────────────────────
@@ -8111,6 +9287,64 @@ function resetSwitch(ref) {{
   }}).catch(()=>showToast('Fehler','error'));
 }}
 
+// ── Switch-Analyse (Profil-Empfehlungen) ──────────────
+function renderSwitchAnalyze(d, applied) {{
+  const box = document.getElementById('sw-analyze-box');
+  if (!box) return;
+  const recs = d.recommendations || [];
+  if (applied) {{
+    box.innerHTML = `<div style="padding:8px 10px;border:1px solid var(--green);border-radius:6px;color:var(--green);font-size:12px">✓ ${{d.applied}} Profil(e) angewendet.</div>`;
+    return;
+  }}
+  if (!recs.length) {{
+    box.innerHTML = `<div style="padding:8px 10px;border:1px solid var(--border);border-radius:6px;color:var(--muted);font-size:12px">Keine Verbesserungen gefunden (min. ${{d.min_samples}} Umschaltvorgänge pro Sender nötig). Alle Profile wirken passend.</div>`;
+    return;
+  }}
+  const fmt = r => `NoLat ${{r.no_latency?'an':'aus'}}, Wait ${{r.zap_wait}}s, Probe ${{r.probesize.toLocaleString()}}`;
+  let html = '<div style="border:1px solid var(--accent);border-radius:6px;padding:10px">'
+    + `<div style="font-size:12px;margin-bottom:8px">🔍 <b>${{recs.length}}</b> Empfehlung(en) — Vorschau (noch nicht angewendet):</div>`
+    + '<table style="width:100%;border-collapse:collapse;font-size:11px;font-family:monospace">'
+    + '<thead><tr style="text-align:left;color:var(--muted);border-bottom:1px solid var(--border)">'
+    + '<th style="padding:4px 8px 4px 0">Sender</th><th style="padding:4px 8px">Aktuell</th>'
+    + '<th style="padding:4px 8px">Empfohlen</th><th style="padding:4px 8px">Grund</th></tr></thead><tbody>';
+  for (const r of recs) {{
+    html += `<tr style="border-bottom:1px solid var(--border)">`
+      + `<td style="padding:4px 8px 4px 0;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{r.name}}">${{r.name}}</td>`
+      + `<td style="padding:4px 8px;color:var(--muted)">${{fmt(r.current)}}</td>`
+      + `<td style="padding:4px 8px;color:var(--accent)">${{fmt(r.recommended)}}</td>`
+      + `<td style="padding:4px 8px;color:var(--muted)">${{(r.reasons||[]).join('; ')}}</td>`
+      + `</tr>`;
+  }}
+  html += '</tbody></table>'
+    + '<div style="margin-top:10px;display:flex;gap:8px">'
+    + '<button class="btn btn-primary" onclick="applySwitchAnalyze()">✓ <span data-i18n="set.switch_analyze_apply">Anwenden</span></button>'
+    + '<button class="btn" onclick="clearSwitchAnalyze()">✕ <span data-i18n="common.cancel">Cancel</span></button>'
+    + '</div></div>';
+  box.innerHTML = html;
+  // Dynamisch eingefuegtes Markup uebersetzen (applyI18n laeuft sonst nur beim Laden)
+  if (typeof applyI18n === 'function') applyI18n();
+}}
+
+function analyzeSwitch() {{
+  const box = document.getElementById('sw-analyze-box');
+  if (box) box.innerHTML = '<div style="color:var(--muted);font-size:12px">Analysiere…</div>';
+  apiPost('/api/switch/analyze', {{apply:false}})
+    .then(d=>renderSwitchAnalyze(d, false))
+    .catch(e=>{{ if(box) box.innerHTML='<div style="color:var(--red)">Fehler: '+e+'</div>'; }});
+}}
+
+function clearSwitchAnalyze() {{
+  const box = document.getElementById('sw-analyze-box');
+  if (box) box.innerHTML = '';
+}}
+
+function applySwitchAnalyze() {{
+  apiPost('/api/switch/analyze', {{apply:true}}).then(d=>{{
+    if (d && d.ok) {{ showToast('✓ '+d.applied+' Profile angewendet','success'); renderSwitchAnalyze(d, true); loadSwitchStats(); }}
+    else showToast('Fehler beim Anwenden','error');
+  }}).catch(()=>showToast('Fehler beim Anwenden','error'));
+}}
+
 function savePlexDvrRefresh(enabled) {{
   const fb = document.getElementById('plex-dvr-refresh-fb');
   const showFb = (msg, color) => {{
@@ -8956,6 +10190,20 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"ok": True})
             return
 
+        if parsed.path == "/api/switch/analyze":
+            result = analyze_switch_stats(
+                apply=bool(data.get("apply")),
+                min_samples=data.get("min_samples"),
+            )
+            result["ok"] = True
+            self.send_json(result)
+            return
+
+        if parsed.path == "/api/usage/reset":
+            reset_usage_stats()
+            self.send_json({"ok": True})
+            return
+
         if parsed.path == "/api/favorites":
             if not isinstance(data, list):
                 self.send_json({"ok": False, "message": "Expected list"})
@@ -9244,6 +10492,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         import time as _t
         _t0 = _t.time()
+        note_endpoint(classify_endpoint(self.path, "proxy"))
         try:
             self._do_GET_inner()
             _dur = int((_t.time() - _t0) * 1000)
@@ -9489,10 +10738,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"global": g, "senders": rows})
             return
 
+        if path == "/api/usage/stats":
+            self.send_json(build_usage_report())
+            return
+
         if path == "/api/favorites":
             self.send_json(get_favorites())
             return
-
         if path == "/api/channels/reload":
             channels = get_channels(force_refresh=True)
             self.send_json({"ok": True, "count": len(channels)})
@@ -10172,6 +11424,20 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 log.error(f"STREAM ERROR: {e}")
             finally:
+                # Nutzung erfassen, BEVOR der Receiver-State verworfen wird
+                # (dort stehen Startzeit und übertragene Bytes).
+                try:
+                    _st = _receiver_state.get(rid) or {}
+                    _t0 = _st.get("started_ts")
+                    if _t0:
+                        record_usage_session(
+                            service_ref, channel_name, user_agent=ua,
+                            client_ip=client_ip, profile=profile_name,
+                            source="Streaming (/stream)", started_ts=_t0,
+                            duration_sec=time.time() - _t0,
+                            bytes_sent=_st.get("bytes_sent", 0))
+                except Exception as _e:
+                    log.debug(f"Usage-Hook (stream) fehlgeschlagen: {_e}")
                 release_receiver(rid)
                 if ref_lock is not None:
                     ref_lock.release()
@@ -10722,6 +11988,7 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
+        note_endpoint(classify_endpoint(self.path, "openwebif"))
         try:
             rest = self._rest()
             low = rest.lower()
@@ -11213,6 +12480,7 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
                                  "codec": (tp.get("codec", "") if tp else "pass"),
                                  "label": (tp.get("label", profile_id) if tp else "Passthrough"),
                              })
+        _owif_t0 = time.time()
         try:
             if not shared:
                 if not do_zap(rid, sref, channel_name):
@@ -11246,6 +12514,17 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             log.error(f"OpenWebif STREAM ERROR: {e}")
         finally:
+            try:
+                _bytes = 0
+                if not shared:
+                    _bytes = (_receiver_state.get(rid) or {}).get("bytes_sent", 0)
+                record_usage_session(
+                    sref, channel_name, user_agent=ua, client_ip=client_ip,
+                    profile=profile_id, source="OpenWebif: Streaming",
+                    started_ts=_owif_t0, duration_sec=time.time() - _owif_t0,
+                    bytes_sent=_bytes)
+            except Exception as _e:
+                log.debug(f"Usage-Hook (OpenWebif) fehlgeschlagen: {_e}")
             if not shared:
                 release_receiver(rid)
 
@@ -11369,6 +12648,7 @@ def run():
     threading.Thread(target=epg_scheduler_loop, daemon=True).start()
     threading.Thread(target=maintenance_notify_loop, daemon=True).start()
     threading.Thread(target=recording_reaper_loop, daemon=True, name="rec-reaper").start()
+    threading.Thread(target=usage_flush_loop, daemon=True, name="usage-flush").start()
     start_compression_scheduler()
 
     proxy_host = get_proxy_host()
