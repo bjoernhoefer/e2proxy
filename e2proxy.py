@@ -39,13 +39,13 @@ from datetime import datetime
 # ── Pfade ─────────────────────────────────────────────────
 # Datenpfad: via Env-Variable überschreibbar (für Docker)
 DATA_DIR       = os.environ.get("E2PROXY_DATA_DIR", "/var/lib/e2proxy")
-VERSION        = "4.2"   # Offizielle Version — nur beim Pull Request erhöhen (major/minor)
+VERSION        = "4.3"   # Offizielle Version — nur beim Pull Request erhöhen (major/minor)
 # ── Interne Build-/Versionskennung ────────────────────────
 # Identifiziert eindeutig den ausgerollten Branch/Stand bei Tests, OHNE die
 # offizielle VERSION zu verändern (die steigt erst beim PR). Bei jedem Test-
 # Rollout eines neuen Standes BUILD_SEQ erhöhen.
-BUILD_BRANCH     = "feature/stream-info"
-BUILD_SEQ        = "a8e6c1b0"
+BUILD_BRANCH     = "feature/dreamplayer-recordings"
+BUILD_SEQ        = "c3395c34"
 INTERNAL_VERSION = f"{VERSION}+{BUILD_BRANCH.split('/')[-1]}.{BUILD_SEQ}"
 CONFIG_FILE    = f"{DATA_DIR}/config.json"
 FAVORITES_FILE = f"{DATA_DIR}/favorites.json"
@@ -5515,7 +5515,14 @@ def build_help_ui():
       <div style="display:flex;flex-direction:column;gap:12px">
 
         <div style="border-left:3px solid var(--accent);padding-left:14px">
-          <b style="color:var(--accent);font-family:monospace;font-size:11px">v4.1</b>
+          <b style="color:var(--accent);font-family:monospace;font-size:11px">v4.3</b>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-07-29</span>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">Aufnahmen für Dream Player</span>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)">OpenWebif-Emulation der Aufnahmen (Dream Player Recordings-Tab) verbessert: die Dauer (<code>e2length</code>) wird jetzt im echten OpenWebif-Format <code>MINUTEN:SS</code> geliefert (90&nbsp;min → <code>90:00</code> statt roher Sekunden), damit Dream Player die Länge korrekt anzeigt. Neu abgefangen werden <code>getlocations</code>/<code>getcurrlocation</code> (melden das e2proxy-Aufnahmeverzeichnis statt das der Box), <code>moviedelete</code> (löscht die lokale e2recorder-Aufnahme inkl. <code>.nfo</code> und leerer Ordner) und <code>moviedetails</code> (Einzel-<code>&lt;e2movie&gt;</code> vor der Wiedergabe). <code>fullmovielist</code> wird als Alias unterstützt, die JSON-Movielist um authentische Felder (<code>filename_stripped</code>, <code>filesize_readable</code>, <code>begintime</code>, <code>lastseen</code>, Bookmarks) ergänzt. Wiedergabe läuft weiterhin als rohes TS über HTTP mit Range/Seeking.</div>
+        </div>
+
+        <div style="border-left:3px solid var(--border);padding-left:14px">
+          <b style="font-family:monospace;font-size:11px">v4.1</b>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-07-20</span>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">Settings tab fix · WebUI self-check · WebUI consolidation</span>
           <div style="font-size:11px;margin-top:4px;color:var(--muted)">Fixed the Settings page where the <b>Maintenance / EPG / Recordings / API</b> tabs could not be opened: a stray escape in the embedded JavaScript broke the whole script block so <code>switchTab()</code> was never defined (only the Configuration tab, which is active by default, still worked). Tab switching is now also independent of the deprecated global <code>event</code> object. To stop this class of bug from ever shipping silently again, a built-in <b>WebUI self-check</b> now validates every page's embedded JavaScript at startup (logged) and via <code>python3 e2proxy.py --selfcheck</code> as a pre-deploy gate. All browser-facing code has been consolidated into one delimited <code>WEBUI</code> block with a documented extraction contract, preparing it to be split into its own service later.</div>
@@ -10401,6 +10408,126 @@ def _owif_parse_nfo(path):
     return {"title": title, "plot": plot, "duration": dur, "ts": ts}
 
 
+def _owif_fmt_length(seconds):
+    """OpenWebif-e2length: 'MINUTEN:SS' — Minuten NICHT auf 59 begrenzt
+    (90 min -> '90:00', nicht '1:30:00'). Leerer String, wenn unbekannt."""
+    try:
+        s = int(seconds or 0)
+    except (TypeError, ValueError):
+        s = 0
+    if s <= 0:
+        return ""
+    return "%d:%02d" % (s // 60, s % 60)
+
+
+def _owif_human_size(n):
+    """Menschenlesbare Dateigröße wie OpenWebif ('3.22 GB')."""
+    try:
+        v = float(n or 0)
+    except (TypeError, ValueError):
+        v = 0.0
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if v < 1024 or unit == "TB":
+            return f"{int(v)} B" if unit == "B" else f"{v:.2f} {unit}"
+        v /= 1024
+    return f"{v:.2f} TB"
+
+
+def _owif_bookmarks(base):
+    """Unmittelbare Unterordner-Namen des Aufnahme-Basisverzeichnisses
+    (OpenWebif <e2locations>/bookmarks)."""
+    try:
+        return sorted(d for d in os.listdir(base)
+                      if os.path.isdir(os.path.join(base, d)))
+    except OSError:
+        return []
+
+
+def _owif_sref_to_path(sref):
+    """File-Service-Reference (1:0:…:0:/pfad.ts) -> lokaler Dateipfad."""
+    m = _OWIF_SREF_CLEAN_RE.match(sref or "")
+    if not m:
+        return ""
+    rest = sref[m.end():]
+    return rest if rest.startswith("/") else ""
+
+
+def _owif_present_path(realpath, base, vroot):
+    """Bildet den realen Aufnahmepfad auf den vom Client erwarteten
+    virtuellen Movie-Ordner ab (z. B. Dream Players '/media/hdd/movie').
+    Ohne vroot bleibt der echte Pfad erhalten."""
+    if not vroot:
+        return realpath
+    rel = os.path.relpath(realpath, base).replace(os.sep, "/")
+    return vroot.rstrip("/") + "/" + rel
+
+
+def _owif_resolve_recording(path):
+    """Bildet einen (ggf. virtuellen) Movie-Pfad zurück auf die echte Datei
+    unterhalb des Aufnahmeverzeichnisses ab — unabhängig vom vom Client
+    konfigurierten 'Movie location'. Liefert den realen Pfad oder ''."""
+    base = os.path.abspath(get_recordings_config()["path"])
+    if not path:
+        return ""
+    real = os.path.abspath(path)
+    if real.startswith(base) and os.path.isfile(real):
+        return real
+    # Virtueller Pfad (z. B. /media/hdd/movie/TV/…): führende Segmente
+    # abschneiden, bis die Datei relativ zum echten base-Verzeichnis passt.
+    parts = [p for p in path.replace("\\", "/").split("/") if p]
+    for i in range(len(parts)):
+        cand = os.path.join(base, *parts[i:])
+        if os.path.isfile(cand):
+            return os.path.abspath(cand)
+    return ""
+
+
+def _owif_movie_entry(fpath, base):
+    """Baut einen OpenWebif-Movie-Eintrag für eine Aufnahmedatei.
+    Metadaten kommen aus der zugehörigen .nfo-Datei."""
+    try:
+        size = os.path.getsize(fpath)
+        mtime = int(os.path.getmtime(fpath))
+    except OSError:
+        return None
+    root_dir = os.path.dirname(fpath)
+    fname = os.path.basename(fpath)
+    stem = os.path.splitext(fname)[0]
+    meta = None
+    for cand in (os.path.join(root_dir, stem + ".nfo"),
+                 os.path.join(root_dir, "movie.nfo"),
+                 os.path.join(root_dir, "tvshow.nfo")):
+        if os.path.exists(cand):
+            meta = _owif_parse_nfo(cand)
+            if meta:
+                break
+    meta = meta or {}
+    rel = os.path.relpath(fpath, base)
+    parts = rel.split(os.sep)
+    category = parts[0] if len(parts) > 1 else ""
+    # TV/<Serie>/Season …/datei.ts  bzw.  Movies/<Titel>/datei.ts
+    if category.lower() in ("tv", "movies") and len(parts) >= 2:
+        series = parts[1]
+    else:
+        series = category
+    ep_title = meta.get("title") or stem
+    if category.lower() == "tv" and series and ep_title and ep_title != series:
+        disp_title = f"{series} – {ep_title}"
+    else:
+        disp_title = ep_title or series
+    return {
+        "path": fpath,
+        "title": disp_title,
+        "plot": meta.get("plot", ""),
+        "servicename": series or "e2proxy",
+        "time": meta.get("ts") or mtime,
+        "duration": meta.get("duration", 0),
+        "size": size,
+        "filename": fpath,
+        "sref": _OWIF_FILE_SREF_PREFIX + fpath,
+    }
+
+
 def _owif_scan_movies():
     """Durchsucht das Aufnahme-Verzeichnis und baut eine OpenWebif-taugliche
     Movie-Liste (neueste zuerst). Metadaten kommen aus .nfo-Dateien."""
@@ -10413,87 +10540,141 @@ def _owif_scan_movies():
         for fname in sorted(files):
             if not fname.lower().endswith(_OWIF_REC_MEDIA_EXT):
                 continue
-            fpath = os.path.join(root_dir, fname)
-            try:
-                size = os.path.getsize(fpath)
-                mtime = int(os.path.getmtime(fpath))
-            except OSError:
-                continue
-            stem = os.path.splitext(fname)[0]
-            meta = None
-            for cand in (os.path.join(root_dir, stem + ".nfo"),
-                         os.path.join(root_dir, "movie.nfo"),
-                         os.path.join(root_dir, "tvshow.nfo")):
-                if os.path.exists(cand):
-                    meta = _owif_parse_nfo(cand)
-                    if meta:
-                        break
-            meta = meta or {}
-            rel = os.path.relpath(fpath, base)
-            parts = rel.split(os.sep)
-            category = parts[0] if len(parts) > 1 else ""
-            # TV/<Serie>/Season …/datei.ts  bzw.  Movies/<Titel>/datei.ts
-            if category.lower() in ("tv", "movies") and len(parts) >= 2:
-                series = parts[1]
-            else:
-                series = category
-            ep_title = meta.get("title") or stem
-            if category.lower() == "tv" and series and ep_title and ep_title != series:
-                disp_title = f"{series} – {ep_title}"
-            else:
-                disp_title = ep_title or series
-            movies.append({
-                "path": fpath,
-                "title": disp_title,
-                "plot": meta.get("plot", ""),
-                "servicename": series or "e2proxy",
-                "time": meta.get("ts") or mtime,
-                "duration": meta.get("duration", 0),
-                "size": size,
-                "filename": fpath,
-                "sref": _OWIF_FILE_SREF_PREFIX + fpath,
-            })
+            entry = _owif_movie_entry(os.path.join(root_dir, fname), base)
+            if entry:
+                movies.append(entry)
     movies.sort(key=lambda m: m["time"], reverse=True)
     return base, movies
 
 
-def _owif_movielist_xml(base, movies):
+def _owif_movielist_xml(base, movies, vroot=None):
     from xml.sax.saxutils import escape
     out = ['<?xml version="1.0" encoding="UTF-8"?>', "<e2movielist>"]
     for m in movies:
+        ppath = _owif_present_path(m["path"], base, vroot)
+        psref = _OWIF_FILE_SREF_PREFIX + ppath
         out.append("<e2movie>")
-        out.append(f"<e2servicereference>{escape(m['sref'])}</e2servicereference>")
+        out.append(f"<e2servicereference>{escape(psref)}</e2servicereference>")
         out.append(f"<e2title>{escape(m['title'])}</e2title>")
         out.append(f"<e2description>{escape(m['plot'][:200])}</e2description>")
         out.append(f"<e2descriptionextended>{escape(m['plot'])}</e2descriptionextended>")
         out.append(f"<e2servicename>{escape(m['servicename'])}</e2servicename>")
         out.append(f"<e2time>{m['time']}</e2time>")
-        out.append(f"<e2length>{m['duration']}</e2length>")
+        out.append(f"<e2length>{escape(_owif_fmt_length(m['duration']))}</e2length>")
         out.append("<e2tags></e2tags>")
-        out.append(f"<e2filename>{escape(m['filename'])}</e2filename>")
+        out.append(f"<e2filename>{escape(ppath)}</e2filename>")
         out.append(f"<e2filesize>{m['size']}</e2filesize>")
         out.append("</e2movie>")
     out.append("</e2movielist>")
     return "\n".join(out)
 
 
-def _owif_movielist_json(base, movies):
-    return {
-        "directory": base if base.endswith("/") else base + "/",
-        "bookmarks": [],
-        "movies": [{
-            "servicereference": m["sref"],
+def _owif_movielist_json(base, movies, directory=None, vroot=None):
+    if directory is None:
+        directory = base
+    out_movies = []
+    for m in movies:
+        ppath = _owif_present_path(m["path"], base, vroot)
+        psref = _OWIF_FILE_SREF_PREFIX + ppath
+        out_movies.append({
+            "servicereference": psref,
+            "fullname": psref,
             "title": m["title"],
+            "eventname": m["title"],
             "description": m["plot"][:200],
             "descriptionExtended": m["plot"],
             "servicename": m["servicename"],
             "recordingtime": m["time"],
-            "length": m["duration"],
-            "filename": m["filename"],
+            "begintime": _owif_begintime(m["time"]),
+            "length": _owif_fmt_length(m["duration"]),
+            "lastseen": 0,
+            "filename": ppath,
+            "filename_stripped": os.path.basename(ppath),
             "filesize": m["size"],
+            "filesize_readable": _owif_human_size(m["size"]),
             "tags": "",
-        } for m in movies],
+        })
+    return {
+        "directory": directory if directory.endswith("/") else directory + "/",
+        "bookmarks": [],
+        "recursive": False,
+        "movies": out_movies,
     }
+
+
+def _owif_begintime(ts):
+    """Menschenlesbares Aufnahmedatum (OpenWebif 'begintime')."""
+    try:
+        return datetime.fromtimestamp(int(ts)).strftime("%d.%m.%Y %H:%M")
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
+def _owif_moviedetails_xml(m):
+    from xml.sax.saxutils import escape
+    return "\n".join([
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        "<e2movie>",
+        f"<e2servicereference>{escape(m['sref'])}</e2servicereference>",
+        f"<e2title>{escape(m['title'])}</e2title>",
+        f"<e2description>{escape(m['plot'][:200])}</e2description>",
+        f"<e2descriptionextended>{escape(m['plot'])}</e2descriptionextended>",
+        f"<e2servicename>{escape(m['servicename'])}</e2servicename>",
+        f"<e2time>{m['time']}</e2time>",
+        f"<e2length>{escape(_owif_fmt_length(m['duration']))}</e2length>",
+        "<e2tags></e2tags>",
+        f"<e2filename>{escape(m['filename'])}</e2filename>",
+        f"<e2filesize>{m['size']}</e2filesize>",
+        "</e2movie>",
+    ])
+
+
+def _owif_moviedetails_json(m):
+    return {"result": True, "movie": {
+        "servicereference": m["sref"],
+        "fullname": m["sref"],
+        "title": m["title"],
+        "eventname": m["title"],
+        "description": m["plot"][:200],
+        "descriptionExtended": m["plot"],
+        "servicename": m["servicename"],
+        "recordingtime": m["time"],
+        "begintime": _owif_begintime(m["time"]),
+        "length": _owif_fmt_length(m["duration"]),
+        "filename": m["filename"],
+        "filename_stripped": os.path.basename(m["filename"]),
+        "filesize": m["size"],
+        "filesize_readable": _owif_human_size(m["size"]),
+        "tags": "",
+    }}
+
+
+def _owif_delete_recording(filepath):
+    """Löscht eine Aufnahme (+ .nfo, leere Ordner) unterhalb des
+    Aufnahmeverzeichnisses. Akzeptiert auch virtuelle Client-Pfade
+    (z. B. /media/hdd/movie/…). Liefert (ok, meldung)."""
+    base = os.path.abspath(get_recordings_config()["path"])
+    real = _owif_resolve_recording(filepath)
+    if not real:
+        return False, "Aufnahme nicht gefunden"
+    try:
+        os.remove(real)
+        nfo = real.rsplit(".", 1)[0] + ".nfo"
+        if os.path.exists(nfo):
+            os.remove(nfo)
+        dirpath = os.path.dirname(real)
+        try:
+            if dirpath != base and not os.listdir(dirpath):
+                os.rmdir(dirpath)
+                parent = os.path.dirname(dirpath)
+                if parent != base and not os.listdir(parent):
+                    os.rmdir(parent)
+        except OSError:
+            pass
+        log.info(f"OpenWebif DELETE Aufnahme: {real}")
+        return True, f"Aufnahme '{os.path.basename(real)}' gelöscht"
+    except OSError as e:
+        return False, str(e)
 
 
 class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
@@ -10511,6 +10692,12 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
     def _query(self):
         parsed = urllib.parse.urlparse(self.path)
         return urllib.parse.parse_qs(parsed.query)
+
+    def _port(self):
+        try:
+            return self.server.server_address[1]
+        except Exception:
+            return "?"
 
     def _is_stream(self):
         return bool(_OWIF_SREF_RE.match(self._rest()))
@@ -10539,10 +10726,30 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
             rest = self._rest()
             low = rest.lower()
             # Aufnahmen-Übersicht (Dream Player Recordings-Tab)
-            if low in ("web/movielist", "api/movielist"):
-                log.info(f"OpenWebif MOVIELIST from {self.client_address[0]} "
+            if low in ("web/movielist", "api/movielist",
+                       "web/fullmovielist", "api/fullmovielist"):
+                log.info(f"OpenWebif MOVIELIST :{self._port()} {self.path} "
+                         f"from {self.client_address[0]} "
                          f"[{self.headers.get('User-Agent','')[:40]}]")
                 self._serve_movielist(is_json=low.startswith("api/"))
+                return
+            # Aufnahme-Verzeichnisse (Dream Player fragt oft zuerst danach)
+            if (low in ("web/getlocations", "api/getlocations",
+                        "web/getcurrlocation", "api/getcurrlocation")
+                    and get_owif_config().get("recordings_enabled", True)):
+                log.info(f"OpenWebif LOCATIONS :{self._port()} {self.path} "
+                         f"from {self.client_address[0]} "
+                         f"[{self.headers.get('User-Agent','')[:40]}]")
+                self._serve_locations(is_json=low.startswith("api/"),
+                                      current=low.endswith("getcurrlocation"))
+                return
+            # Aufnahme-Details (vor Wiedergabe)
+            if low in ("web/moviedetails", "api/moviedetails"):
+                self._serve_moviedetails(is_json=low.startswith("api/"))
+                return
+            # Aufnahme löschen (Dream Player Recordings-Tab)
+            if low in ("web/moviedelete", "api/moviedelete"):
+                self._serve_moviedelete(is_json=low.startswith("api/"))
                 return
             # OpenWebif-Datei-Download/-Stream einer Aufnahme
             if low == "file":
@@ -10793,16 +11000,28 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
 
     # ── Aufnahmen: Movielist + Datei-Streaming ───────────
     def _serve_movielist(self, is_json):
+        # Dream Player fragt movielist mit seinem konfigurierten "Movie
+        # location" (Default /media/hdd/movie) als dirname an und zeigt nur
+        # Aufnahmen, deren Pfad/Directory dazu passt. Wir spiegeln daher die
+        # Aufnahmen unter genau diesen virtuellen Ordner (vroot) und mappen
+        # beim Abspielen/Löschen wieder auf den echten Pfad zurück.
+        vroot = (self._query().get("dirname") or [""])[0] or None
         if not get_owif_config().get("recordings_enabled", True):
-            base, movies = "/", []
+            base, movies = os.path.abspath(get_recordings_config()["path"]), []
         else:
             base, movies = _owif_scan_movies()
+        directory = vroot or base
         if is_json:
-            payload = json.dumps(_owif_movielist_json(base, movies)).encode("utf-8")
+            payload = json.dumps(
+                _owif_movielist_json(base, movies, directory=directory, vroot=vroot)
+            ).encode("utf-8")
             ctype = "application/json; charset=utf-8"
         else:
-            payload = _owif_movielist_xml(base, movies).encode("utf-8")
+            payload = _owif_movielist_xml(base, movies, vroot=vroot).encode("utf-8")
             ctype = "text/xml; charset=utf-8"
+        log.info(f"OpenWebif MOVIELIST -> {len(movies)} Aufnahmen, "
+                 f"{len(payload)} Bytes ({'JSON' if is_json else 'XML'}), "
+                 f"dirname={vroot or '-'}")
         try:
             self.send_response(200)
             self.send_header("Content-Type", ctype)
@@ -10813,20 +11032,86 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _serve_locations(self, is_json, current):
+        """Meldet e2proxy's Aufnahme-Verzeichnis als OpenWebif-Location, damit
+        Dream Player die Aufnahmen dort (statt beim echten Receiver) sucht."""
+        base = os.path.abspath(get_recordings_config()["path"])
+        loc = base if base.endswith("/") else base + "/"
+        if is_json:
+            if current:
+                data = {"result": True, "location": base}
+            else:
+                data = {"result": True, "locations": [loc], "default": loc}
+            payload = json.dumps(data).encode("utf-8")
+            ctype = "application/json; charset=utf-8"
+        else:
+            from xml.sax.saxutils import escape
+            payload = ("\n".join([
+                '<?xml version="1.0" encoding="UTF-8"?>',
+                "<e2locations>",
+                f"<e2location>{escape(loc)}</e2location>",
+                "</e2locations>",
+            ])).encode("utf-8")
+            ctype = "text/xml; charset=utf-8"
+        self._send_bytes(200, ctype, payload)
+
+    def _serve_moviedetails(self, is_json):
+        q = self._query()
+        sref = (q.get("sRef") or q.get("sref") or [""])[0]
+        base = os.path.abspath(get_recordings_config()["path"])
+        vpath = _owif_sref_to_path(sref)
+        real = _owif_resolve_recording(vpath)
+        entry = _owif_movie_entry(real, base) if real else None
+        if not entry:
+            self._reverse_proxy(b"")
+            return
+        # Dem Client denselben (virtuellen) Pfad zurückgeben, den er kennt.
+        if vpath:
+            entry["filename"] = vpath
+            entry["sref"] = _OWIF_FILE_SREF_PREFIX + vpath
+        if is_json:
+            payload = json.dumps(_owif_moviedetails_json(entry)).encode("utf-8")
+            ctype = "application/json; charset=utf-8"
+        else:
+            payload = _owif_moviedetails_xml(entry).encode("utf-8")
+            ctype = "text/xml; charset=utf-8"
+        self._send_bytes(200, ctype, payload)
+
+    def _serve_moviedelete(self, is_json):
+        q = self._query()
+        sref = (q.get("sRef") or q.get("sref") or [""])[0]
+        path = _owif_sref_to_path(sref)
+        ok, msg = _owif_delete_recording(path)
+        log.info(f"OpenWebif MOVIEDELETE from {self.client_address[0]}: "
+                 f"{ok} ({msg})")
+        if is_json:
+            payload = json.dumps({"result": ok, "message": msg}).encode("utf-8")
+            ctype = "application/json; charset=utf-8"
+        else:
+            from xml.sax.saxutils import escape
+            payload = ("\n".join([
+                '<?xml version="1.0" encoding="UTF-8"?>',
+                "<e2simplexmlresult>",
+                f"<e2state>{'True' if ok else 'False'}</e2state>",
+                f"<e2statetext>{escape(msg)}</e2statetext>",
+                "</e2simplexmlresult>",
+            ])).encode("utf-8")
+            ctype = "text/xml; charset=utf-8"
+        self._send_bytes(200, ctype, payload)
+
     def _serve_file_param(self):
         """OpenWebif /file?file=<pfad> — Aufnahmen lokal ausliefern, sonst
         an den Receiver weiterreichen (z. B. Picons/Logs)."""
         fp = self._query().get("file", [""])[0]
-        base = os.path.abspath(get_recordings_config()["path"])
-        if fp and os.path.abspath(fp).startswith(base) and os.path.isfile(fp):
-            self._send_file_range(fp)
+        real = _owif_resolve_recording(fp)
+        if real:
+            self._send_file_range(real)
             return
         self._reverse_proxy(b"")
 
     def _serve_recording_file(self, filepath):
-        base = os.path.abspath(get_recordings_config()["path"])
-        real = os.path.abspath(filepath)
-        if not real.startswith(base) or not os.path.isfile(real):
+        real = _owif_resolve_recording(filepath)
+        if not real:
             self._fail(404, "Aufnahme nicht gefunden")
             return
         log.info(f"OpenWebif RECORDING from {self.client_address[0]}: "
