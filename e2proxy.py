@@ -40,13 +40,13 @@ from datetime import datetime, timedelta, timezone
 # ── Pfade ─────────────────────────────────────────────────
 # Datenpfad: via Env-Variable überschreibbar (für Docker)
 DATA_DIR       = os.environ.get("E2PROXY_DATA_DIR", "/var/lib/e2proxy")
-VERSION        = "4.4"   # Offizielle Version — nur beim Pull Request erhöhen (major/minor)
+VERSION        = "4.5"   # Offizielle Version — nur beim Pull Request erhöhen (major/minor)
 # ── Interne Build-/Versionskennung ────────────────────────
 # Identifiziert eindeutig den ausgerollten Branch/Stand bei Tests, OHNE die
 # offizielle VERSION zu verändern (die steigt erst beim PR). Bei jedem Test-
 # Rollout eines neuen Standes BUILD_SEQ erhöhen.
-BUILD_BRANCH     = "feature/switch-analyze"
-BUILD_SEQ        = "6ff20bfa"
+BUILD_BRANCH     = "feature/grafana-loki-stream-diagnostics"
+BUILD_SEQ        = "fc43d840"
 INTERNAL_VERSION = f"{VERSION}+{BUILD_BRANCH.split('/')[-1]}.{BUILD_SEQ}"
 CONFIG_FILE    = f"{DATA_DIR}/config.json"
 FAVORITES_FILE = f"{DATA_DIR}/favorites.json"
@@ -1830,6 +1830,200 @@ def write_chunked(wfile, data):
     wfile.flush()
 
 
+# ── Stream-Diagnose (strukturierte Logs für Loki/Grafana) ─────────────
+#
+# Streams bleiben gelegentlich ein bis zwei Minuten stehen. Um das im Nachhinein
+# analysieren zu können, misst jede Stream-Schleife getrennt, wie lange sie auf
+# Upstream-Daten (Receiver bzw. ffmpeg) und wie lange sie auf den Client
+# gewartet hat. Damit lässt sich ein Stillstand eindeutig zuordnen:
+#   read_wait steigt  → Receiver/Transponder bzw. ffmpeg liefert nicht
+#   write_wait steigt → Client liest nicht ab (Netz/Player-Buffer)
+# Ein Watchdog-Thread meldet laufende Stillstände in Echtzeit, damit ein Hänger
+# auch dann sichtbar wird, wenn der Stream danach nie wieder Daten liefert.
+#
+# Ausgabeformat ist logfmt hinter dem Marker "DIAG", damit Loki es per
+# `|= "DIAG" | logfmt` ohne weitere Parser-Konfiguration zerlegen kann.
+
+DIAG_STALL_SEC     = 3.0    # ab dieser Lücke ohne Daten gilt ein Stream als stehend
+DIAG_STALL_REPEAT  = 15.0   # Wiederholintervall für "stall läuft noch"-Meldungen
+DIAG_SAMPLE_SEC    = 15.0   # Durchsatz-Samples (nur im Diag-Modus)
+
+_diag_streams = {}          # diag_id → Live-Zähler eines aktiven Streams
+_diag_lock = threading.Lock()
+_diag_counter = 0
+
+
+def diag_enabled():
+    """True, wenn der erweiterte Diagnose-Modus aktiv ist (on demand)."""
+    try:
+        return bool(get_config().get("diag_logging", False))
+    except Exception:
+        return False
+
+
+def _diag_quote(v):
+    s = "" if v is None else str(v)
+    s = s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+    if s == "" or any(c in s for c in ' ="'):
+        return f'"{s}"'
+    return s
+
+
+def diag_log(event, level="info", **fields):
+    """Schreibt eine strukturierte Diagnose-Zeile (logfmt) ins normale Log."""
+    parts = [f"event={_diag_quote(event)}"]
+    for k, v in fields.items():
+        if v is None:
+            continue
+        if isinstance(v, float):
+            v = f"{v:.2f}"
+        parts.append(f"{k}={_diag_quote(v)}")
+    line = "DIAG " + " ".join(parts)
+    getattr(log, level, log.info)(line)
+
+
+def diag_stream_start(rid, service_ref, mode, channel=None, client=None, profile=None):
+    """Registriert einen Stream für die Stillstands-Überwachung."""
+    global _diag_counter
+    st = _receiver_state.get(rid)
+    if isinstance(st, dict):
+        channel = channel or st.get("channel_name")
+        client = client or st.get("client_ip")
+        profile = profile or st.get("profile")
+    now = time.monotonic()
+    with _diag_lock:
+        _diag_counter += 1
+        diag_id = f"s{_diag_counter:06d}"
+    d = {
+        "id": diag_id, "rid": rid, "ref": service_ref, "mode": mode,
+        "channel": channel or "", "client": client or "", "profile": profile or "",
+        "t0": now, "last_data": now, "bytes": 0,
+        "read_wait": 0.0, "write_wait": 0.0,
+        "stall_count": 0, "stall_total": 0.0,
+        "stall_since": None, "stall_kind": None, "stall_noted": 0.0,
+        "last_sample": now, "last_sample_bytes": 0,
+    }
+    with _diag_lock:
+        _diag_streams[diag_id] = d
+    diag_log("stream_start", rid=rid, sid=diag_id, ref=service_ref, mode=mode,
+             channel=d["channel"], client=d["client"], profile=d["profile"])
+    return d
+
+
+def diag_stream_end(d, reason="client_closed"):
+    """Meldet einen Stream ab und schreibt die Zusammenfassung."""
+    if not d:
+        return
+    with _diag_lock:
+        _diag_streams.pop(d["id"], None)
+    dur = max(0.001, time.monotonic() - d["t0"])
+    diag_log("stream_end",
+             level=("warning" if d["stall_count"] else "info"),
+             rid=d["rid"], sid=d["id"], ref=d["ref"], mode=d["mode"],
+             channel=d["channel"], client=d["client"], reason=reason,
+             dur_s=dur, mb=d["bytes"] / 1048576.0,
+             kbps=(d["bytes"] * 8 / 1000.0) / dur,
+             read_wait_s=d["read_wait"], write_wait_s=d["write_wait"],
+             stalls=d["stall_count"], stall_s=d["stall_total"])
+
+
+def diag_note_chunk(d, nbytes, read_wait, write_wait):
+    """Bucht einen gelieferten Chunk inkl. der Wartezeiten davor."""
+    if not d:
+        return
+    d["bytes"] += nbytes
+    d["read_wait"] += read_wait
+    d["write_wait"] += write_wait
+    d["last_data"] = time.monotonic()
+    # Ein laufender Stillstand ist mit dem Chunk beendet → Ende protokollieren.
+    if d["stall_since"] is not None:
+        gap = d["last_data"] - d["stall_since"]
+        d["stall_since"] = None
+        d["stall_total"] += gap
+        diag_log("stall_end", level="warning", rid=d["rid"], sid=d["id"],
+                 ref=d["ref"], mode=d["mode"], channel=d["channel"],
+                 client=d["client"], kind=d.get("stall_kind") or "unknown",
+                 gap_s=gap, mb=d["bytes"] / 1048576.0)
+        d["stall_kind"] = None
+
+
+def _diag_watchdog_loop():
+    """Meldet Stillstände, während sie passieren, plus optionale Samples."""
+    while True:
+        time.sleep(1.0)
+        try:
+            now = time.monotonic()
+            sample_on = diag_enabled()
+            with _diag_lock:
+                streams = list(_diag_streams.values())
+            for d in streams:
+                gap = now - d["last_data"]
+                if gap >= DIAG_STALL_SEC:
+                    if d["stall_since"] is None:
+                        # Wer blockiert? Die Schleife hängt entweder im Lesen
+                        # (Upstream liefert nichts) oder im Schreiben (Client
+                        # nimmt nichts ab) — das zuletzt gesetzte Phasen-Flag
+                        # sagt es eindeutig.
+                        d["stall_since"] = d["last_data"]
+                        d["stall_count"] += 1
+                        d["stall_noted"] = now
+                        d["stall_kind"] = ("client_backpressure"
+                                           if d.get("phase") == "write"
+                                           else "upstream_no_data")
+                        diag_log("stall_start", level="warning", rid=d["rid"],
+                                 sid=d["id"], ref=d["ref"], mode=d["mode"],
+                                 channel=d["channel"], client=d["client"],
+                                 kind=d["stall_kind"], gap_s=gap,
+                                 mb=d["bytes"] / 1048576.0)
+                    elif now - d["stall_noted"] >= DIAG_STALL_REPEAT:
+                        d["stall_noted"] = now
+                        diag_log("stall_ongoing", level="warning", rid=d["rid"],
+                                 sid=d["id"], ref=d["ref"], mode=d["mode"],
+                                 channel=d["channel"], client=d["client"],
+                                 kind=d["stall_kind"],
+                                 gap_s=now - d["stall_since"])
+                if sample_on and now - d["last_sample"] >= DIAG_SAMPLE_SEC:
+                    span = now - d["last_sample"]
+                    delta = d["bytes"] - d["last_sample_bytes"]
+                    d["last_sample"] = now
+                    d["last_sample_bytes"] = d["bytes"]
+                    diag_log("sample", rid=d["rid"], sid=d["id"], ref=d["ref"],
+                             mode=d["mode"], channel=d["channel"],
+                             client=d["client"],
+                             kbps=(delta * 8 / 1000.0) / max(0.001, span),
+                             mb=d["bytes"] / 1048576.0,
+                             read_wait_s=d["read_wait"],
+                             write_wait_s=d["write_wait"],
+                             stalls=d["stall_count"],
+                             dur_s=now - d["t0"])
+        except Exception as e:
+            log.debug(f"Diag-Watchdog Fehler: {e}")
+
+
+def diag_active_streams():
+    """Snapshot der überwachten Streams für die API/UI."""
+    now = time.monotonic()
+    out = []
+    with _diag_lock:
+        streams = list(_diag_streams.values())
+    for d in streams:
+        dur = max(0.001, now - d["t0"])
+        out.append({
+            "sid": d["id"], "rid": d["rid"], "ref": d["ref"], "mode": d["mode"],
+            "channel": d["channel"], "client": d["client"],
+            "duration_s": round(dur, 1),
+            "mb": round(d["bytes"] / 1048576.0, 2),
+            "kbps": round((d["bytes"] * 8 / 1000.0) / dur, 1),
+            "read_wait_s": round(d["read_wait"], 2),
+            "write_wait_s": round(d["write_wait"], 2),
+            "stalls": d["stall_count"],
+            "stall_total_s": round(d["stall_total"], 2),
+            "stalled_since_s": (round(now - d["stall_since"], 1)
+                                if d["stall_since"] is not None else None),
+        })
+    return out
+
+
 def stream_passthrough(rid, service_ref, wfile, use_chunked=False):
     r = get_receiver_by_id(rid)
     encoded_ref = urllib.parse.quote(service_ref, safe=":@")
@@ -1852,26 +2046,39 @@ def stream_passthrough(rid, service_ref, wfile, use_chunked=False):
     sock.settimeout(30)
     bytes_sent = 0
     _last_note = 0.0
+    d = diag_stream_start(rid, service_ref, "passthrough")
     with stream_sockets_lock:
         stream_sockets[rid] = sock
+    end_reason = "client_closed"
     try:
         while True:
+            d["phase"] = "read"
+            t_a = time.monotonic()
             chunk = sock.recv(CHUNK_SIZE)
+            t_b = time.monotonic()
             if not chunk:
+                end_reason = "upstream_eof"
                 break
+            d["phase"] = "write"
             if use_chunked:
                 write_chunked(wfile, chunk)
             else:
                 wfile.write(chunk)
                 wfile.flush()
+            t_c = time.monotonic()
             bytes_sent += len(chunk)
+            diag_note_chunk(d, len(chunk), t_b - t_a, t_c - t_b)
             now = time.time()
             if now - _last_note >= 1.0:
                 note_stream_bytes(rid, bytes_sent)
                 _last_note = now
-    except (BrokenPipeError, ConnectionResetError, OSError):
-        pass
+    except socket.timeout:
+        end_reason = "upstream_timeout"
+        log.warning(f"Passthrough {service_ref}: 30s ohne Daten vom Receiver — Stream beendet")
+    except (BrokenPipeError, ConnectionResetError, OSError) as e:
+        end_reason = f"{type(e).__name__}"
     finally:
+        diag_stream_end(d, end_reason)
         with stream_sockets_lock:
             if stream_sockets.get(rid) is sock:
                 stream_sockets.pop(rid, None)
@@ -1904,7 +2111,7 @@ def build_ffmpeg_cmd(rid, service_ref, tp, probesize=None, analyzeduration=None,
     fflags = "+discardcorrupt+genpts+nobuffer" if low_latency else "+discardcorrupt+genpts"
 
     base = [
-        "ffmpeg", "-loglevel", "warning",
+        "ffmpeg", "-loglevel", ("verbose" if diag_enabled() else "warning"),
         # Stalled Receiver darf ffmpeg nicht ewig blockieren: nach 20s ohne Daten
         # bricht der HTTP-Input ab → Prozess endet → Tuner/ref_lock werden freigegeben.
         "-rw_timeout", "20000000",
@@ -2003,19 +2210,42 @@ def stream_transcoded(rid, service_ref, tp, wfile, use_chunked=False, channel_na
     proc = None
     bytes_sent = 0
     attempts = 0
+    d = None
+    end_reason = "client_closed"
     # content_type ist probe-unabhängig; sicherer Default bis erster Build
     _, content_type = build_ffmpeg_cmd(rid, service_ref, tp)
 
     def read_stderr(pipe, sink):
+        # ffmpeg-Meldungen sind die wichtigste Quelle bei hängenden Streams.
+        # Sie werden klassifiziert, damit man in Loki gezielt nach
+        # Transportstrom-Problemen filtern kann statt Freitext zu greppen.
+        FF_PROBLEMS = (
+            ("scrambled", "scrambled"), ("conditional access", "scrambled"),
+            ("not authorized", "scrambled"),
+            ("non-monotonous dts", "dts"), ("non-monotonic dts", "dts"),
+            ("pes packet size mismatch", "ts_corrupt"),
+            ("invalid data found", "ts_corrupt"),
+            ("corrupt", "ts_corrupt"),
+            ("cc error", "cc_error"), ("continuity", "cc_error"),
+            ("buffer underflow", "underflow"),
+            ("circular buffer overrun", "overrun"),
+            ("timed out", "timeout"), ("timeout", "timeout"),
+            ("connection reset", "conn"), ("connection refused", "conn"),
+            ("error opening input", "input_error"),
+        )
         try:
             for line in pipe:
                 l = line.decode("utf-8", errors="replace").strip()
-                if l:
-                    sink.append(l)
-                    if any(kw in l.lower() for kw in ["scrambled", "conditional access"]):
-                        log.warning(f"SCRAMBLED: {l}")
-                    else:
-                        log.debug(f"ffmpeg: {l}")
+                if not l:
+                    continue
+                sink.append(l)
+                kind = next((k for needle, k in FF_PROBLEMS if needle in l.lower()), None)
+                if kind:
+                    diag_log("ffmpeg_issue", level="warning", rid=rid,
+                             ref=service_ref, channel=channel_name or "",
+                             kind=kind, msg=l)
+                else:
+                    log.debug(f"ffmpeg[{label}] {service_ref}: {l}")
         except Exception:
             pass
 
@@ -2108,26 +2338,39 @@ def stream_transcoded(rid, service_ref, tp, wfile, use_chunked=False, channel_na
 
         # ── Phase 2: Daten erhalten → Erfolg werten & normal streamen ────────
         record_stream_start(service_ref, True, attempts, no_latency, channel_name)
+        d = diag_stream_start(rid, service_ref, "transcode", channel=channel_name,
+                              profile=label)
         chunk = first_chunk
         _last_note = 0.0
+        _read_wait = 0.0
         while chunk:
+            d["phase"] = "write"
+            t_b = time.monotonic()
             if use_chunked:
                 write_chunked(wfile, chunk)
             else:
                 wfile.write(chunk)
                 wfile.flush()
+            t_c = time.monotonic()
             bytes_sent += len(chunk)
+            # Die Wartezeit des vorangegangenen Reads gehört zu diesem Chunk.
+            diag_note_chunk(d, len(chunk), _read_wait, t_c - t_b)
             now = time.time()
             if now - _last_note >= 1.0:
                 note_stream_bytes(rid, bytes_sent)
                 _last_note = now
+            d["phase"] = "read"
+            t_a = time.monotonic()
             chunk = proc.stdout.read(CHUNK_SIZE)
+            _read_wait = time.monotonic() - t_a
+        end_reason = "ffmpeg_eof"
 
     except ScrambledStreamError:
         raise
-    except (BrokenPipeError, ConnectionResetError, OSError):
-        pass
+    except (BrokenPipeError, ConnectionResetError, OSError) as e:
+        end_reason = type(e).__name__
     finally:
+        diag_stream_end(d, end_reason)
         with stream_processes_lock:
             stream_processes.pop(rid, None)
         if proc:
@@ -7164,6 +7407,7 @@ def build_settings_ui():
     tvdb_api_key = cfg.get("tvdb_api_key", "")
     recorder_url = cfg.get("recorder_url", "")
     log_retention_days = cfg.get("log_retention_days", 5)
+    diag_enabled_attr = "checked" if cfg.get("diag_logging", False) else ""
     # OpenWebif-Emulation ("virtuelle Enigma2-Box")
     owif = get_owif_config()
     owif_enabled_attr = "checked" if owif["enabled"] else ""
@@ -7717,6 +7961,23 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
             </td>
             <td style="width:120px">
               <button class="btn btn-primary" onclick="saveApiKey('log_retention_days','log-retention')" style="font-size:10px">💾 <span data-i18n="common.save">Save</span></button>
+            </td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted);font-size:11px">Stream-Diagnose</td>
+            <td>
+              <label style="font-size:11px;display:flex;align-items:center;gap:8px">
+                <input type="checkbox" id="diag-logging" {diag_enabled_attr} onchange="toggleDiag(this.checked)">
+                <span>Erweitertes Diagnose-Logging (ffmpeg <code>verbose</code> + Durchsatz-Samples alle 15 s)</span>
+              </label>
+              <div style="font-size:10px;color:var(--muted);margin-top:4px">
+                Stillstände (&gt;3 s ohne Daten) werden <b>immer</b> als <code>DIAG event=stall_start</code> protokolliert.
+                Dieser Schalter erhöht nur die Detailtiefe — bei Bedarf einschalten, danach wieder aus (Log-Volumen).
+              </div>
+              <div id="diag-live" style="font-size:10px;color:var(--muted);margin-top:6px;font-family:monospace"></div>
+            </td>
+            <td style="width:120px">
+              <button class="btn" onclick="refreshDiag()" style="font-size:10px">🔄 Status</button>
             </td>
           </tr>
         </tbody>
@@ -8606,6 +8867,30 @@ function saveApiKey(key, inputId) {{
       showToast(d.ok ? '✓ API-Key gespeichert!' : 'Fehler', d.ok ? 'success' : 'error');
     }});
   }});
+}}
+
+function toggleDiag(on) {{
+  fetch('/api/diag?on=' + (on ? '1' : '0')).then(r=>r.json()).then(d => {{
+    showToast(d.ok ? (d.enabled ? '✓ Diagnose-Logging aktiv' : '✓ Diagnose-Logging aus')
+                   : 'Fehler', d.ok ? 'success' : 'error');
+    renderDiag(d);
+  }});
+}}
+
+function refreshDiag() {{
+  fetch('/api/diag').then(r=>r.json()).then(renderDiag);
+}}
+
+function renderDiag(d) {{
+  const el = document.getElementById('diag-live');
+  if (!el || !d || !d.ok) return;
+  if (!d.streams || !d.streams.length) {{ el.textContent = 'Kein aktiver Stream.'; return; }}
+  el.innerHTML = d.streams.map(s =>
+    (s.channel || s.ref) + ' [' + s.mode + '] ' + s.kbps + ' kbps · ' + s.mb + ' MB · '
+    + 'read-wait ' + s.read_wait_s + 's / write-wait ' + s.write_wait_s + 's · '
+    + 'Stalls: ' + s.stalls + ' (' + s.stall_total_s + 's)'
+    + (s.stalled_since_s !== null ? ' <b style="color:var(--danger,#e55)">STEHT seit ' + s.stalled_since_s + 's</b>' : '')
+  ).join('<br>');
 }}
 
 function saveOwif() {{
@@ -10750,6 +11035,25 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"ok": True, "count": len(channels)})
             return
 
+        if path == "/api/diag":
+            # Diagnose-Modus abfragen bzw. per Query-Parameter umschalten
+            # (?on=1 / ?on=0). Zusätzlich der Live-Zustand aller Streams.
+            want = params.get("on", [None])[0]
+            if want is not None:
+                cfg = get_config()
+                cfg["diag_logging"] = want in ("1", "true", "on", "yes")
+                update_config(cfg)
+                diag_log("diag_mode", enabled=cfg["diag_logging"])
+                log.info(f"Diagnose-Modus {'aktiviert' if cfg['diag_logging'] else 'deaktiviert'}")
+            self.send_json({
+                "ok": True,
+                "enabled": diag_enabled(),
+                "stall_threshold_s": DIAG_STALL_SEC,
+                "sample_interval_s": DIAG_SAMPLE_SEC,
+                "streams": diag_active_streams(),
+            })
+            return
+
         if path == "/api/logs":
             # Live-Abfrage aus RAM-Buffer (für laufenden Browser)
             level = params.get("level", ["INFO"])[0]
@@ -12649,6 +12953,7 @@ def run():
     threading.Thread(target=maintenance_notify_loop, daemon=True).start()
     threading.Thread(target=recording_reaper_loop, daemon=True, name="rec-reaper").start()
     threading.Thread(target=usage_flush_loop, daemon=True, name="usage-flush").start()
+    threading.Thread(target=_diag_watchdog_loop, daemon=True, name="diag-watchdog").start()
     start_compression_scheduler()
 
     proxy_host = get_proxy_host()
