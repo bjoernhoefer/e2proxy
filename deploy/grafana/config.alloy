@@ -1,0 +1,149 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Grafana Alloy — Standort Wien (Streaming-Pi)
+//
+// Metriken → Grafana Cloud Prometheus
+// Logs     → Grafana Cloud Loki  (Docker-Logs von e2proxy / e2recorder)
+//
+// Erwartete Umgebungsvariablen (aus /home/pi/alloy/.env):
+//   BJOERN01_USER        Prometheus/Mimir User-ID
+//   BJOERN01_TOKEN       Access-Policy-Token (metrics:write)
+//   BJOERN01_LOKI_USER   Loki User-ID
+//   BJOERN01_LOKI_TOKEN  Access-Policy-Token (logs:write)
+//   BJOERN01_LOKI_URL    z.B. https://logs-prod-012.grafana.net/loki/api/v1/push
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Metriken ────────────────────────────────────────────────────────────────
+
+prometheus.scrape "node_wien" {
+  targets = [{ __address__ = "192.168.88.67:9100",
+      site = "wien", host = "streamer", job = "node" }]
+  scrape_interval = "30s"
+  forward_to = [prometheus.remote_write.bjoern01.receiver]
+}
+
+prometheus.scrape "adsb_system_wien" {
+  targets = [{ __address__ = "192.168.88.67:9101" }]
+  scrape_interval = "30s"
+  honor_labels    = true
+  forward_to = [prometheus.remote_write.bjoern01.receiver]
+}
+
+prometheus.remote_write "bjoern01" {
+  endpoint {
+    url = "https://prometheus-prod-65-prod-eu-west-2.grafana.net/api/prom/push"
+    basic_auth {
+      username = env("BJOERN01_USER")
+      password = env("BJOERN01_TOKEN")
+    }
+  }
+}
+
+// ── Logs: Docker-Container entdecken ────────────────────────────────────────
+
+discovery.docker "local" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "15s"
+}
+
+// Nur die relevanten Container einsammeln — der Loki-Free-Tier (50 GB/Monat)
+// soll nicht von Plex- oder Cloudflared-Logs aufgebraucht werden.
+discovery.relabel "e2_containers" {
+  targets = discovery.docker.local.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(e2proxy|e2recorder)"
+    action        = "keep"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+  rule {
+    target_label = "job"
+    replacement  = "e2proxy"
+  }
+  rule {
+    target_label = "site"
+    replacement  = "wien"
+  }
+  rule {
+    target_label = "host"
+    replacement  = "streamer"
+  }
+}
+
+loki.source.docker "e2" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.relabel.e2_containers.output
+  relabel_rules = discovery.relabel.e2_containers.rules
+  forward_to    = [loki.process.e2proxy.receiver]
+}
+
+// ── Logs: Aufbereitung ──────────────────────────────────────────────────────
+//
+// e2proxy-Zeilen sehen so aus:
+//   2026-08-07 07:16:19,822 [DEBUG] DIAG event=stall_start rid=vu1 ...
+// Der Präfix wird abgeschnitten (Zeitstempel + Level werden zu Metadaten),
+// damit `| logfmt` in Loki direkt auf den DIAG-Zeilen funktioniert.
+
+loki.process "e2proxy" {
+  forward_to = [loki.write.bjoern01.receiver]
+
+  // SSDP-Discovery schreibt alle 30 s eine DEBUG-Zeile ohne Diagnosewert.
+  stage.drop {
+    expression = "SSDP: M-SEARCH"
+    drop_counter_reason = "ssdp_noise"
+  }
+
+  stage.regex {
+    expression = "^(?P<ts>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2},\\d{3}) \\[(?P<level>[A-Z]+)\\] (?P<message>(?s:.*))$"
+  }
+
+  stage.timestamp {
+    source   = "ts"
+    format   = "2006-01-02 15:04:05,000"
+    // Die Container laufen ohne TZ-Variable, e2proxy loggt daher in UTC.
+    location = "UTC"
+  }
+
+  stage.labels {
+    values = { level = "level" }
+  }
+
+  // Nur noch die eigentliche Nachricht speichern (spart Volumen und macht
+  // `| logfmt` möglich, weil die DIAG-Zeile dann am Zeilenanfang steht).
+  stage.output {
+    source = "message"
+  }
+
+  // Aus den Logs abgeleitete Zähler — sichtbar unter :12345/metrics.
+  stage.match {
+    selector = "{job=\"e2proxy\"}"
+
+    stage.regex {
+      expression = "^DIAG event=(?P<diag_event>[a-z_]+)"
+    }
+    stage.metrics {
+      metric.counter {
+        name        = "e2proxy_diag_events_total"
+        description = "e2proxy Diagnose-Events aus dem Log"
+        source      = "diag_event"
+        match_all   = false
+        action      = "inc"
+        max_idle_duration = "24h"
+      }
+    }
+  }
+}
+
+loki.write "bjoern01" {
+  endpoint {
+    url = env("BJOERN01_LOKI_URL")
+    basic_auth {
+      username = env("BJOERN01_LOKI_USER")
+      password = env("BJOERN01_LOKI_TOKEN")
+    }
+  }
+}
