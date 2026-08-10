@@ -1,0 +1,42 @@
+services:
+  alloy:
+    image: grafana/alloy:latest
+    container_name: alloy-wien
+    restart: unless-stopped
+    env_file: .env
+    # Für loki.source.docker wird der Docker-Socket gelesen. Alloy läuft
+    # standardmäßig als UID 473 und käme sonst nicht an den Socket.
+    user: root
+    volumes:
+      - ./config.alloy:/etc/alloy/config.alloy:ro
+      - alloy-data:/var/lib/alloy
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: run /etc/alloy/config.alloy --server.http.listen-addr=0.0.0.0:12345 --storage.path=/var/lib/alloy
+    ports:
+      - "12345:12345"
+
+  node_exporter:
+    image: quay.io/prometheus/node-exporter:latest
+    container_name: node_exporter
+    restart: unless-stopped
+    pid: host
+    network_mode: host
+    volumes:
+      - /:/host:ro,rslave
+    command:
+      - --path.rootfs=/host
+      - --collector.disable-defaults
+      - --collector.cpu
+      - --collector.meminfo
+      - --collector.filesystem
+      - --collector.netdev
+      - --collector.loadavg
+      - --collector.uname
+      - --collector.hwmon
+      - --collector.stat
+      - --collector.time
+      - --collector.diskstats
+      - --web.listen-address=:9100
+
+volumes:
+  alloy-data:

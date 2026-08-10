@@ -1,0 +1,375 @@
+{
+  "title": "e2proxy — Stream-Diagnose",
+  "uid": "e2proxy-stream-diag",
+  "tags": ["e2proxy", "loki", "streaming"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "30s",
+  "time": { "from": "now-3h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "DS_LOKI",
+        "label": "Loki",
+        "type": "datasource",
+        "query": "loki",
+        "current": {},
+        "hide": 0
+      },
+      {
+        "name": "container",
+        "label": "Container",
+        "type": "query",
+        "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+        "query": { "label": "container", "refId": "LokiVariableQueryEditor-VariableQuery", "type": 1 },
+        "refresh": 1,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "e2proxy", "value": "e2proxy" }
+      },
+      {
+        "name": "channel",
+        "label": "Sender (Regex)",
+        "type": "textbox",
+        "query": ".+",
+        "current": { "text": ".+", "value": ".+" }
+      },
+      {
+        "name": "level",
+        "label": "Log-Level",
+        "type": "custom",
+        "query": "DEBUG,INFO,WARNING,ERROR,CRITICAL",
+        "multi": true,
+        "includeAll": true,
+        "current": { "text": ["INFO", "WARNING", "ERROR", "CRITICAL"], "value": ["INFO", "WARNING", "ERROR", "CRITICAL"] }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Überblick",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "Stillstände (Zeitraum)",
+      "description": "Anzahl erkannter Stream-Stillstände (>3 s ohne Daten).",
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 1 },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "instant",
+          "expr": "sum(count_over_time({container=~\"$container\"} |= `DIAG event=stall_start` | logfmt | channel=~`$channel` [$__range]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 }, { "color": "red", "value": 5 } ] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "title": "Stillstandszeit gesamt",
+      "description": "Summe der gemessenen Stillstandsdauern (aus stall_end).",
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 1 },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "instant",
+          "expr": "sum(sum_over_time({container=~\"$container\"} |= `DIAG event=stall_end` | logfmt | channel=~`$channel` | unwrap gap_s [$__range]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 5 }, { "color": "red", "value": 30 } ] }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "title": "Längster Stillstand",
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 1 },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "instant",
+          "expr": "max(max_over_time({container=~\"$container\"} |= `DIAG event=stall_end` | logfmt | channel=~`$channel` | unwrap gap_s [$__range]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 5 }, { "color": "red", "value": 30 } ] }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "title": "ffmpeg-Probleme",
+      "description": "Klassifizierte ffmpeg-Meldungen (DTS, TS-Korruption, Timeouts, Scrambled …).",
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "gridPos": { "h": 5, "w": 4, "x": 12, "y": 1 },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "instant",
+          "expr": "sum(count_over_time({container=~\"$container\"} |= `DIAG event=ffmpeg_issue` | logfmt | channel=~`$channel` [$__range]))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "title": "Fehler & Warnungen",
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "gridPos": { "h": 5, "w": 4, "x": 16, "y": 1 },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "instant",
+          "expr": "sum(count_over_time({container=~\"$container\", level=~\"WARNING|ERROR|CRITICAL\"} [$__range]))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "title": "Streams (beendet)",
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "gridPos": { "h": 5, "w": 4, "x": 20, "y": 1 },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "instant",
+          "expr": "sum(count_over_time({container=~\"$container\"} |= `DIAG event=stream_end` | logfmt | channel=~`$channel` [$__range]))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "row",
+      "title": "Stillstände",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Stillstände pro Sender",
+      "description": "Wann und wo hakt es? Balken = beginnende Stillstände.",
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{channel}} ({{kind}})",
+          "expr": "sum by (channel, kind) (count_over_time({container=~\"$container\"} |= `DIAG event=stall_start` | logfmt | channel=~`$channel` [$__auto]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "bars", "fillOpacity": 70, "lineWidth": 1, "stacking": { "mode": "normal" } },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["sum"] }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Stillstandsdauer (gap_s)",
+      "description": "Wie lange stand der Stream jeweils still?",
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 7 },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{channel}}",
+          "expr": "max by (channel) (max_over_time({container=~\"$container\"} |= `DIAG event=stall_end` | logfmt | channel=~`$channel` | unwrap gap_s [$__auto]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "points", "pointSize": 8, "fillOpacity": 0, "lineWidth": 0 },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "type": "table",
+      "title": "Stillstands-Details",
+      "description": "kind=upstream_no_data → Receiver/Transponder liefert nichts. kind=client_backpressure → der Player nimmt die Daten nicht ab.",
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 15 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{container=~\"$container\"} |= `DIAG event=stall_` | logfmt | channel=~`$channel` | line_format `{{.event}} | {{.channel}} | {{.kind}} | {{.gap_s}}s | {{.mode}} | {{.client}} | {{.sid}}`"
+        }
+      ],
+      "options": { "showHeader": true }
+    },
+    {
+      "type": "row",
+      "title": "Durchsatz & Wartezeiten",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Durchsatz je Stream (kbps)",
+      "description": "Nur im Diagnose-Modus (Einstellungen → Stream-Diagnose) befüllt: Sample alle 15 s.",
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 25 },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{channel}} / {{sid}}",
+          "expr": "avg by (channel, sid) (avg_over_time({container=~\"$container\"} |= `DIAG event=sample` | logfmt | channel=~`$channel` | unwrap kbps [$__auto]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }, "unit": "Kbits" },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "min"] }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Wartezeit: Upstream (read) vs. Client (write)",
+      "description": "Steigt read_wait → Receiver/ffmpeg liefert nicht. Steigt write_wait → der Player/das Netz bremst.",
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 25 },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "read_wait {{channel}}",
+          "expr": "max by (channel) (max_over_time({container=~\"$container\"} |= `DIAG event=sample` | logfmt | channel=~`$channel` | unwrap read_wait_s [$__auto]))"
+        },
+        {
+          "refId": "B",
+          "legendFormat": "write_wait {{channel}}",
+          "expr": "max by (channel) (max_over_time({container=~\"$container\"} |= `DIAG event=sample` | logfmt | channel=~`$channel` | unwrap write_wait_s [$__auto]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 5, "lineWidth": 2 }, "unit": "s" },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["max"] }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "type": "table",
+      "title": "Beendete Streams (Zusammenfassung)",
+      "description": "Pro Stream: Dauer, Datenmenge, mittlerer Durchsatz, Wartezeiten, Stillstände, Abbruchgrund.",
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 33 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{container=~\"$container\"} |= `DIAG event=stream_end` | logfmt | channel=~`$channel` | line_format `{{.channel}} | {{.mode}} | {{.client}} | {{.dur_s}}s | {{.mb}}MB | {{.kbps}}kbps | read {{.read_wait_s}}s / write {{.write_wait_s}}s | Stalls {{.stalls}} ({{.stall_s}}s) | {{.reason}}`"
+        }
+      ],
+      "options": { "showHeader": true }
+    },
+    {
+      "type": "row",
+      "title": "ffmpeg & Rohlogs",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 42 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "ffmpeg-Probleme nach Art",
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 43 },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{kind}} — {{channel}}",
+          "expr": "sum by (kind, channel) (count_over_time({container=~\"$container\"} |= `DIAG event=ffmpeg_issue` | logfmt | channel=~`$channel` [$__auto]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "drawStyle": "bars", "fillOpacity": 70, "stacking": { "mode": "normal" } }, "unit": "short" },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["sum"] }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Log-Volumen nach Level",
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 43 },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{level}}",
+          "expr": "sum by (level) (count_over_time({container=~\"$container\"} [$__auto]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "drawStyle": "bars", "fillOpacity": 70, "stacking": { "mode": "normal" } }, "unit": "short" },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "type": "logs",
+      "title": "Live-Log",
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "gridPos": { "h": 14, "w": 24, "x": 0, "y": 51 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{container=~\"$container\", level=~\"$level\"}"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "sortOrder": "Descending",
+        "enableLogDetails": true,
+        "dedupStrategy": "none"
+      }
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "name": "Stillstände",
+        "enable": true,
+        "iconColor": "red",
+        "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+        "target": {
+          "expr": "{container=~\"$container\"} |= `DIAG event=stall_start`",
+          "refId": "Anno"
+        }
+      }
+    ]
+  }
+}

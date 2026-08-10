@@ -247,6 +247,7 @@ Static analysis has limits — it finds missing functions and broken syntax, not
 | `/api/usage/reset` | POST | Clear the usage store |
 | `/api/logs` | GET | Live logs (`?level=INFO&since=<unix>&n=100`) |
 | `/api/logs/history` | GET | Historical logs from disk (`?hours=6`) |
+| `/api/diag` | GET | Stream diagnostics: status + live per-stream counters; `?on=1`/`?on=0` toggles verbose mode |
 
 ### Plex DVR (HDHomeRun Emulation)
 
@@ -319,6 +320,92 @@ e2proxy can impersonate an Enigma2 receiver on its **standard ports** so any nat
 ## Companion: e2recorder
 
 [e2recorder](https://github.com/bjoernhoefer/e2recorder) is the automated recording scheduler that works with e2proxy. It monitors the EPG and triggers recordings via the `/api/record/start` endpoint.
+
+## Stream Diagnostics (Grafana Loki)
+
+Live streams occasionally freeze for a minute or two. To make that analysable
+after the fact, e2proxy writes structured `DIAG` lines (logfmt) that are shipped
+to Grafana Cloud Loki by [Grafana Alloy](https://grafana.com/docs/alloy/).
+
+### What is measured
+
+Every streaming loop measures separately how long it waited for **upstream**
+data (receiver / ffmpeg) and how long it waited for the **client** to accept
+data. That distinguishes the two very different causes of a freeze:
+
+| Field | Meaning |
+|-------|---------|
+| `read_wait_s` | time spent waiting for the receiver / ffmpeg |
+| `write_wait_s` | time spent waiting for the player to read (backpressure) |
+| `kind=upstream_no_data` | the tuner/transponder or ffmpeg stopped delivering |
+| `kind=client_backpressure` | the player or the network stopped consuming |
+
+A watchdog thread reports freezes **while they happen**, so a stream that never
+recovers still shows up.
+
+### Events
+
+| Event | Level | When |
+|-------|-------|------|
+| `stream_start` / `stream_end` | INFO / WARN | stream opened / closed (summary: duration, MB, kbps, waits, stalls) |
+| `stall_start` / `stall_ongoing` / `stall_end` | WARNING | no data for >3 s, still stalled (every 15 s), recovered |
+| `ffmpeg_issue` | WARNING | classified ffmpeg message (`dts`, `ts_corrupt`, `cc_error`, `timeout`, `scrambled`, …) |
+| `sample` | INFO | throughput sample every 15 s — **diagnostic mode only** |
+
+Stall detection is always on (very low volume). The extra detail — ffmpeg at
+`-loglevel verbose` plus throughput samples — is switched on demand:
+
+```bash
+curl "http://e2proxy:8888/api/diag?on=1"   # enable
+curl "http://e2proxy:8888/api/diag?on=0"   # disable
+curl "http://e2proxy:8888/api/diag"        # status + live stream counters
+```
+
+The same switch sits in *Settings → Stream-Diagnose*, together with a live view
+of throughput, waits and stalls per active stream.
+
+### Shipping to Grafana Cloud
+
+`deploy/grafana/` contains the ready-made setup:
+
+| File | Purpose |
+|------|---------|
+| `config.alloy` | Alloy config: metrics + Docker logs → Loki (drops SSDP noise, parses timestamp/level, strips the log prefix so `\| logfmt` works) |
+| `docker-compose.alloy.yml` | Alloy container (Docker socket, persistent `--storage.path`) |
+| `e2proxy-stream-diagnose.json` | Grafana dashboard — import via *Dashboards → New → Import* |
+
+Required environment variables (e.g. in `alloy/.env`):
+
+```
+BJOERN01_USER=…            # Prometheus user id
+BJOERN01_TOKEN=…           # token with metrics:write
+BJOERN01_LOKI_USER=…       # Loki user id
+BJOERN01_LOKI_TOKEN=…      # token with logs:write (and logs:read for querying)
+BJOERN01_LOKI_URL=https://logs-prod-XXX.grafana.net/loki/api/v1/push
+```
+
+> Grafana Cloud access tokens keep the scopes they had when created — after
+> changing an access policy you have to issue a **new** token.
+
+`--storage.path=/var/lib/alloy` matters: without it Alloy forgets its read
+positions on every restart and replays the whole container log, which Loki
+rejects as "timestamp too old".
+
+### Useful LogQL queries
+
+```logql
+# all freezes with cause
+{container="e2proxy"} |= `DIAG event=stall_start` | logfmt
+
+# longest freeze per channel
+max by (channel) (max_over_time({container="e2proxy"} |= `DIAG event=stall_end` | logfmt | unwrap gap_s [5m]))
+
+# throughput per stream (diagnostic mode)
+avg by (channel, sid) (avg_over_time({container="e2proxy"} |= `DIAG event=sample` | logfmt | unwrap kbps [1m]))
+
+# ffmpeg problems by type
+sum by (kind) (count_over_time({container="e2proxy"} |= `DIAG event=ffmpeg_issue` | logfmt [5m]))
+```
 
 ## Data Paths
 
