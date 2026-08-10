@@ -35,18 +35,19 @@ import copy
 import math
 import struct
 import gzip
+import collections
 from datetime import datetime, timedelta, timezone
 
 # ── Pfade ─────────────────────────────────────────────────
 # Datenpfad: via Env-Variable überschreibbar (für Docker)
 DATA_DIR       = os.environ.get("E2PROXY_DATA_DIR", "/var/lib/e2proxy")
-VERSION        = "4.5"   # Offizielle Version — nur beim Pull Request erhöhen (major/minor)
+VERSION        = "4.6"   # Offizielle Version — nur beim Pull Request erhöhen (major/minor)
 # ── Interne Build-/Versionskennung ────────────────────────
 # Identifiziert eindeutig den ausgerollten Branch/Stand bei Tests, OHNE die
 # offizielle VERSION zu verändern (die steigt erst beim PR). Bei jedem Test-
 # Rollout eines neuen Standes BUILD_SEQ erhöhen.
-BUILD_BRANCH     = "feature/grafana-loki-stream-diagnostics"
-BUILD_SEQ        = "fc43d840"
+BUILD_BRANCH     = "fix/stream-stability"
+BUILD_SEQ        = "1c76420d"
 INTERNAL_VERSION = f"{VERSION}+{BUILD_BRANCH.split('/')[-1]}.{BUILD_SEQ}"
 CONFIG_FILE    = f"{DATA_DIR}/config.json"
 FAVORITES_FILE = f"{DATA_DIR}/favorites.json"
@@ -1465,14 +1466,21 @@ def get_favorites():
 
 # ── Receiver State Management ─────────────────────────────
 
-receiver_lock = threading.Lock()
+receiver_lock = threading.RLock()
 _receiver_state = {}   # receiver_id → None | dict(info)
-stream_processes = {}  # receiver_id → subprocess.Popen
+# Auch ffmpeg-Prozesse können sich einen Tuner teilen (Shared Tuner mit
+# Transcode-Profil) — deshalb Set statt Einzelwert: sonst überschreibt der
+# zweite Stream den Eintrag des ersten, /kill erwischt den falschen Prozess und
+# der andere zieht als Waise weiter Daten vom Receiver.
+stream_processes = {}  # receiver_id → set(subprocess.Popen)
 stream_processes_lock = threading.Lock()
 # Passthrough-Streams laufen als reine Socket-Schleife ohne Subprozess. Damit ein
-# /kill sie tatsächlich beendet (und nicht nur den Receiver-State freigibt), wird
-# der Upstream-Socket je Receiver hier registriert und beim Kill hart geschlossen.
-stream_sockets = {}    # receiver_id → upstream socket (passthrough)
+# /kill sie tatsächlich beendet (und nicht nur den Receiver-State freigibt), werden
+# die Upstream-Sockets je Receiver hier registriert und beim Kill hart geschlossen.
+# Mehrere Zuschauer können denselben Tuner teilen (Shared Tuner) — deshalb ein Set
+# pro Receiver statt eines einzelnen Sockets: sonst überschreibt der zweite Stream
+# den Eintrag des ersten und dessen Socket bleibt beim Kill offen (Tuner-Leak).
+stream_sockets = {}    # receiver_id → set(upstream sockets, passthrough)
 stream_sockets_lock = threading.Lock()
 
 # Client dedup - prevent Kodi parallel probe requests
@@ -1521,9 +1529,21 @@ def get_ref_lock(service_ref):
         return _stream_ref_locks[service_ref]
 
 
+_receiver_epoch = 0
+
+
 def acquire_receiver(rid, client_ip, service_ref="", channel_name="",
                      user_agent="", profile="", transcode=None):
+    """Belegt einen Receiver exklusiv und gibt ein Session-Token zurück.
+
+    Das Token MUSS an release_receiver() zurückgegeben werden. Sonst kann ein
+    spät aufräumender Thread (dessen Stream längst per /kill abgeräumt wurde)
+    die inzwischen NEU begonnene Session eines anderen Clients freigeben.
+    """
+    global _receiver_epoch
     with receiver_lock:
+        _receiver_epoch += 1
+        epoch = _receiver_epoch
         _receiver_state[rid] = {
             "client_ip": client_ip,
             "service_ref": service_ref,
@@ -1534,9 +1554,37 @@ def acquire_receiver(rid, client_ip, service_ref="", channel_name="",
             "profile": profile or "",
             "transcode": transcode or {"active": False},
             "bytes_sent": 0,
+            # Referenzzähler: wie viele Streams nutzen diesen Tuner gerade?
+            # Erst wenn der letzte geht, wird der Receiver wirklich freigegeben.
+            "users": 1,
+            "epoch": epoch,
         }
     r = get_receiver_by_id(rid)
     log.info(f"Receiver '{rid}' ({r['name'] if r else rid}) busy from {client_ip}")
+    return epoch
+
+
+def attach_receiver(rid, service_ref=None):
+    """Hängt einen weiteren Nutzer an einen bereits belegten Receiver (Shared Tuner).
+
+    Ohne diesen Zähler galt der Tuner als frei, sobald IRGENDEINE der Sessions
+    endete — auch wenn noch jemand zuschaute. Der nächste Request nahm den
+    vermeintlich freien Receiver und zappte ihn weg → laufender Stream tot.
+
+    Gibt das Session-Token zurück (für release_receiver) oder None, wenn der
+    Receiver frei ist bzw. auf einem anderen Sender steht.
+    """
+    with receiver_lock:
+        st = _receiver_state.get(rid)
+        if not isinstance(st, dict):
+            return None
+        if service_ref and st.get("service_ref", "").rstrip("/") != service_ref.rstrip("/"):
+            return None
+        st["users"] = int(st.get("users", 1)) + 1
+        users = st["users"]
+        epoch = st.get("epoch")
+    log.debug(f"Receiver '{rid}': Stream angehängt (Shared Tuner) — {users} Nutzer")
+    return epoch
 
 
 def note_stream_bytes(rid, total):
@@ -1641,11 +1689,38 @@ def stream_info_public(state):
     }
 
 
-def release_receiver(rid):
+def release_receiver(rid, epoch=None, force=False):
+    """Gibt einen Receiver frei — aber erst, wenn der LETZTE Nutzer geht.
+
+    epoch: Session-Token aus acquire_receiver()/attach_receiver(). Passt es nicht
+    mehr zum aktuellen State, gehört der Receiver bereits einer anderen Session
+    (z.B. nach /kill + sofortigem Neuaufbau) — dann NICHTS tun. Ohne diese Prüfung
+    reißt ein spät aufräumender Thread die frische Session eines anderen Clients ab.
+    force=True (z.B. /kill) reißt den Receiver unabhängig vom Zähler los.
+    """
     with receiver_lock:
-        _receiver_state[rid] = None
+        st = _receiver_state.get(rid)
+        if (epoch is not None and isinstance(st, dict)
+                and st.get("epoch") is not None and st["epoch"] != epoch):
+            log.debug(f"Receiver '{rid}': verspätete Freigabe einer alten Session "
+                      f"(epoch {epoch} ≠ {st['epoch']}) — ignoriert")
+            return
+        if epoch is not None and not isinstance(st, dict):
+            return          # bereits freigegeben (z.B. durch /kill)
+        users = int(st.get("users", 1)) if isinstance(st, dict) else 0
+        if isinstance(st, dict) and not force:
+            users -= 1
+            st["users"] = users
+        freed = force or users <= 0
+        if freed:
+            _receiver_state[rid] = None
     r = get_receiver_by_id(rid)
-    log.info(f"Receiver '{rid}' ({r['name'] if r else rid}) released")
+    name = r["name"] if r else rid
+    if freed:
+        log.info(f"Receiver '{rid}' ({name}) released")
+    else:
+        log.info(f"Receiver '{rid}' ({name}) weiterhin belegt — "
+                 f"{users} Stream(s) aktiv, keine Freigabe")
 
 
 def kill_proc_robust(proc, label="", grace=5):
@@ -1675,13 +1750,15 @@ def kill_proc_robust(proc, label="", grace=5):
 
 def kill_stream(rid):
     with stream_processes_lock:
-        proc = stream_processes.get(rid)
-    kill_proc_robust(proc, label=f"Stream '{rid}'")
-    # Passthrough-Streams haben keinen Subprozess: Upstream-Socket hart schließen,
-    # damit die recv()-Schleife bricht und der Tuner der Box wirklich frei wird.
+        procs = list(stream_processes.get(rid) or ())
+    for proc in procs:
+        kill_proc_robust(proc, label=f"Stream '{rid}'")
+    # Passthrough-Streams haben keinen Subprozess: ALLE Upstream-Sockets dieses
+    # Receivers hart schließen (bei Shared Tuner sind es mehrere), damit jede
+    # recv()-Schleife bricht und der Tuner der Box wirklich frei wird.
     with stream_sockets_lock:
-        sock = stream_sockets.get(rid)
-    if sock is not None:
+        socks = list(stream_sockets.get(rid) or ())
+    for sock in socks:
         try:
             sock.shutdown(socket.SHUT_RDWR)
         except Exception:
@@ -1690,7 +1767,7 @@ def kill_stream(rid):
             sock.close()
         except Exception:
             pass
-    release_receiver(rid)
+    release_receiver(rid, force=True)
     log.info(f"Stream auf Receiver '{rid}' abgebrochen")
 
 
@@ -1706,30 +1783,75 @@ def is_receiver_online(rid):
         return False
 
 
+ZAP_TIMEOUT_SEC = 8      # einzelner Zap-Versuch (Boxen brauchen erwiesen bis ~7s)
+ZAP_ATTEMPTS    = 3      # inkl. Erstversuch
+
+
+def receiver_current_ref(rid, timeout=4):
+    """Aktuell eingestellte Service-Reference der Box (oder None)."""
+    r = get_receiver_by_id(rid)
+    if not r:
+        return None
+    try:
+        url = f"http://{r['ip']}:{r['port']}/api/statusinfo"
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        ref = (data.get("currservice_serviceref") or "").strip()
+        return ref or None
+    except Exception:
+        return None
+
+
 def do_zap(rid, service_ref, channel_name=None):
+    """Schaltet die Box um — mit Wiederholung.
+
+    Ein Timeout heißt NICHT, dass der Zap fehlschlug: langsame Boxen antworten
+    erst nach mehreren Sekunden, haben aber längst umgeschaltet. Früher galt der
+    Stream dann als gescheitert, der Client versuchte es sofort erneut und
+    erzeugte parallele Sessions auf demselben Tuner. Deshalb: nach einem Fehler
+    erst den Ist-Zustand der Box prüfen, dann erst erneut zappen.
+    """
     r = get_receiver_by_id(rid)
     if not r:
         return False
     encoded = urllib.parse.quote(service_ref, safe=":@")
     url = f"http://{r['ip']}:{r['port']}/web/zap?sRef={encoded}"
-    t0 = time.time()
     wait_used = get_switch_settings(service_ref)["zap_wait"]
-    try:
-        with urllib.request.urlopen(url, timeout=5) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
+    t0 = time.time()
+    last_err = None
+
+    for attempt in range(1, ZAP_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=ZAP_TIMEOUT_SEC) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
             elapsed_ms = (time.time() - t0) * 1000
             if "<e2state>True</e2state>" in body:
-                log.info(f"ZAP OK → '{rid}' → {service_ref} ({elapsed_ms:.0f}ms)")
+                log.info(f"ZAP OK → '{rid}' → {service_ref} ({elapsed_ms:.0f}ms"
+                         f"{f', Versuch {attempt}' if attempt > 1 else ''})")
                 record_zap_result(service_ref, True, elapsed_ms, wait_used, channel_name)
                 return True
-            log.warning(f"ZAP FAILED: {body[:100]}")
-            record_zap_result(service_ref, False, elapsed_ms, wait_used, channel_name)
-            return False
-    except Exception as e:
-        elapsed_ms = (time.time() - t0) * 1000
-        log.error(f"ZAP ERROR: {e}")
-        record_zap_result(service_ref, False, elapsed_ms, wait_used, channel_name)
-        return False
+            last_err = f"e2state != True: {body[:100]}"
+        except Exception as e:
+            last_err = str(e)
+
+        # Box antwortet nicht (rechtzeitig) — steht sie trotzdem schon richtig?
+        cur = receiver_current_ref(rid)
+        if cur and cur.rstrip("/") == service_ref.rstrip("/"):
+            elapsed_ms = (time.time() - t0) * 1000
+            log.info(f"ZAP OK (verifiziert trotz '{last_err}') → '{rid}' → "
+                     f"{service_ref} ({elapsed_ms:.0f}ms)")
+            record_zap_result(service_ref, True, elapsed_ms, wait_used, channel_name)
+            return True
+
+        if attempt < ZAP_ATTEMPTS:
+            log.warning(f"ZAP Versuch {attempt}/{ZAP_ATTEMPTS} für '{rid}' "
+                        f"fehlgeschlagen ({last_err}) — neuer Versuch")
+            time.sleep(1.0)
+
+    elapsed_ms = (time.time() - t0) * 1000
+    log.error(f"ZAP ERROR nach {ZAP_ATTEMPTS} Versuchen auf '{rid}': {last_err}")
+    record_zap_result(service_ref, False, elapsed_ms, wait_used, channel_name)
+    return False
 
 
 # ── Channel Cache ─────────────────────────────────────────
@@ -1816,6 +1938,24 @@ def get_channels(force_refresh=False):
 
 CHUNK_SIZE = 65536
 
+# ── Jitter-Puffer für Passthrough-Streams ────────────────────────────
+# Vorpuffer in Sekunden; 0 = aus (direktes Durchreichen wie früher).
+PASSTHRU_PREBUFFER_DEFAULT = 3.0
+PASSTHRU_PREBUFFER_MAX     = 15.0
+# Harte Obergrenze pro Stream, damit ein langsamer Client keinen Speicher frisst.
+PASSTHRU_BUFFER_MAX_BYTES  = 24 * 1024 * 1024
+
+
+def get_passthrough_prebuffer_sec():
+    """Vorpuffer-Dauer für Passthrough-Streams (konfigurierbar, geklemmt)."""
+    try:
+        v = float(get_config().get("passthrough_prebuffer_sec",
+                                   PASSTHRU_PREBUFFER_DEFAULT))
+    except (TypeError, ValueError):
+        v = PASSTHRU_PREBUFFER_DEFAULT
+    return max(0.0, min(PASSTHRU_PREBUFFER_MAX, v))
+
+
 def write_chunked(wfile, data):
     """Schreibt Daten im HTTP/1.1 Chunked Transfer Encoding Format.
     Plex DVR Segmenter erwaitingt HTTP/1.1 mit chunked encoding —
@@ -1880,6 +2020,96 @@ def diag_log(event, level="info", **fields):
         parts.append(f"{k}={_diag_quote(v)}")
     line = "DIAG " + " ".join(parts)
     getattr(log, level, log.info)(line)
+
+
+DIAG_ISSUE_WINDOW_SEC = 60.0   # Aggregationsfenster für wiederkehrende ffmpeg-Meldungen
+_diag_issue_agg = {}           # (rid, ref, kind) → {"first","last","n","msg","logged"}
+_diag_issue_lock = threading.Lock()
+
+
+def diag_log_issue(rid, service_ref, channel, kind, msg):
+    """Meldet ein ffmpeg-Problem — aber höchstens einmal pro Fenster und Art.
+
+    Ein leicht gestörter Transponder erzeugt hunderte identische
+    "Packet corrupt"-Meldungen pro Minute. Einzeln geloggt ersäuft das Loki und
+    verdeckt die wirklich interessanten Ereignisse. Deshalb: erste Meldung
+    sofort, danach nur noch eine Zusammenfassung pro Fenster mit Zähler.
+    """
+    now = time.monotonic()
+    key = (rid, service_ref, kind)
+    with _diag_issue_lock:
+        e = _diag_issue_agg.get(key)
+        if e is None or now - e["start"] >= DIAG_ISSUE_WINDOW_SEC:
+            # Abgelaufenes Fenster vorher zusammenfassen
+            summary = None
+            if e is not None and e["n"] > 1:
+                summary = (e["n"] - 1, now - e["start"], e["msg"])
+            _diag_issue_agg[key] = {"start": now, "n": 1, "msg": msg}
+            emit_first = True
+        else:
+            e["n"] += 1
+            e["msg"] = msg
+            summary = None
+            emit_first = False
+    if summary:
+        n, span, last_msg = summary
+        diag_log("ffmpeg_issue_summary", level="warning", rid=rid,
+                 ref=service_ref, channel=channel or "", kind=kind,
+                 count=n, window_s=span, msg=last_msg)
+    if emit_first:
+        diag_log("ffmpeg_issue", level="warning", rid=rid, ref=service_ref,
+                 channel=channel or "", kind=kind, msg=msg)
+
+
+def diag_flush_issues(rid=None, service_ref=None):
+    """Schreibt offene Aggregate raus (z.B. beim Stream-Ende), damit der
+    Zähler nicht verloren geht."""
+    now = time.monotonic()
+    out = []
+    with _diag_issue_lock:
+        for key in list(_diag_issue_agg):
+            k_rid, k_ref, k_kind = key
+            if rid and k_rid != rid:
+                continue
+            if service_ref and k_ref != service_ref:
+                continue
+            e = _diag_issue_agg.pop(key)
+            if e["n"] > 1:
+                out.append((k_rid, k_ref, k_kind, e["n"] - 1, now - e["start"], e["msg"]))
+    for k_rid, k_ref, k_kind, n, span, msg in out:
+        diag_log("ffmpeg_issue_summary", level="warning", rid=k_rid, ref=k_ref,
+                 kind=k_kind, count=n, window_s=span, msg=msg)
+
+
+def iter_ffmpeg_lines(pipe, chunk=4096, max_line=65536):
+    """Liest ffmpeg-stderr und liefert einzelne Meldungen.
+
+    Nicht zeilenweise iterieren: ffmpeg trennt Statuszeilen mit \\r. Ein
+    `for line in pipe` würde alles bis zum nächsten \\n zu einer einzigen Zeile
+    verkleben — echte Meldungen kämen dann mit KB an Fortschrittstext im Log an.
+    Deshalb blockweise lesen und an \\r UND \\n trennen.
+    """
+    buf = b""
+    while True:
+        block = pipe.read(chunk)
+        if not block:
+            break
+        buf += block
+        buf = buf.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        *complete, buf = buf.split(b"\n")
+        for raw in complete:
+            s = raw.decode("utf-8", errors="replace").strip()
+            if s:
+                yield s
+        if len(buf) > max_line:      # Schutz gegen endlose Zeile ohne Trenner
+            s = buf.decode("utf-8", errors="replace").strip()
+            buf = b""
+            if s:
+                yield s
+    if buf:
+        s = buf.decode("utf-8", errors="replace").strip()
+        if s:
+            yield s
 
 
 def diag_stream_start(rid, service_ref, mode, channel=None, client=None, profile=None):
@@ -2048,40 +2278,127 @@ def stream_passthrough(rid, service_ref, wfile, use_chunked=False):
     _last_note = 0.0
     d = diag_stream_start(rid, service_ref, "passthrough")
     with stream_sockets_lock:
-        stream_sockets[rid] = sock
+        stream_sockets.setdefault(rid, set()).add(sock)
+
+    # ── Jitter-Puffer ────────────────────────────────────────────────
+    # Schwache Receiver (z.B. Vu+ Zero4K) liefern das TS in Schüben und legen
+    # dabei regelmäßig 3–6s Pausen ein. Ohne Puffer schlägt jede dieser Pausen
+    # 1:1 auf den Client durch → Bild friert ein / Player bricht ab. Ein
+    # Reader-Thread füllt deshalb einen Vorpuffer, aus dem der Client
+    # gleichmäßig bedient wird. Der Puffer ist gemessen statt geraten: nach
+    # `prebuffer_sec` Sekunden Füllzeit steht genau eine Sekundenmenge des
+    # tatsächlichen Bitratenprofils bereit.
+    prebuffer_sec = get_passthrough_prebuffer_sec()
+    max_bytes = PASSTHRU_BUFFER_MAX_BYTES
+    q = collections.deque()
+    cv = threading.Condition()
+    st = {"bytes": 0, "eof": False, "reason": None, "stop": False}
+
+    def _set_eof(reason=None):
+        with cv:
+            if reason and not st["reason"]:
+                st["reason"] = reason
+            st["eof"] = True
+            cv.notify_all()
+
+    def _reader():
+        try:
+            while True:
+                d["phase"] = "read"
+                t_a = time.monotonic()
+                chunk = sock.recv(CHUNK_SIZE)
+                t_b = time.monotonic()
+                if not chunk:
+                    _set_eof("upstream_eof")
+                    return
+                # Upstream-Ankunft treibt die Stall-Erkennung — write_wait bucht
+                # der Writer-Thread separat.
+                diag_note_chunk(d, len(chunk), t_b - t_a, 0.0)
+                with cv:
+                    while st["bytes"] >= max_bytes and not st["stop"]:
+                        cv.wait(0.5)
+                    if st["stop"]:
+                        return
+                    q.append(chunk)
+                    st["bytes"] += len(chunk)
+                    cv.notify_all()
+        except socket.timeout:
+            log.warning(f"Passthrough {service_ref}: 30s ohne Daten vom Receiver — Stream beendet")
+            _set_eof("upstream_timeout")
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            _set_eof(type(e).__name__)
+        except Exception as e:
+            _set_eof(type(e).__name__)
+        finally:
+            _set_eof()
+
+    reader = threading.Thread(target=_reader, daemon=True,
+                              name=f"passthru-read-{rid}")
+    reader.start()
+
     end_reason = "client_closed"
     try:
+        # Vorpuffer füllen (abbrechen, sobald Upstream endet oder Puffer voll ist)
+        if prebuffer_sec > 0:
+            deadline = time.monotonic() + prebuffer_sec
+            with cv:
+                while (time.monotonic() < deadline and not st["eof"]
+                       and st["bytes"] < max_bytes):
+                    cv.wait(min(0.25, max(0.01, deadline - time.monotonic())))
+                filled = st["bytes"]
+            log.debug(f"Passthrough {service_ref}: Vorpuffer {filled/1024:.0f} KB "
+                      f"in {prebuffer_sec:.1f}s")
+
         while True:
-            d["phase"] = "read"
-            t_a = time.monotonic()
-            chunk = sock.recv(CHUNK_SIZE)
-            t_b = time.monotonic()
-            if not chunk:
-                end_reason = "upstream_eof"
-                break
+            with cv:
+                while not q and not st["eof"]:
+                    cv.wait(1.0)
+                if not q:
+                    end_reason = st["reason"] or "upstream_eof"
+                    break
+                chunk = q.popleft()
+                st["bytes"] -= len(chunk)
+                cv.notify_all()
+
             d["phase"] = "write"
+            t_b = time.monotonic()
             if use_chunked:
                 write_chunked(wfile, chunk)
             else:
                 wfile.write(chunk)
                 wfile.flush()
             t_c = time.monotonic()
+            d["phase"] = "read"
+            # Nur die Client-Wartezeit buchen; die Bytes hat der Reader gemeldet.
+            d["write_wait"] += (t_c - t_b)
             bytes_sent += len(chunk)
-            diag_note_chunk(d, len(chunk), t_b - t_a, t_c - t_b)
             now = time.time()
             if now - _last_note >= 1.0:
                 note_stream_bytes(rid, bytes_sent)
                 _last_note = now
-    except socket.timeout:
-        end_reason = "upstream_timeout"
-        log.warning(f"Passthrough {service_ref}: 30s ohne Daten vom Receiver — Stream beendet")
     except (BrokenPipeError, ConnectionResetError, OSError) as e:
         end_reason = f"{type(e).__name__}"
     finally:
+        with cv:
+            st["stop"] = True
+            cv.notify_all()
         diag_stream_end(d, end_reason)
         with stream_sockets_lock:
-            if stream_sockets.get(rid) is sock:
-                stream_sockets.pop(rid, None)
+            socks = stream_sockets.get(rid)
+            if socks is not None:
+                socks.discard(sock)
+                if not socks:
+                    stream_sockets.pop(rid, None)
+        try:
+            # shutdown vor close: ein in recv() blockierender Reader-Thread wacht
+            # sonst je nach Plattform erst nach dem 30s-Timeout auf.
+            sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        # Erst joinen, DANN close(): sonst könnte der Reader nach dem close()
+        # noch auf den fd zugreifen, den das OS zwischenzeitlich an eine neue
+        # Verbindung vergeben hat.
+        reader.join(timeout=2)
         try:
             sock.close()
         except Exception:
@@ -2112,6 +2429,12 @@ def build_ffmpeg_cmd(rid, service_ref, tp, probesize=None, analyzeduration=None,
 
     base = [
         "ffmpeg", "-loglevel", ("verbose" if diag_enabled() else "warning"),
+        # -nostats/-hide_banner: ffmpeg schreibt die Fortschrittszeile
+        # ("frame=… fps=…") mit \r statt \n auf stderr. Zeilenweises Lesen fasst
+        # dadurch minutenlangen Fortschritt zu EINER Riesenzeile zusammen, die
+        # dann samt echter Meldung als Warnung im Log landet. Ohne Stats bleibt
+        # stderr auf echte Meldungen beschränkt.
+        "-nostats", "-hide_banner",
         # Stalled Receiver darf ffmpeg nicht ewig blockieren: nach 20s ohne Daten
         # bricht der HTTP-Input ab → Prozess endet → Tuner/ref_lock werden freigegeben.
         "-rw_timeout", "20000000",
@@ -2208,6 +2531,7 @@ def stream_transcoded(rid, service_ref, tp, wfile, use_chunked=False, channel_na
     no_latency = sw["no_latency"]
 
     proc = None
+    my_procs = []          # alle von DIESEM Aufruf gestarteten ffmpeg-Prozesse
     bytes_sent = 0
     attempts = 0
     d = None
@@ -2233,21 +2557,24 @@ def stream_transcoded(rid, service_ref, tp, wfile, use_chunked=False, channel_na
             ("connection reset", "conn"), ("connection refused", "conn"),
             ("error opening input", "input_error"),
         )
+
+        def handle(l):
+            if not l:
+                return
+            sink.append(l)
+            kind = next((k for needle, k in FF_PROBLEMS if needle in l.lower()), None)
+            if kind:
+                diag_log_issue(rid, service_ref, channel_name, kind, l)
+            else:
+                log.debug(f"ffmpeg[{label}] {service_ref}: {l}")
+
         try:
-            for line in pipe:
-                l = line.decode("utf-8", errors="replace").strip()
-                if not l:
-                    continue
-                sink.append(l)
-                kind = next((k for needle, k in FF_PROBLEMS if needle in l.lower()), None)
-                if kind:
-                    diag_log("ffmpeg_issue", level="warning", rid=rid,
-                             ref=service_ref, channel=channel_name or "",
-                             kind=kind, msg=l)
-                else:
-                    log.debug(f"ffmpeg[{label}] {service_ref}: {l}")
+            for l in iter_ffmpeg_lines(pipe):
+                handle(l)
         except Exception:
             pass
+        finally:
+            diag_flush_issues(rid, service_ref)
 
     def _kill(p):
         try:
@@ -2279,7 +2606,8 @@ def stream_transcoded(rid, service_ref, tp, wfile, use_chunked=False, channel_na
             stderr_lines = []
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
             with stream_processes_lock:
-                stream_processes[rid] = proc
+                stream_processes.setdefault(rid, set()).add(proc)
+            my_procs.append(proc)
             t = threading.Thread(target=read_stderr, args=(proc.stderr, stderr_lines), daemon=True)
             t.start()
 
@@ -2312,7 +2640,13 @@ def stream_transcoded(rid, service_ref, tp, wfile, use_chunked=False, channel_na
             )
             _kill(proc)
             with stream_processes_lock:
-                stream_processes.pop(rid, None)
+                procs = stream_processes.get(rid)
+                if procs is not None:
+                    procs.discard(proc)
+                    if not procs:
+                        stream_processes.pop(rid, None)
+            if proc in my_procs:
+                my_procs.remove(proc)
             proc = None
             if scrambled:
                 record_stream_start(service_ref, False, attempts, no_latency, channel_name)
@@ -2372,7 +2706,14 @@ def stream_transcoded(rid, service_ref, tp, wfile, use_chunked=False, channel_na
     finally:
         diag_stream_end(d, end_reason)
         with stream_processes_lock:
-            stream_processes.pop(rid, None)
+            procs = stream_processes.get(rid)
+            if procs is not None:
+                # Nur die eigenen Prozesse abmelden — ein parallel laufender
+                # Shared-Tuner-Stream muss registriert bleiben.
+                for p in my_procs:
+                    procs.discard(p)
+                if not procs:
+                    stream_processes.pop(rid, None)
         if proc:
             _kill(proc)
         note_stream_bytes(rid, bytes_sent)
@@ -6701,7 +7042,17 @@ def build_help_ui():
       <div style="display:flex;flex-direction:column;gap:12px">
 
         <div style="border-left:3px solid var(--accent);padding-left:14px">
-          <b style="color:var(--accent);font-family:monospace;font-size:11px">v4.3</b>
+          <b style="color:var(--accent);font-family:monospace;font-size:11px">v4.6</b>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-08-10</span>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">Stream-Stabilität: Tuner-Refcount · Jitter-Puffer · Log-Flut</span>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)"><b>Abbrechende Streams behoben:</b> Ein Receiver wird jetzt per Referenzzähler verwaltet. Teilten sich mehrere Zuschauer einen Tuner (Shared Tuner, z.&nbsp;B. VLCs Probe- plus Play-Verbindung), gab der zuerst endende Stream den Tuner frei, obwohl der andere noch lief — der nächste Request nahm den vermeintlich freien Receiver und zappte ihn weg. Freigabe erfolgt erst, wenn der letzte Nutzer geht (<code>/kill</code> erzwingt weiterhin sofort). Receiver-Auswahl und -Belegung laufen unter einem Lock, damit zwei fast gleichzeitige Requests nicht denselben Tuner greifen. Die Upstream-Sockets werden pro Receiver als Menge geführt (vorher überschrieb der zweite Stream den Socket des ersten → Tuner-Leak beim Kill). Ein <code>/stream</code> mit <code>preacquired</code> hängt sich an, statt den Receiver der laufenden Aufnahme freizugeben.<br>
+          <b>Jitter-Puffer für Passthrough:</b> Schwache Boxen liefern das TS schubweise mit 3–6&nbsp;s Pausen, was bisher 1:1 beim Client ankam. Ein Reader-Thread füllt nun einen gemessenen Vorpuffer (<code>passthrough_prebuffer_sec</code>, Default 2&nbsp;s, max. 24&nbsp;MB je Stream), aus dem der Client gleichmäßig bedient wird. 0 schaltet ihn ab.<br>
+          <b>Zap-Robustheit:</b> Timeout auf 8&nbsp;s erhöht, bis zu 3 Versuche, und nach einem Fehlversuch wird per <code>statusinfo</code> geprüft, ob die Box längst richtig steht — ein langsamer Zap gilt nicht mehr als Fehler und löst keine Client-Retries mit parallelen Sessions mehr aus.<br>
+          <b>Log-Flut beseitigt:</b> ffmpeg läuft mit <code>-nostats -hide_banner</code>, und stderr wird an <code>\r</code> <i>und</i> <code>\n</code> getrennt gelesen — bisher verklebte zeilenweises Lesen minutenlangen Fortschritt (<code>frame=… fps=…</code>) zu einer Riesenzeile, die samt echter Meldung als Warnung im Log landete. Wiederkehrende Transportstrom-Meldungen werden pro Receiver/Ref/Art in 60-s-Fenstern aggregiert: erste Meldung sofort, danach ein <code>ffmpeg_issue_summary</code> mit Zähler statt hunderter Einzelzeilen.</div>
+        </div>
+
+        <div style="border-left:3px solid var(--border);padding-left:14px">
+          <b style="font-family:monospace;font-size:11px">v4.3</b>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-07-29</span>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">Aufnahmen für Dream Player</span>
           <div style="font-size:11px;margin-top:4px;color:var(--muted)">OpenWebif-Emulation der Aufnahmen (Dream Player Recordings-Tab) verbessert: die Dauer (<code>e2length</code>) wird jetzt im echten OpenWebif-Format <code>MINUTEN:SS</code> geliefert (90&nbsp;min → <code>90:00</code> statt roher Sekunden), damit Dream Player die Länge korrekt anzeigt. Neu abgefangen werden <code>getlocations</code>/<code>getcurrlocation</code> (melden das e2proxy-Aufnahmeverzeichnis statt das der Box), <code>moviedelete</code> (löscht die lokale e2recorder-Aufnahme inkl. <code>.nfo</code> und leerer Ordner) und <code>moviedetails</code> (Einzel-<code>&lt;e2movie&gt;</code> vor der Wiedergabe). <code>fullmovielist</code> wird als Alias unterstützt, die JSON-Movielist um authentische Felder (<code>filename_stripped</code>, <code>filesize_readable</code>, <code>begintime</code>, <code>lastseen</code>, Bookmarks) ergänzt. Wiedergabe läuft weiterhin als rohes TS über HTTP mit Range/Seeking.</div>
@@ -11637,35 +11988,44 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             log.info(f"STREAM [{profile_name}] from {client_ip}: {channel_name} [{ua[:40]}]")
 
             # Receiver wählen — preacquired hat Vorrang (Aufnahme hat ihn bereits belegt)
-            preacquired = params.get("preacquired", [None])[0]
-            if preacquired:
-                rid = preacquired
-                log.debug(f"Stream: Receiver '{rid}' bereits durch Aufnahme belegt — überspringe acquire")
-            else:
-                rid = get_free_receiver(receiver_pref if receiver_pref != "auto" else None)
-                if not rid:
-                    self.send_text("All receivers busy", 503)
-                    return
-
+            #
             # Dedup-Lock NUR für Live-Anfragen (z.B. Jellyfin Probe + Stream, die fast
             # gleichzeitig denselben Sender öffnen). Aufnahmen (preacquired) sind bereits
             # über den Receiver koordiniert (jede belegt einen eigenen Tuner) und dürfen
             # Live-Zuschauer desselben Senders NICHT blockieren — sonst sperrt jede
             # laufende oder hängende VOX-Aufnahme das Live-Schauen von VOX (429).
+            preacquired = params.get("preacquired", [None])[0]
             ref_lock = None
-            if not preacquired:
+            if preacquired:
+                rid = preacquired
+                # Nicht neu acquiren, aber mitzählen: sonst gibt das finally
+                # unten den Receiver der Aufnahme frei, obwohl sie weiterläuft.
+                rcv_epoch = attach_receiver(rid)
+                log.debug(f"Stream: Receiver '{rid}' bereits durch Aufnahme belegt — angehängt")
+            else:
                 ref_lock = get_ref_lock(service_ref)
                 if not ref_lock.acquire(blocking=False):
                     log.warning(f"Duplicate request for {service_ref} — rejected (429)")
                     self.send_text("Stream für diesen Sender läuft bereits", 429)
                     return
-                acquire_receiver(rid, client_ip, service_ref, channel_name,
-                                 user_agent=ua, profile=profile_name,
-                                 transcode={
-                                     "active": tp.get("codec") != "pass",
-                                     "codec": tp.get("codec", ""),
-                                     "label": tp.get("label", profile_name),
-                                 })
+                # Suchen und Belegen MÜSSEN atomar sein — sonst schnappt sich ein
+                # paralleler Request denselben "freien" Receiver und zappt den
+                # gerade startenden Stream weg.
+                with receiver_lock:
+                    rid = get_free_receiver(receiver_pref if receiver_pref != "auto" else None)
+                    if rid:
+                        rcv_epoch = acquire_receiver(
+                            rid, client_ip, service_ref, channel_name,
+                            user_agent=ua, profile=profile_name,
+                            transcode={
+                                "active": tp.get("codec") != "pass",
+                                "codec": tp.get("codec", ""),
+                                "label": tp.get("label", profile_name),
+                            })
+                if not rid:
+                    ref_lock.release()
+                    self.send_text("All receivers busy", 503)
+                    return
 
             try:
                 if not do_zap(rid, service_ref, channel_name):
@@ -11742,7 +12102,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             bytes_sent=_st.get("bytes_sent", 0))
                 except Exception as _e:
                     log.debug(f"Usage-Hook (stream) fehlgeschlagen: {_e}")
-                release_receiver(rid)
+                release_receiver(rid, epoch=rcv_epoch)
                 if ref_lock is not None:
                     ref_lock.release()
             return
@@ -12757,9 +13117,12 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
         channel_name = _ch_lookup.get(sref.rstrip("/"), sref[:30])
 
         # Receiver wählen: bereits laufenden Tuner für denselben Sender bevorzugen
-        # (Shared Tuner), sonst einen freien.
+        # (Shared Tuner), sonst einen freien. Auswahl UND Belegung passieren unter
+        # einem Lock — sonst greifen zwei fast gleichzeitige Requests (z.B. VLCs
+        # Probe- plus Play-Verbindung) denselben "freien" Receiver.
         rid = None
         shared = False
+        rcv_epoch = None
         with receiver_lock:
             for r in get_receivers():
                 st = _receiver_state.get(r["id"])
@@ -12767,8 +13130,23 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
                     rid = r["id"]
                     shared = True
                     break
-        if not rid:
-            rid = get_free_receiver()
+            if not rid:
+                rid = get_free_receiver()
+            if rid:
+                if shared:
+                    # Mitzählen! Sonst gibt der zuerst endende Stream den Tuner frei,
+                    # obwohl der andere noch läuft — der nächste Request zappt ihn weg.
+                    rcv_epoch = attach_receiver(rid, sref)
+                    shared = rcv_epoch is not None
+                if not shared:
+                    rcv_epoch = acquire_receiver(
+                        rid, client_ip, sref, channel_name,
+                        user_agent=ua, profile=profile_id,
+                        transcode={
+                            "active": not passthrough,
+                            "codec": (tp.get("codec", "") if tp else "pass"),
+                            "label": (tp.get("label", profile_id) if tp else "Passthrough"),
+                        })
         if not rid:
             self._fail(503, "All receivers busy")
             return
@@ -12776,14 +13154,6 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
         log.info(f"OpenWebif STREAM [{profile_id}] from {client_ip}: {channel_name} "
                  f"[{ua[:40]}] (receiver={rid}, shared={shared})")
 
-        if not shared:
-            acquire_receiver(rid, client_ip, sref, channel_name,
-                             user_agent=ua, profile=profile_id,
-                             transcode={
-                                 "active": not passthrough,
-                                 "codec": (tp.get("codec", "") if tp else "pass"),
-                                 "label": (tp.get("label", profile_id) if tp else "Passthrough"),
-                             })
         _owif_t0 = time.time()
         try:
             if not shared:
@@ -12829,8 +13199,9 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
                     bytes_sent=_bytes)
             except Exception as _e:
                 log.debug(f"Usage-Hook (OpenWebif) fehlgeschlagen: {_e}")
-            if not shared:
-                release_receiver(rid)
+            # Immer freigeben — der Refcount entscheidet, ob der Tuner wirklich
+            # frei wird. Shared-Sessions haben oben via attach_receiver erhöht.
+            release_receiver(rid, epoch=rcv_epoch)
 
 
 def start_openwebif_server():
