@@ -41,7 +41,7 @@ from datetime import datetime, timedelta, timezone
 # ── Pfade ─────────────────────────────────────────────────
 # Datenpfad: via Env-Variable überschreibbar (für Docker)
 DATA_DIR       = os.environ.get("E2PROXY_DATA_DIR", "/var/lib/e2proxy")
-VERSION        = "4.6"   # Offizielle Version — nur beim Pull Request erhöhen (major/minor)
+VERSION        = "4.7"   # Offizielle Version — nur beim Pull Request erhöhen (major/minor)
 # ── Interne Build-/Versionskennung ────────────────────────
 # Identifiziert eindeutig den ausgerollten Branch/Stand bei Tests, OHNE die
 # offizielle VERSION zu verändern (die steigt erst beim PR). Bei jedem Test-
@@ -1496,25 +1496,116 @@ def _init_receiver_state():
                 _receiver_state[r["id"]] = None
 
 
-def get_free_receiver(preferred_id=None):
-    """Gibt ID des ersten freien Receivers zurück. Bevorzugt preferred_id."""
+# ── Receiver Circuit Breaker ──────────────────────────────
+# Eine Enigma2-Box kann "halb tot" sein: der TCP-Port ist offen, aber Enigma2
+# antwortet nie auf HTTP (typisch nach einem Stromausfall). Jeder Zap lief dann
+# in 3 × 8 s Timeout, und weil die defekte Box der Default-Receiver war, blockierte
+# sie den kompletten Streaming-Pfad — obwohl der zweite Tuner frei und gesund war.
+#
+# Der Breaker merkt sich Fehlversuche: nach RECEIVER_FAIL_THRESHOLD Fehlern gilt
+# ein Receiver für RECEIVER_DOWN_COOLDOWN Sekunden als "down" und wird bei der
+# Auswahl übersprungen. Danach darf er sich automatisch wieder bewähren.
+
+RECEIVER_FAIL_THRESHOLD = 2    # Fehlversuche in Folge bis "down"
+RECEIVER_DOWN_COOLDOWN  = 60   # Sekunden, die ein Receiver als down gilt
+RECEIVER_PROBE_TIMEOUT  = 3    # HTTP-Timeout des Online-Checks
+RECEIVER_PROBE_TTL      = 10   # Sekunden, die ein Probe-Ergebnis gecacht wird
+RECEIVER_WATCHDOG_INTERVAL = 30  # Probe-Intervall des Hintergrund-Watchdogs
+
+_receiver_health = {}          # rid → dict(fails, down_until, probe_ts, probe_ok)
+_receiver_health_lock = threading.RLock()
+
+
+def _health_entry(rid):
+    with _receiver_health_lock:
+        return _receiver_health.setdefault(
+            rid, {"fails": 0, "down_until": 0.0, "probe_ts": 0.0, "probe_ok": None})
+
+
+def mark_receiver_failure(rid, reason=""):
+    """Zählt einen Fehlversuch und öffnet ggf. den Circuit Breaker."""
+    with _receiver_health_lock:
+        h = _health_entry(rid)
+        h["fails"] += 1
+        h["probe_ts"] = 0.0          # Probe-Cache verwerfen
+        h["probe_ok"] = None
+        if h["fails"] >= RECEIVER_FAIL_THRESHOLD and h["down_until"] <= time.time():
+            h["down_until"] = time.time() + RECEIVER_DOWN_COOLDOWN
+            log.warning(f"Receiver '{rid}' als DOWN markiert für "
+                        f"{RECEIVER_DOWN_COOLDOWN}s nach {h['fails']} Fehlern"
+                        f"{f': {reason}' if reason else ''}")
+
+
+def mark_receiver_ok(rid):
+    """Setzt den Breaker zurück — der Receiver hat wieder geantwortet."""
+    with _receiver_health_lock:
+        h = _health_entry(rid)
+        was_down = h["down_until"] > time.time()
+        h["fails"] = 0
+        h["down_until"] = 0.0
+        h["probe_ts"] = time.time()
+        h["probe_ok"] = True
+    if was_down:
+        log.info(f"Receiver '{rid}' wieder erreichbar — DOWN aufgehoben")
+
+
+def is_receiver_down(rid):
+    """True, solange der Breaker für diesen Receiver offen ist."""
+    with _receiver_health_lock:
+        return _health_entry(rid)["down_until"] > time.time()
+
+
+def receiver_health_snapshot():
+    """Health-Zustand aller Receiver für API/UI."""
+    now = time.time()
+    out = {}
+    with _receiver_health_lock:
+        for rid, h in _receiver_health.items():
+            out[rid] = {
+                "fails": h["fails"],
+                "down": h["down_until"] > now,
+                "down_for_sec": max(0, int(h["down_until"] - now)),
+            }
+    return out
+
+
+def get_free_receiver(preferred_id=None, exclude=None):
+    """Gibt ID des ersten freien Receivers zurück. Bevorzugt preferred_id.
+
+    Receiver, für die der Circuit Breaker offen ist, werden übersprungen. Sind
+    ALLE Kandidaten als down markiert, wird trotzdem einer zurückgegeben — eine
+    Fehleinschätzung des Breakers darf das Streaming nicht dauerhaft blockieren.
+    """
+    exclude = set(exclude or ())
     with receiver_lock:
         receivers = get_receivers()
-        # Preferred zuerst
+
+        # Prioritätsreihenfolge: preferred → default → Rest
+        ordered = []
         if preferred_id and preferred_id != "auto":
-            state = _receiver_state.get(preferred_id)
-            for r in receivers:
-                if r["id"] == preferred_id and is_receiver_usable(r) and state is None:
-                    return preferred_id
-        # Default Receiver
-        for r in receivers:
-            if r.get("default") and is_receiver_usable(r):
-                if _receiver_state.get(r["id"]) is None:
-                    return r["id"]
-        # Erster freier
-        for r in receivers:
-            if is_receiver_usable(r) and _receiver_state.get(r["id"]) is None:
-                return r["id"]
+            ordered += [r for r in receivers if r["id"] == preferred_id]
+        ordered += [r for r in receivers if r.get("default")]
+        ordered += receivers
+
+        free, healthy = [], []
+        seen = set()
+        for r in ordered:
+            rid = r["id"]
+            if rid in seen or rid in exclude:
+                continue
+            seen.add(rid)
+            if not is_receiver_usable(r) or _receiver_state.get(rid) is not None:
+                continue
+            free.append(rid)
+            if not is_receiver_down(rid):
+                healthy.append(rid)
+
+        if healthy:
+            return healthy[0]
+        if free:
+            log.warning(f"Alle freien Receiver sind als down markiert — "
+                        f"versuche '{free[0]}' trotzdem")
+            return free[0]
     return None
 
 
@@ -1772,15 +1863,36 @@ def kill_stream(rid):
 
 
 def is_receiver_online(rid):
+    """Prüft, ob die Box HTTP beantwortet — mit Kurzzeit-Cache.
+
+    Der Check hing früher an jedem /api/status-Aufruf: eine tote Box kostete
+    3 s pro Request und ließ damit sogar den Container-Healthcheck (Timeout 3 s)
+    fehlschlagen. Ergebnisse werden deshalb RECEIVER_PROBE_TTL Sekunden gecacht,
+    und ein bereits als down bekannter Receiver wird gar nicht erst angefragt.
+    """
     r = get_receiver_by_id(rid)
     if not r:
         return False
+
+    with _receiver_health_lock:
+        h = _health_entry(rid)
+        if h["probe_ok"] is not None and (time.time() - h["probe_ts"]) < RECEIVER_PROBE_TTL:
+            return h["probe_ok"]
+        if h["down_until"] > time.time():
+            return False        # Breaker offen — nicht erneut blockieren
+
     try:
         url = f"http://{r['ip']}:{r['port']}/web/about"
-        with urllib.request.urlopen(url, timeout=3) as resp:
-            return resp.status == 200
-    except:
+        with urllib.request.urlopen(url, timeout=RECEIVER_PROBE_TIMEOUT) as resp:
+            ok = resp.status == 200
+    except Exception as e:
+        mark_receiver_failure(rid, f"Probe: {e}")
         return False
+    if ok:
+        mark_receiver_ok(rid)
+    else:
+        mark_receiver_failure(rid, "Probe: HTTP != 200")
+    return ok
 
 
 ZAP_TIMEOUT_SEC = 8      # einzelner Zap-Versuch (Boxen brauchen erwiesen bis ~7s)
@@ -1829,6 +1941,7 @@ def do_zap(rid, service_ref, channel_name=None):
                 log.info(f"ZAP OK → '{rid}' → {service_ref} ({elapsed_ms:.0f}ms"
                          f"{f', Versuch {attempt}' if attempt > 1 else ''})")
                 record_zap_result(service_ref, True, elapsed_ms, wait_used, channel_name)
+                mark_receiver_ok(rid)
                 return True
             last_err = f"e2state != True: {body[:100]}"
         except Exception as e:
@@ -1841,6 +1954,7 @@ def do_zap(rid, service_ref, channel_name=None):
             log.info(f"ZAP OK (verifiziert trotz '{last_err}') → '{rid}' → "
                      f"{service_ref} ({elapsed_ms:.0f}ms)")
             record_zap_result(service_ref, True, elapsed_ms, wait_used, channel_name)
+            mark_receiver_ok(rid)
             return True
 
         if attempt < ZAP_ATTEMPTS:
@@ -1851,7 +1965,78 @@ def do_zap(rid, service_ref, channel_name=None):
     elapsed_ms = (time.time() - t0) * 1000
     log.error(f"ZAP ERROR nach {ZAP_ATTEMPTS} Versuchen auf '{rid}': {last_err}")
     record_zap_result(service_ref, False, elapsed_ms, wait_used, channel_name)
+    mark_receiver_failure(rid, f"Zap: {last_err}")
     return False
+
+
+def zap_with_failover(rid, epoch, service_ref, channel_name,
+                      acquire_kwargs, preferred_id=None, source="Stream"):
+    """Zappt den Receiver — weicht bei Ausfall auf einen anderen Tuner aus.
+
+    Bisher beendete ein fehlgeschlagener Zap den Request sofort mit 502. Hing die
+    Default-Box (Stromausfall: TCP offen, aber keine HTTP-Antwort), scheiterte
+    damit jeder Stream — obwohl ein zweiter, gesunder Tuner frei war. Jetzt wird
+    der defekte Receiver freigegeben, im Circuit Breaker als down markiert und
+    der nächste freie Tuner probiert.
+
+    Rückgabe: (rid, epoch) des erfolgreich gezappten Receivers, sonst (None, None).
+    Bei Misserfolg sind alle belegten Receiver bereits freigegeben.
+    """
+    tried = []
+    while rid:
+        if do_zap(rid, service_ref, channel_name):
+            return rid, epoch
+
+        tried.append(rid)
+        release_receiver(rid, epoch=epoch)
+
+        # Nächsten gesunden Tuner suchen und atomar belegen
+        with receiver_lock:
+            nxt = get_free_receiver(preferred_id, exclude=tried)
+            nxt_epoch = acquire_receiver(nxt, **acquire_kwargs) if nxt else None
+
+        if not nxt:
+            log.error(f"{source}: Zap auf allen Receivern fehlgeschlagen "
+                      f"(versucht: {', '.join(tried)})")
+            return None, None
+
+        log.warning(f"{source}: Receiver '{rid}' antwortet nicht — "
+                    f"Failover auf '{nxt}'")
+        rid, epoch = nxt, nxt_epoch
+    return None, None
+
+
+def receiver_watchdog_loop():
+    """Prüft periodisch die Erreichbarkeit aller Receiver.
+
+    Ohne aktiven Probe merkt der Proxy einen Box-Ausfall erst, wenn ein Client
+    streamen will — und der Breaker schließt sich erst wieder, wenn es jemand
+    erneut versucht. Der Watchdog hält den Zustand aktuell und protokolliert
+    Statuswechsel, sodass ein Ausfall in Loki/Grafana sichtbar wird.
+    """
+    time.sleep(20)   # Startup nicht ausbremsen
+    last = {}
+    while True:
+        try:
+            for r in get_receivers():
+                if not is_receiver_usable(r):
+                    continue
+                rid = r["id"]
+                # Belegte Tuner nicht unnötig anfragen — sie antworten gerade
+                # ohnehin und ein Probe kostet den laufenden Stream Latenz.
+                if _receiver_state.get(rid) is not None:
+                    continue
+                ok = is_receiver_online(rid)
+                if last.get(rid) is not None and last[rid] != ok:
+                    if ok:
+                        log.info(f"DIAG event=receiver_state rid={rid} state=up")
+                    else:
+                        log.warning(f"DIAG event=receiver_state rid={rid} state=down "
+                                    f"ip={r.get('ip')}")
+                last[rid] = ok
+        except Exception as e:
+            log.debug(f"Receiver-Watchdog: {e}")
+        time.sleep(RECEIVER_WATCHDOG_INTERVAL)
 
 
 # ── Channel Cache ─────────────────────────────────────────
@@ -11292,15 +11477,22 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         if path == "/api/health":
             # Schneller Health-Check für e2recorder (kein EPG-Overhead)
             receivers_health = []
+            health = receiver_health_snapshot()
             for r in get_receivers():
                 if not r.get("enabled", True):
                     continue
                 locked = is_receiver_locked(r)
                 state = _receiver_state.get(r["id"])
+                _h = health.get(r["id"], {})
+                down = _h.get("down", False)
                 receivers_health.append({
                     "id":     r["id"],
                     "name":   r["name"],
-                    "online": True,
+                    # Kein blockierender Probe: der Circuit Breaker kennt den
+                    # Zustand bereits aus echten Zap-/Probe-Ergebnissen.
+                    "online": not down,
+                    "down":   down,
+                    "fails":  _h.get("fails", 0),
                     "busy":   state is not None,
                     "locked": locked,
                     "channel": state.get("channel_name", "") if state else "",
@@ -11310,12 +11502,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "version":     "2.1.0",
                 "uptime_sec":  int(time.time() - _proxy_start_time),
                 "receivers":   receivers_health,
-                "tuners_free": sum(1 for r in receivers_health if not r["busy"] and not r["locked"]),
+                "tuners_free": sum(1 for r in receivers_health
+                                   if not r["busy"] and not r["locked"] and not r["down"]),
             })
             return
 
         if path == "/api/status":
             rx_status = []
+            health = receiver_health_snapshot()
             # Check which receivers have active recordings
             rec_by_receiver = {}
             with _active_recordings_lock:
@@ -11329,12 +11523,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         }
             for r in get_receivers():
                 state = _receiver_state.get(r["id"])
+                _h = health.get(r["id"], {})
                 rx_status.append({
                     "id": r["id"],
                     "name": r["name"],
                     "busy": state is not None,
                     "locked": is_receiver_locked(r),
                     "online": is_receiver_online(r["id"]),
+                    "down": _h.get("down", False),
+                    "fails": _h.get("fails", 0),
                     "stream": stream_info_public(state),
                     "recording": rec_by_receiver.get(r["id"]),
                 })
@@ -12011,24 +12208,39 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 # Suchen und Belegen MÜSSEN atomar sein — sonst schnappt sich ein
                 # paralleler Request denselben "freien" Receiver und zappt den
                 # gerade startenden Stream weg.
+                acquire_kwargs = {
+                    "client_ip": client_ip,
+                    "service_ref": service_ref,
+                    "channel_name": channel_name,
+                    "user_agent": ua,
+                    "profile": profile_name,
+                    "transcode": {
+                        "active": tp.get("codec") != "pass",
+                        "codec": tp.get("codec", ""),
+                        "label": tp.get("label", profile_name),
+                    },
+                }
                 with receiver_lock:
                     rid = get_free_receiver(receiver_pref if receiver_pref != "auto" else None)
                     if rid:
-                        rcv_epoch = acquire_receiver(
-                            rid, client_ip, service_ref, channel_name,
-                            user_agent=ua, profile=profile_name,
-                            transcode={
-                                "active": tp.get("codec") != "pass",
-                                "codec": tp.get("codec", ""),
-                                "label": tp.get("label", profile_name),
-                            })
+                        rcv_epoch = acquire_receiver(rid, **acquire_kwargs)
                 if not rid:
                     ref_lock.release()
                     self.send_text("All receivers busy", 503)
                     return
 
             try:
-                if not do_zap(rid, service_ref, channel_name):
+                if preacquired:
+                    zap_ok = do_zap(rid, service_ref, channel_name)
+                else:
+                    # Defekter Tuner darf den Stream nicht scheitern lassen,
+                    # solange ein anderer Receiver frei ist.
+                    rid, rcv_epoch = zap_with_failover(
+                        rid, rcv_epoch, service_ref, channel_name, acquire_kwargs,
+                        preferred_id=(receiver_pref if receiver_pref != "auto" else None),
+                        source="Stream")
+                    zap_ok = rid is not None
+                if not zap_ok:
                     self.send_text("Zap fehlgeschlagen", 502)
                     return
 
@@ -12102,7 +12314,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             bytes_sent=_st.get("bytes_sent", 0))
                 except Exception as _e:
                     log.debug(f"Usage-Hook (stream) fehlgeschlagen: {_e}")
-                release_receiver(rid, epoch=rcv_epoch)
+                # rid ist None, wenn das Failover auf allen Tunern scheiterte —
+                # dann sind sie dort bereits freigegeben.
+                if rid:
+                    release_receiver(rid, epoch=rcv_epoch)
                 if ref_lock is not None:
                     ref_lock.release()
             return
@@ -13123,6 +13338,18 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
         rid = None
         shared = False
         rcv_epoch = None
+        owif_acquire_kwargs = {
+            "client_ip": client_ip,
+            "service_ref": sref,
+            "channel_name": channel_name,
+            "user_agent": ua,
+            "profile": profile_id,
+            "transcode": {
+                "active": not passthrough,
+                "codec": (tp.get("codec", "") if tp else "pass"),
+                "label": (tp.get("label", profile_id) if tp else "Passthrough"),
+            },
+        }
         with receiver_lock:
             for r in get_receivers():
                 st = _receiver_state.get(r["id"])
@@ -13139,14 +13366,7 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
                     rcv_epoch = attach_receiver(rid, sref)
                     shared = rcv_epoch is not None
                 if not shared:
-                    rcv_epoch = acquire_receiver(
-                        rid, client_ip, sref, channel_name,
-                        user_agent=ua, profile=profile_id,
-                        transcode={
-                            "active": not passthrough,
-                            "codec": (tp.get("codec", "") if tp else "pass"),
-                            "label": (tp.get("label", profile_id) if tp else "Passthrough"),
-                        })
+                    rcv_epoch = acquire_receiver(rid, **owif_acquire_kwargs)
         if not rid:
             self._fail(503, "All receivers busy")
             return
@@ -13157,7 +13377,10 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
         _owif_t0 = time.time()
         try:
             if not shared:
-                if not do_zap(rid, sref, channel_name):
+                rid, rcv_epoch = zap_with_failover(
+                    rid, rcv_epoch, sref, channel_name, owif_acquire_kwargs,
+                    source="OpenWebif")
+                if not rid:
                     self._fail(502, "Zap fehlgeschlagen")
                     return
                 zap_wait = get_switch_settings(sref)["zap_wait"]
@@ -13201,7 +13424,9 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
                 log.debug(f"Usage-Hook (OpenWebif) fehlgeschlagen: {_e}")
             # Immer freigeben — der Refcount entscheidet, ob der Tuner wirklich
             # frei wird. Shared-Sessions haben oben via attach_receiver erhöht.
-            release_receiver(rid, epoch=rcv_epoch)
+            # rid ist None, wenn das Failover auf allen Tunern scheiterte.
+            if rid:
+                release_receiver(rid, epoch=rcv_epoch)
 
 
 def start_openwebif_server():
@@ -13325,6 +13550,7 @@ def run():
     threading.Thread(target=recording_reaper_loop, daemon=True, name="rec-reaper").start()
     threading.Thread(target=usage_flush_loop, daemon=True, name="usage-flush").start()
     threading.Thread(target=_diag_watchdog_loop, daemon=True, name="diag-watchdog").start()
+    threading.Thread(target=receiver_watchdog_loop, daemon=True, name="rx-watchdog").start()
     start_compression_scheduler()
 
     proxy_host = get_proxy_host()
