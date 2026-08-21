@@ -1,0 +1,27 @@
+services:
+  e2proxy:
+    image: python:3.11-slim
+    container_name: e2proxy
+    restart: unless-stopped
+    network_mode: host          # nötig für SSDP (UDP Multicast 1900) + LAN-Receiver-Zugriff
+    volumes:
+      - ./e2proxy.py:/app/e2proxy.py:ro       # Script read-only (live austauschbar)
+      - ./data:/data                          # Persistente Daten (config, EPG, Cache)
+      - /mnt/nvme/recordings:/mnt/nvme/recordings  # Aufnahmen (externer Mount)
+    working_dir: /app
+    command: >
+      bash -c "apt-get update -qq &&
+               apt-get install -y -q --no-install-recommends ffmpeg &&
+               python3 e2proxy.py"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - E2PROXY_DATA_DIR=/data
+    healthcheck:
+      # /api/health statt /api/status: der Status-Endpunkt probte jeden Receiver
+      # und lief bei einer haengenden Box in den Timeout -> Container faelschlich
+      # "unhealthy". /api/health antwortet ohne Receiver-Zugriff.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8888/api/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s

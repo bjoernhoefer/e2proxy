@@ -26,36 +26,17 @@ Single Python file, runs in Docker, manages two SAT receivers with automatic tun
 
 ### Docker (recommended)
 
-```yaml
-# docker-compose.yml
-services:
-  e2proxy:
-    image: python:3.11-slim
-    container_name: e2proxy
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ./e2proxy.py:/app/e2proxy.py:ro
-      - ./data:/data
-      - /mnt/nvme/recordings:/mnt/nvme/recordings
-    working_dir: /app
-    command: >
-      bash -c "apt-get update -qq &&
-               apt-get install -y -q --no-install-recommends ffmpeg &&
-               python3 e2proxy.py"
-    environment:
-      - PYTHONUNBUFFERED=1
-      - E2PROXY_DATA_DIR=/data
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8888/api/status', timeout=3)"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-```
+The compose file lives in the repo as
+[`docker-compose.e2proxy.yml`](docker-compose.e2proxy.yml) — use it directly so
+it never drifts from the deployed configuration:
 
 ```bash
-docker compose up -d
+docker compose -f docker-compose.e2proxy.yml up -d
 ```
+
+The healthcheck deliberately targets `/api/health`, not `/api/status`: the status
+endpoint probes every receiver and runs into a timeout when a box hangs, which
+marked the container `unhealthy` even though the proxy itself was fine.
 
 Open http://your-server:8888 and configure your receivers in Settings.
 
