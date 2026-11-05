@@ -429,6 +429,27 @@ curl -s http://server:8888/api/version
 The build id is also visible in the UI under Settings → About and in the Help page header,
 so you can confirm a rollout without shell access.
 
+### CI/CD on the self-hosted runner + host diagnostics
+
+`.github/workflows/e2proxy-host.yml` runs on the self-hosted runner on the host:
+
+| Trigger | What happens |
+|---------|--------------|
+| push → `main` | self-check gate → `deploy/host/deploy.sh` |
+| push → `feature/diaghost` | gate → deploy (only if the branch contains `main`) → `deploy/host/diagnose.sh` |
+| *Run workflow* (manual) | deploy and/or diagnose on any branch |
+
+`feature/diaghost` is a long-lived side branch — no PR needed; every push triggers the
+diagnostics. The report (reboots, OOM/kernel errors, disk/mount, Docker state, health,
+container log excerpts, automatic findings) is shown in the job summary, printed to the
+job log and uploaded as artifact `diag-report-<run_id>` (7 days). The repo is public, so
+the scripts redact tokens/passwords and never dump `config.json`. There is deliberately no
+`pull_request` trigger, so forks can never run code on the host.
+
+Optional repository variables: `E2PROXY_RUNNER` (runner label, default `self-hosted`),
+`E2PROXY_DIR` (default `$HOME/e2proxy`), `E2PROXY_URL` (default `http://localhost:8888`).
+The runner user needs Docker access; passwordless `sudo` gives fuller journal/kernel data.
+
 ## License
 
 MIT

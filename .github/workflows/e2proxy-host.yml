@@ -1,0 +1,128 @@
+# Rollout + host diagnostics for e2proxy on the self-hosted runner (= the host).
+#
+#   push → main               : self-check gate → deploy
+#   push → feature/diaghost   : self-check gate → deploy (only if branch contains main) → diagnose
+#   workflow_dispatch         : choose deploy / diagnose manually on any branch
+#
+# No pull_request trigger on purpose: the repo is public and this runs on the
+# host — fork PRs must never be able to execute code there. Pushing to the
+# diagnose branch is enough to trigger everything; no PR is needed.
+#
+# Repository variables (optional, Settings → Secrets and variables → Variables):
+#   E2PROXY_RUNNER  runner label         (default: self-hosted)
+#   E2PROXY_DIR     deploy dir on host   (default: $HOME/e2proxy)
+#   E2PROXY_URL     health-check base URL (default: http://localhost:8888)
+name: e2proxy host
+
+on:
+  push:
+    branches: [main, feature/diaghost]
+    paths-ignore: ["**.md", "LICENSE", "deploy/grafana/**"]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Deploy this ref to the host
+        type: boolean
+        default: false
+      diagnose:
+        description: Run host diagnostics
+        type: boolean
+        default: true
+      since:
+        description: Journal window for diagnostics
+        default: 7 days ago
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2proxy-host
+  cancel-in-progress: false
+
+env:
+  DIAG_BRANCH: feature/diaghost
+
+jobs:
+  selfcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile + WebUI self-check
+        run: |
+          python -m py_compile e2proxy.py
+          E2PROXY_DATA_DIR="$(mktemp -d)" python e2proxy.py --selfcheck
+          bash -n deploy/host/deploy.sh
+          bash -n deploy/host/diagnose.sh
+
+  deploy:
+    needs: selfcheck
+    if: >-
+      (github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && inputs.deploy)
+    runs-on: ${{ vars.E2PROXY_RUNNER || 'self-hosted' }}
+    env:
+      E2PROXY_DIR: ${{ vars.E2PROXY_DIR }}
+      E2PROXY_URL: ${{ vars.E2PROXY_URL }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Guard against rolling back main
+        id: guard
+        run: |
+          if [ "$GITHUB_REF_NAME" = main ]; then echo "ok=true" >>"$GITHUB_OUTPUT"; exit 0; fi
+          git fetch -q origin main
+          if git merge-base --is-ancestor origin/main HEAD; then
+            echo "ok=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "::warning::$GITHUB_REF_NAME does not contain origin/main — skipping deploy to avoid a rollback. Merge/rebase main into the branch to deploy it."
+            echo "ok=false" >>"$GITHUB_OUTPUT"
+          fi
+      - name: Deploy
+        if: steps.guard.outputs.ok == 'true'
+        run: |
+          [ -n "$E2PROXY_DIR" ] || unset E2PROXY_DIR
+          [ -n "$E2PROXY_URL" ] || unset E2PROXY_URL
+          bash deploy/host/deploy.sh
+
+  diagnose:
+    needs: deploy
+    # Runs even if deploy was skipped or failed — the failure itself is a data point.
+    if: >-
+      always() && (
+        (github.event_name == 'push' && github.ref_name == 'feature/diaghost') ||
+        (github.event_name == 'workflow_dispatch' && inputs.diagnose)
+      )
+    runs-on: ${{ vars.E2PROXY_RUNNER || 'self-hosted' }}
+    env:
+      E2PROXY_DIR: ${{ vars.E2PROXY_DIR }}
+      E2PROXY_URL: ${{ vars.E2PROXY_URL }}
+      DIAG_SINCE: ${{ inputs.since || '7 days ago' }}
+      DIAG_OUT: ${{ github.workspace }}/diag-report
+    steps:
+      - uses: actions/checkout@v4
+      - name: Collect host diagnostics
+        run: |
+          [ -n "$E2PROXY_DIR" ] || unset E2PROXY_DIR
+          [ -n "$E2PROXY_URL" ] || unset E2PROXY_URL
+          rm -rf "$DIAG_OUT"
+          bash deploy/host/diagnose.sh
+      - name: Summary
+        if: always()
+        run: cat "$DIAG_OUT/SUMMARY.md" >>"$GITHUB_STEP_SUMMARY"
+      # Full report in the job log, so it can be read via the API / `gh run view --log`.
+      - name: Print report
+        if: always()
+        run: |
+          for f in "$DIAG_OUT"/SUMMARY.md "$DIAG_OUT"/*.txt; do
+            echo "::group::$(basename "$f")"; cat "$f"; echo "::endgroup::"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diag-report-${{ github.run_id }}
+          path: diag-report/
+          retention-days: 7
