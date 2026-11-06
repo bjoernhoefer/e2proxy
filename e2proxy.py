@@ -41,13 +41,13 @@ from datetime import datetime, timedelta, timezone
 # ── Pfade ─────────────────────────────────────────────────
 # Datenpfad: via Env-Variable überschreibbar (für Docker)
 DATA_DIR       = os.environ.get("E2PROXY_DATA_DIR", "/var/lib/e2proxy")
-VERSION        = "4.7"   # Offizielle Version — nur beim Pull Request erhöhen (major/minor)
+VERSION        = "4.9"   # Offizielle Version — nur beim Pull Request erhöhen (major/minor)
 # ── Interne Build-/Versionskennung ────────────────────────
 # Identifiziert eindeutig den ausgerollten Branch/Stand bei Tests, OHNE die
 # offizielle VERSION zu verändern (die steigt erst beim PR). Bei jedem Test-
 # Rollout eines neuen Standes BUILD_SEQ erhöhen.
-BUILD_BRANCH     = "fix/stream-stability"
-BUILD_SEQ        = "1c76420d"
+BUILD_BRANCH = "interface-health-probes"
+BUILD_SEQ    = "1e34e85b"
 INTERNAL_VERSION = f"{VERSION}+{BUILD_BRANCH.split('/')[-1]}.{BUILD_SEQ}"
 CONFIG_FILE    = f"{DATA_DIR}/config.json"
 FAVORITES_FILE = f"{DATA_DIR}/favorites.json"
@@ -1512,20 +1512,23 @@ RECEIVER_PROBE_TIMEOUT  = 3    # HTTP-Timeout des Online-Checks
 RECEIVER_PROBE_TTL      = 10   # Sekunden, die ein Probe-Ergebnis gecacht wird
 RECEIVER_WATCHDOG_INTERVAL = 30  # Probe-Intervall des Hintergrund-Watchdogs
 
-_receiver_health = {}          # rid → dict(fails, down_until, probe_ts, probe_ok)
+_receiver_health = {}          # rid → dict(fails, down_until, probe_ts, probe_ok, fail_since)
 _receiver_health_lock = threading.RLock()
 
 
 def _health_entry(rid):
     with _receiver_health_lock:
         return _receiver_health.setdefault(
-            rid, {"fails": 0, "down_until": 0.0, "probe_ts": 0.0, "probe_ok": None})
+            rid, {"fails": 0, "down_until": 0.0, "probe_ts": 0.0, "probe_ok": None,
+                  "fail_since": 0.0})
 
 
 def mark_receiver_failure(rid, reason=""):
     """Zählt einen Fehlversuch und öffnet ggf. den Circuit Breaker."""
     with _receiver_health_lock:
         h = _health_entry(rid)
+        if h["fails"] == 0:
+            h["fail_since"] = time.time()   # Beginn des Ausfalls (für Alarm/UI)
         h["fails"] += 1
         h["probe_ts"] = 0.0          # Probe-Cache verwerfen
         h["probe_ok"] = None
@@ -1542,6 +1545,7 @@ def mark_receiver_ok(rid):
         h = _health_entry(rid)
         was_down = h["down_until"] > time.time()
         h["fails"] = 0
+        h["fail_since"] = 0.0
         h["down_until"] = 0.0
         h["probe_ts"] = time.time()
         h["probe_ok"] = True
@@ -1555,16 +1559,36 @@ def is_receiver_down(rid):
         return _health_entry(rid)["down_until"] > time.time()
 
 
+def is_receiver_unhealthy(rid):
+    """True, wenn der Receiver aktuell als ausgefallen gilt.
+
+    Strenger als is_receiver_down(): der Breaker ist nur 60 s am Stück offen und
+    schließt sich zwischen zwei Watchdog-Probes kurz. Wer nur auf den Breaker
+    schaut, landet in diesen Lücken wieder bei der toten Box. Maßgeblich ist
+    deshalb zusätzlich die Fehlerserie — sie wird erst durch eine erfolgreiche
+    Antwort (mark_receiver_ok) zurückgesetzt.
+    """
+    with _receiver_health_lock:
+        h = _health_entry(rid)
+        return h["down_until"] > time.time() or h["fails"] >= RECEIVER_FAIL_THRESHOLD
+
+
 def receiver_health_snapshot():
     """Health-Zustand aller Receiver für API/UI."""
     now = time.time()
     out = {}
     with _receiver_health_lock:
         for rid, h in _receiver_health.items():
+            unhealthy = h["down_until"] > now or h["fails"] >= RECEIVER_FAIL_THRESHOLD
+            since = h.get("fail_since") or 0.0
             out[rid] = {
                 "fails": h["fails"],
                 "down": h["down_until"] > now,
                 "down_for_sec": max(0, int(h["down_until"] - now)),
+                "unhealthy": unhealthy,
+                "unreachable_sec": int(now - since) if (unhealthy and since) else 0,
+                "unreachable_since": (datetime.fromtimestamp(since).strftime("%Y-%m-%d %H:%M")
+                                      if (unhealthy and since) else ""),
             }
     return out
 
@@ -1597,7 +1621,7 @@ def get_free_receiver(preferred_id=None, exclude=None):
             if not is_receiver_usable(r) or _receiver_state.get(rid) is not None:
                 continue
             free.append(rid)
-            if not is_receiver_down(rid):
+            if not is_receiver_unhealthy(rid):
                 healthy.append(rid)
 
         if healthy:
@@ -1931,8 +1955,11 @@ def do_zap(rid, service_ref, channel_name=None):
     wait_used = get_switch_settings(service_ref)["zap_wait"]
     t0 = time.time()
     last_err = None
+    # Bekannt ausgefallene Box: nur ein Versuch — sonst warten Clients wie Plex
+    # 3×8 s, bevor der Failover greift, und brechen vorher selbst ab.
+    attempts = 1 if is_receiver_unhealthy(rid) else ZAP_ATTEMPTS
 
-    for attempt in range(1, ZAP_ATTEMPTS + 1):
+    for attempt in range(1, attempts + 1):
         try:
             with urllib.request.urlopen(url, timeout=ZAP_TIMEOUT_SEC) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
@@ -1957,13 +1984,13 @@ def do_zap(rid, service_ref, channel_name=None):
             mark_receiver_ok(rid)
             return True
 
-        if attempt < ZAP_ATTEMPTS:
-            log.warning(f"ZAP Versuch {attempt}/{ZAP_ATTEMPTS} für '{rid}' "
+        if attempt < attempts:
+            log.warning(f"ZAP Versuch {attempt}/{attempts} für '{rid}' "
                         f"fehlgeschlagen ({last_err}) — neuer Versuch")
             time.sleep(1.0)
 
     elapsed_ms = (time.time() - t0) * 1000
-    log.error(f"ZAP ERROR nach {ZAP_ATTEMPTS} Versuchen auf '{rid}': {last_err}")
+    log.error(f"ZAP ERROR nach {attempts} Versuch(en) auf '{rid}': {last_err}")
     record_zap_result(service_ref, False, elapsed_ms, wait_used, channel_name)
     mark_receiver_failure(rid, f"Zap: {last_err}")
     return False
@@ -2036,6 +2063,10 @@ def receiver_watchdog_loop():
                 last[rid] = ok
         except Exception as e:
             log.debug(f"Receiver-Watchdog: {e}")
+        try:
+            check_receiver_alerts()
+        except Exception as e:
+            log.debug(f"Receiver-Alarm: {e}")
         time.sleep(RECEIVER_WATCHDOG_INTERVAL)
 
 
@@ -3279,6 +3310,13 @@ def run_epg_update(triggered_by="manual"):
         if not receivers:
             _epg_log("Keine Receiver verfügbar")
             return False
+        # Ausgefallene Receiver überspringen (sonst läuft jedes Bouquet in den Timeout)
+        healthy = [r for r in receivers if not is_receiver_unhealthy(r["id"])]
+        for r in receivers:
+            if r not in healthy:
+                _epg_log(f"Receiver {r['name']} nicht erreichbar — übersprungen")
+        if healthy:
+            receivers = healthy
 
         with epg_run_lock:
             epg_run_state["total"] = len(target_refs)
@@ -5518,6 +5556,282 @@ def maintenance_notify_loop():
         time.sleep(20)
 
 
+# ── Receiver-Ausfall-Alarm ────────────────────────────────────────────────────
+# Eine eingefrorene Box (Ping ok, HTTP hängt) blieb früher tagelang unbemerkt:
+# der Circuit Breaker umging sie still, nur das Log füllte sich. Ist ein Receiver
+# länger als `after_min` Minuten am Stück nicht erreichbar, wird EINMAL pro
+# Ausfall alarmiert (Log-Event für Loki/Grafana + optionaler Webhook), und
+# ebenso einmal, wenn er wieder antwortet.
+RECEIVER_ALERT_DEFAULT = {
+    "enabled": True,
+    "after_min": 10,
+    "url": "",
+    "method": "POST",
+}
+
+_receiver_alerted = {}          # rid → fail_since des bereits gemeldeten Ausfalls
+_receiver_alert_lock = threading.Lock()
+
+
+def get_receiver_alert_config():
+    cfg = get_config().get("receiver_alerts", {})
+    merged = dict(RECEIVER_ALERT_DEFAULT)
+    if isinstance(cfg, dict):
+        merged.update(cfg)
+    merged["enabled"] = bool(merged.get("enabled", True))
+    try:
+        merged["after_min"] = max(1, min(1440, int(merged.get("after_min", 10))))
+    except (TypeError, ValueError):
+        merged["after_min"] = 10
+    merged["url"] = str(merged.get("url", "") or "").strip()
+    merged["method"] = "GET" if str(merged.get("method", "POST")).upper() == "GET" else "POST"
+    return merged
+
+
+def send_receiver_alert(event, r, since_ts=0.0, test=False):
+    """Schickt den Alarm-Webhook ab. event: 'receiver_down' | 'receiver_up'.
+
+    Gibt (ok, message) zurück. Ohne konfigurierte URL wird nur geloggt."""
+    ac = get_receiver_alert_config()
+    url = ac["url"]
+    if not url:
+        return False, "Keine URL konfiguriert"
+    if _is_self_url(url):
+        msg = "URL zeigt auf diese e2proxy-Instanz — abgebrochen"
+        log.warning(f"Receiver-Alarm abgebrochen ({url}): {msg}")
+        return False, msg
+    down_min = int((time.time() - since_ts) / 60) if since_ts else 0
+    try:
+        if ac["method"] == "POST":
+            payload = json.dumps({
+                "event": event,
+                "test": test,
+                "receiver": r.get("id", ""),
+                "name": r.get("name", ""),
+                "ip": r.get("ip", ""),
+                "since": datetime.fromtimestamp(since_ts).isoformat() if since_ts else "",
+                "down_min": down_min,
+                "timestamp": datetime.now().isoformat(),
+            }).encode("utf-8")
+            req = urllib.request.Request(url, data=payload, method="POST",
+                                         headers={"Content-Type": "application/json",
+                                                  "User-Agent": "e2proxy"})
+        else:
+            q = urllib.parse.urlencode({"event": event, "receiver": r.get("id", ""),
+                                        "down_min": down_min, "test": int(test)})
+            req = urllib.request.Request(url + ("&" if "?" in url else "?") + q,
+                                         method="GET", headers={"User-Agent": "e2proxy"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            status = resp.getcode()
+        log.info(f"Receiver-Alarm gesendet ({event} '{r.get('id')}') → HTTP {status}")
+        return True, f"HTTP {status}"
+    except Exception as e:
+        log.warning(f"Receiver-Alarm fehlgeschlagen ({ac['method']} {url}): {e}")
+        return False, str(e)
+
+
+def check_receiver_alerts():
+    """Vom Receiver-Watchdog aufgerufen: meldet lange Ausfälle und deren Ende."""
+    ac = get_receiver_alert_config()
+    threshold = ac["after_min"] * 60
+    for r in get_receivers():
+        rid = r["id"]
+        if not r.get("enabled", True):
+            continue
+        with _receiver_health_lock:
+            h = _health_entry(rid)
+            since = h.get("fail_since") or 0.0
+            failing = h["fails"] >= RECEIVER_FAIL_THRESHOLD and since > 0
+        with _receiver_alert_lock:
+            alerted_since = _receiver_alerted.get(rid)
+            if failing and alerted_since != since and (time.time() - since) >= threshold:
+                _receiver_alerted[rid] = since
+                fire = "receiver_down"
+            elif not failing and alerted_since is not None:
+                _receiver_alerted.pop(rid, None)
+                fire = "receiver_up"
+            else:
+                fire = None
+        if fire == "receiver_down":
+            log.warning(f"DIAG event=receiver_alert rid={rid} state=down ip={r.get('ip')} "
+                        f"since=\"{datetime.fromtimestamp(since).strftime('%Y-%m-%d %H:%M:%S')}\" "
+                        f"down_min={int((time.time() - since) / 60)}")
+            if ac["enabled"]:
+                send_receiver_alert("receiver_down", r, since)
+        elif fire == "receiver_up":
+            log.info(f"DIAG event=receiver_alert rid={rid} state=up ip={r.get('ip')}")
+            if ac["enabled"]:
+                send_receiver_alert("receiver_up", r, alerted_since or 0.0)
+
+
+# ── Schnittstellen-Health-Probes (Modul e2probe.py) ───────────────────────────
+# Prüft periodisch von außen, ob Plex (HDHomeRun-Emulation) und die Enigma2-Apps
+# (OpenWebif-Emulation) bedient werden können. Das Modul ist optional: fehlt die
+# Datei, läuft e2proxy unverändert ohne Probes weiter.
+try:
+    import e2probe
+except Exception as _e2probe_err:          # pragma: no cover
+    e2probe = None
+
+INTERFACE_PROBE_INTERVAL = 60
+_interface_monitor = None
+
+
+def _probe_tuners():
+    """Kann Plex gerade einen Sender einstellen? (freier, erreichbarer Tuner)"""
+    usable = [r for r in get_receivers() if is_receiver_usable(r)]
+    if not usable:
+        return "down", "Kein Receiver aktiviert"
+    healthy = [r for r in usable if not is_receiver_unhealthy(r["id"])]
+    free = [r for r in healthy if _receiver_state.get(r["id"]) is None]
+    dead = [r["name"] for r in usable if r not in healthy]
+    tail = f" · nicht erreichbar: {', '.join(dead)}" if dead else ""
+    if not healthy:
+        return "down", "Alle Receiver nicht erreichbar — Plex: „Sender konnte nicht eingestellt werden“"
+    if not free:
+        return "warn", f"Alle {len(healthy)} erreichbaren Tuner belegt{tail}"
+    if dead:
+        return "warn", f"{len(free)}/{len(usable)} Tuner frei{tail}"
+    return "ok", f"{len(free)}/{len(usable)} Tuner frei"
+
+
+def _check_health_json(obj):
+    return ("ok", "API antwortet") if obj.get("ok") else ("down", "ok=false")
+
+
+def _check_discover(obj):
+    n = int(obj.get("TunerCount", 0) or 0)
+    if n <= 0:
+        return "down", "TunerCount=0 — Plex sieht keine Tuner"
+    return "ok", f"{n} Tuner gemeldet"
+
+
+def _check_lineup(obj):
+    if not isinstance(obj, list) or not obj:
+        return "down", "Senderliste leer — Plex hat nichts zum Einstellen"
+    return "ok", f"{len(obj)} Sender"
+
+
+def _check_owif_about(status, body):
+    if not 200 <= status < 300:
+        return "down", f"HTTP {status} (Metadaten-Receiver antwortet nicht)"
+    r = _owif_metadata_receiver()
+    return "ok", f"Metadaten über {r['name'] if r else '?'}"
+
+
+def _check_owif_services(status, body):
+    if not 200 <= status < 300:
+        return "down", f"HTTP {status}"
+    obj = json.loads(body.decode("utf-8", "replace"))
+    n = len(obj.get("services") or [])
+    return ("ok", f"{n} Bouquets") if n else ("down", "keine Bouquets")
+
+
+def interface_probe_targets():
+    port = get_proxy_port()
+    base = f"http://127.0.0.1:{port}"
+    targets = [
+        {"id": "web", "group": "e2proxy", "label": "Web-UI / API", "kind": "http",
+         "url": f"{base}/api/health", "timeout": 5, "warn_ms": 1500,
+         "check": e2probe.check_json(_check_health_json)},
+        {"id": "plex_discover", "group": "Plex", "label": "HDHomeRun discover.json",
+         "kind": "http", "url": f"{base}/discover.json", "timeout": 5, "warn_ms": 1500,
+         "check": e2probe.check_json(_check_discover)},
+        {"id": "plex_lineup", "group": "Plex", "label": "HDHomeRun lineup.json",
+         "kind": "http", "url": f"{base}/lineup.json", "timeout": 10, "warn_ms": 3000,
+         "check": e2probe.check_json(_check_lineup)},
+        {"id": "tuners", "group": "Plex", "label": "Tuner verfügbar", "kind": "func",
+         "fn": _probe_tuners},
+    ]
+    owif = get_owif_config()
+    if owif["enabled"]:
+        wb = f"http://127.0.0.1:{owif['webif_port']}"
+        targets += [
+            {"id": "owif_about", "group": "OpenWebif", "label": "Metadaten (/web/about)",
+             "kind": "http", "url": f"{wb}/web/about", "timeout": 8, "warn_ms": 3000,
+             "check": _check_owif_about},
+            {"id": "owif_bouquets", "group": "OpenWebif", "label": "Bouquets (/api/getservices)",
+             "kind": "http", "url": f"{wb}/api/getservices", "timeout": 10, "warn_ms": 4000,
+             "check": _check_owif_services},
+            {"id": "owif_stream", "group": "OpenWebif", "label": "Stream-Port",
+             "kind": "tcp", "port": owif["stream_port"]},
+        ]
+        if owif.get("recordings_enabled", True) and owif.get("recordings_port"):
+            targets.append({"id": "owif_recordings", "group": "OpenWebif",
+                            "label": "Aufnahmen-Port", "kind": "tcp",
+                            "port": owif["recordings_port"]})
+    return targets
+
+
+def _on_interface_change(target, old, new, res):
+    if new == "down":
+        log.warning(f"DIAG event=interface_state id={target['id']} state=down "
+                    f"group={target.get('group', '')} detail=\"{res.get('detail', '')}\"")
+    else:
+        log.info(f"DIAG event=interface_state id={target['id']} state=up "
+                 f"group={target.get('group', '')}")
+    ac = get_receiver_alert_config()
+    if ac["enabled"] and ac["url"]:
+        pseudo = {"id": target["id"], "name": f"{target.get('group', '')}: {target.get('label', '')}",
+                  "ip": ""}
+        since = res.get("since", 0.0) if new != "down" else 0.0
+        send_receiver_alert("interface_down" if new == "down" else "interface_up", pseudo, since)
+
+
+def start_interface_monitor():
+    global _interface_monitor
+    if e2probe is None:
+        log.warning("Schnittstellen-Probes deaktiviert: e2probe.py nicht gefunden")
+        return
+    _interface_monitor = e2probe.InterfaceMonitor(
+        interface_probe_targets, interval=INTERFACE_PROBE_INTERVAL,
+        fail_threshold=2, on_change=_on_interface_change, logger=log)
+    _interface_monitor.start(initial_delay=45)
+
+
+def interface_snapshot():
+    if _interface_monitor is None:
+        return {"available": False, "state": "unknown", "ok": True, "down": [], "probes": []}
+    snap = _interface_monitor.snapshot()
+    snap["available"] = True
+    return snap
+
+
+def interface_stream_test(kind, ref=""):
+    """Echter Stream-Test über den Plex- bzw. OpenWebif-Pfad (belegt einen Tuner)."""
+    if e2probe is None:
+        return {"ok": False, "detail": "e2probe.py nicht gefunden"}
+    if _probe_tuners()[0] == "down" or get_free_receiver() is None:
+        return {"ok": False, "detail": "Kein freier, erreichbarer Tuner — Test übersprungen"}
+    favs = get_favorites()
+    if not ref:
+        if not favs:
+            return {"ok": False, "detail": "Keine Favoriten — kein Test-Sender"}
+        ref = favs[0]["ref"]
+    name = next((f.get("name", "") for f in favs if f["ref"] == ref), "") or ref
+    if kind == "openwebif":
+        owif = get_owif_config()
+        if not owif["enabled"]:
+            return {"ok": False, "detail": "OpenWebif-Emulation ist deaktiviert"}
+        url = f"http://127.0.0.1:{owif['stream_port']}/{ref}"
+    else:
+        lineup = build_hdhr_lineup()
+        def _entry_ref(e):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(e.get("URL", "")).query)
+            return (q.get("ref") or [""])[0]
+        entry = next((e for e in lineup if _entry_ref(e) == ref), None)
+        if not entry:
+            return {"ok": False, "detail": f"{name} nicht in der Plex-Senderliste"}
+        url = entry["URL"].replace(f"{get_proxy_host()}:{get_proxy_port()}",
+                                   f"127.0.0.1:{get_proxy_port()}", 1)
+    res = e2probe.stream_probe(url, seconds=8)
+    res["channel"] = name
+    res["kind"] = kind
+    log.info(f"DIAG event=stream_test kind={kind} ok={res['ok']} channel=\"{name}\" "
+             f"ttfb_ms={res.get('ttfb_ms')} bytes={res.get('bytes')} detail=\"{res['detail']}\"")
+    return res
+
+
 # ── API Access Log ─────────────────────────────────────────────────────────────
 API_ACCESS_LOG_FILE = f"{DATA_DIR}/api_access.log"
 API_ACCESS_LOG_MAX  = 1000  # max Einträge
@@ -5776,6 +6090,30 @@ const I18N = {
     "set.maint_notify_idle_always": "Always at the scheduled time",
     "set.maint_notify_idle_only": "Only when idle (no recording / nobody watching)",
     "set.maint_notify_test": "Send test",
+    "set.rx_alert": "Receiver Outage Alert",
+    "if.title": "Interface status",
+    "if.check_now": "Check now",
+    "if.hint": "Probes the Plex (HDHomeRun) and DreamBox app (OpenWebif) interfaces every 60 s. Probe requests are not counted in usage statistics. Outages are reported via the receiver alert webhook.",
+    "if.test_plex": "Stream test Plex",
+    "if.test_owif": "Stream test OpenWebif",
+    "if.test_confirm": "The stream test tunes a free receiver to the first favorite for about 8 seconds. Continue?",
+    "if.testing": "Stream test running…",
+    "if.checking": "Checking…",
+    "if.checked": "checked",
+    "if.unavailable": "Probe module (e2probe.py) not available.",
+    "if.col_group": "Interface",
+    "if.col_probe": "Probe",
+    "if.col_detail": "Detail",
+    "if.col_since": "Since",
+    "if.state_ok": "All interfaces OK",
+    "if.state_warn": "Warning",
+    "if.state_down": "Interface down",
+    "if.state_unknown": "Not checked yet",
+    "set.rx_alert_hint": "If a receiver is unreachable for longer than the configured minutes, an alert is logged (DIAG event=receiver_alert) and optionally an HTTP call is sent — once per outage, plus once when it is reachable again.",
+    "set.rx_alert_enable": "Send alert webhook",
+    "set.rx_alert_after": "Alert after (minutes)",
+    "rx.unreachable": "unreachable since",
+    "rx.unreachable_hint": "Receiver does not answer HTTP — requests are routed to another receiver.",
     "set.update_logos_card": "Update logos", "set.update_logos_hint": "Reloads all channel logos into the local cache.",
     "set.reload_channels": "Reload channel list", "set.reload_channels_hint": "Reloads all channels and bouquets from the receiver.",
     "set.restart_service": "Restart service", "set.restart_hint": "Restarts the e2proxy service. Active streams will be interrupted.",
@@ -5961,6 +6299,30 @@ const I18N = {
     "set.maint_notify_idle_always": "Immer zur geplanten Zeit",
     "set.maint_notify_idle_only": "Nur im Leerlauf (keine Aufnahme / niemand schaut)",
     "set.maint_notify_test": "Test senden",
+    "set.rx_alert": "Receiver-Ausfall-Alarm",
+    "if.title": "Schnittstellen-Status",
+    "if.check_now": "Jetzt prüfen",
+    "if.hint": "Prüft alle 60 s die Plex- (HDHomeRun) und DreamBox-App-Schnittstellen (OpenWebif). Probe-Anfragen zählen nicht in die Nutzungsstatistik. Ausfälle werden über den Receiver-Alarm-Webhook gemeldet.",
+    "if.test_plex": "Stream-Test Plex",
+    "if.test_owif": "Stream-Test OpenWebif",
+    "if.test_confirm": "Der Stream-Test schaltet einen freien Receiver für ca. 8 Sekunden auf den ersten Favoriten. Fortfahren?",
+    "if.testing": "Stream-Test läuft…",
+    "if.checking": "Prüfe…",
+    "if.checked": "geprüft vor",
+    "if.unavailable": "Probe-Modul (e2probe.py) nicht verfügbar.",
+    "if.col_group": "Schnittstelle",
+    "if.col_probe": "Probe",
+    "if.col_detail": "Detail",
+    "if.col_since": "Seit",
+    "if.state_ok": "Alle Schnittstellen OK",
+    "if.state_warn": "Warnung",
+    "if.state_down": "Schnittstelle ausgefallen",
+    "if.state_unknown": "Noch nicht geprüft",
+    "set.rx_alert_hint": "Ist ein Receiver länger als die eingestellten Minuten nicht erreichbar, wird ein Alarm geloggt (DIAG event=receiver_alert) und optional ein HTTP-Call gesendet — einmal pro Ausfall, und einmal, wenn er wieder erreichbar ist.",
+    "set.rx_alert_enable": "Alarm-Webhook senden",
+    "set.rx_alert_after": "Alarm nach (Minuten)",
+    "rx.unreachable": "nicht erreichbar seit",
+    "rx.unreachable_hint": "Receiver beantwortet kein HTTP — Anfragen werden auf einen anderen Receiver umgeleitet.",
     "set.update_logos_card": "Logos aktualisieren", "set.update_logos_hint": "Lädt alle Senderlogos neu in den lokalen Cache.",
     "set.reload_channels": "Senderliste neu laden", "set.reload_channels_hint": "Lädt alle Sender und Bouquets neu vom Receiver.",
     "set.restart_service": "Service neu starten", "set.restart_hint": "Startet den e2proxy Service neu. Aktive Streams werden unterbrochen.",
@@ -6704,6 +7066,10 @@ def build_web_ui(channels):
         if state is None:
             color = "#22c55e" if online else "#ef4444"
             status = "free"
+            _hs = receiver_health_snapshot().get(r["id"], {})
+            if _hs.get("unhealthy"):
+                color = "#ef4444"
+                status = f"⚠ nicht erreichbar ({int(_hs.get('unreachable_sec', 0)) // 60} min)"
         else:
             # Check if this receiver has an active recording
             is_rec = False
@@ -7117,10 +7483,16 @@ function refreshStatus() {{
         const since = rx.stream.started || '?';
         const recLabel = isRec ? '🔴 REC ' + (rx.recording.title||'') + ' · ' : '';
         st.textContent = recLabel + ch + ' · ' + cl + ' · ' + since;
+      }} else if (rx.unhealthy) {{
+        dot.style.background = '#ef4444';
+        dot.className = 'rx-dot';
+        st.textContent = '⚠ ' + t('rx.unreachable') + ' ' + (rx.unreachable_sec ? new Date(Date.now() - rx.unreachable_sec*1000).toLocaleString([], {{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}}) : '?');
+        st.title = t('rx.unreachable_hint');
       }} else {{
         dot.style.background = rx.online ? '#22c55e' : '#ef4444';
         dot.className = 'rx-dot';
         st.textContent = t('rec.tuner_free');
+        st.title = 'Details';
       }}
     }});
     if (_modalRxId != null) renderStreamModal();
@@ -7227,7 +7599,23 @@ def build_help_ui():
       <div style="display:flex;flex-direction:column;gap:12px">
 
         <div style="border-left:3px solid var(--accent);padding-left:14px">
-          <b style="color:var(--accent);font-family:monospace;font-size:11px">v4.6</b>
+          <b style="color:var(--accent);font-family:monospace;font-size:11px">v4.9</b>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-11-06</span>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">Schnittstellen-Health-Probes · schnelleres Zap-Failover</span>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)"><b>Schnittstellen-Status:</b> Neues Modul <code>e2probe.py</code> prüft alle 60&nbsp;s die Plex-Schnittstelle (<code>/discover.json</code>, <code>/lineup.json</code>, Tuner-Verfügbarkeit) und die DreamBox-App-Schnittstelle (OpenWebif <code>/web/about</code>, Bouquet-Liste, Stream-Port, Aufnahme-Port). Ergebnis unter <b>Einstellungen → Wartung</b> und <code>/api/interfaces</code>; Ausfälle werden nach 2 Fehlschlägen als <code>DIAG event=interface_state</code> geloggt und über den Receiver-Alarm-Webhook (<code>interface_down</code>/<code>interface_up</code>) gemeldet. Manueller Stream-Test für Plex und OpenWebif. Probe-Anfragen zählen nicht in Statistik und Access-Log.<br>
+          <b>Schnelleres Failover beim Umschalten:</b> Ein bereits als ausgefallen bekannter Receiver wird bei der Tuner-Wahl übersprungen bzw. nur einmal (statt dreimal) versucht — Plex bekam vorher erst nach ~38&nbsp;s einen Stream und brach mit „Sender konnte nicht eingestellt werden“ ab.</div>
+        </div>
+
+        <div style="border-left:3px solid var(--accent);padding-left:14px">
+          <b style="color:var(--accent);font-family:monospace;font-size:11px">v4.8</b>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-11-06</span>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">Eingefrorene Receiver: OpenWebif-Ausweichen · Ausfall-Alarm</span>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)"><b>OpenWebif-Emulation weicht toten Boxen aus:</b> Metadaten-/EPG-Anfragen der Apps gingen immer an den Default-Receiver. War dieser eingefroren (Ping ok, HTTP hängt), lief jede Anfrage 20&nbsp;s in den Timeout — die Apps wirkten „hängend“. Ausgefallene Receiver (Circuit Breaker offen oder Fehlerserie) werden jetzt übersprungen; der Default bleibt unverändert und wird automatisch wieder genutzt, sobald er antwortet.<br>
+          <b>Receiver-Ausfall-Alarm:</b> Ist ein Receiver länger als N Minuten (Default 10) nicht erreichbar, wird einmal pro Ausfall <code>DIAG event=receiver_alert</code> geloggt und optional ein Webhook (<b>Einstellungen → Wartung</b>) mit <code>receiver_down</code> bzw. <code>receiver_up</code> gesendet. Die Statusleiste zeigt „⚠ nicht erreichbar seit …“ statt „frei“.</div>
+        </div>
+
+        <div style="border-left:3px solid var(--border);padding-left:14px">
+          <b style="font-family:monospace;font-size:11px">v4.6</b>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-08-10</span>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">Stream-Stabilität: Tuner-Refcount · Jitter-Puffer · Log-Flut</span>
           <div style="font-size:11px;margin-top:4px;color:var(--muted)"><b>Abbrechende Streams behoben:</b> Ein Receiver wird jetzt per Referenzzähler verwaltet. Teilten sich mehrere Zuschauer einen Tuner (Shared Tuner, z.&nbsp;B. VLCs Probe- plus Play-Verbindung), gab der zuerst endende Stream den Tuner frei, obwohl der andere noch lief — der nächste Request nahm den vermeintlich freien Receiver und zappte ihn weg. Freigabe erfolgt erst, wenn der letzte Nutzer geht (<code>/kill</code> erzwingt weiterhin sofort). Receiver-Auswahl und -Belegung laufen unter einem Lock, damit zwei fast gleichzeitige Requests nicht denselben Tuner greifen. Die Upstream-Sockets werden pro Receiver als Menge geführt (vorher überschrieb der zweite Stream den Socket des ersten → Tuner-Leak beim Kill). Ein <code>/stream</code> mit <code>preacquired</code> hängt sich an, statt den Receiver der laufenden Aufnahme freizugeben.<br>
@@ -8690,6 +9078,20 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
     </div>
 
     <div class="card">
+      <div class="card-title">🩺 <span data-i18n="if.title">Interface status</span>
+        <button class="btn" style="margin-left:auto;font-size:10px" onclick="checkInterfaces()">↺ <span data-i18n="if.check_now">Check now</span></button>
+      </div>
+      <div style="color:var(--muted);font-size:11px;margin-bottom:8px" data-i18n="if.hint">Probes the Plex (HDHomeRun) and DreamBox app (OpenWebif) interfaces every 60 s. Probe requests are not counted in usage statistics.</div>
+      <div id="if-summary" style="font-size:12px;margin-bottom:6px"></div>
+      <div style="overflow-x:auto"><table style="width:100%;font-size:11px;border-collapse:collapse" id="if-table"><tbody><tr><td style="color:var(--muted)" data-i18n="common.loading">Loading…</td></tr></tbody></table></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center">
+        <button class="btn" onclick="streamTestInterface('plex')">▶ <span data-i18n="if.test_plex">Stream test Plex</span></button>
+        <button class="btn" onclick="streamTestInterface('openwebif')">▶ <span data-i18n="if.test_owif">Stream test OpenWebif</span></button>
+        <span class="action-feedback" id="if-fb"></span>
+      </div>
+    </div>
+
+    <div class="card">
       <div class="card-title">🔧 <span data-i18n="set.maint_actions">Maintenance Actions</span></div>
       <div class="action-grid">
 
@@ -8764,6 +9166,38 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
         <button class="btn btn-primary" onclick="saveMaintNotify()">💾 <span data-i18n="common.save">Save</span></button>
         <button class="btn" onclick="testMaintNotify()">🚀 <span data-i18n="set.maint_notify_test">Send test</span></button>
         <span class="action-feedback" id="mn-fb"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">🚨 <span data-i18n="set.rx_alert">Receiver Outage Alert</span></div>
+      <p class="card-desc" data-i18n="set.rx_alert_hint">If a receiver is unreachable for longer than the configured minutes, an alert is logged and optionally an HTTP call is sent.</p>
+
+      <label style="display:flex;align-items:center;gap:8px;margin-bottom:14px;cursor:pointer">
+        <input type="checkbox" id="ra-enabled">
+        <span data-i18n="set.rx_alert_enable">Send alert webhook</span>
+      </label>
+
+      <div class="field">
+        <label class="label" data-i18n="set.maint_notify_url">Target URL</label>
+        <div class="flex">
+          <select class="select" id="ra-method" style="width:90px">
+            <option value="POST">POST</option>
+            <option value="GET">GET</option>
+          </select>
+          <input type="text" class="input" id="ra-url" placeholder="https://example.com/hook" style="flex:1">
+        </div>
+      </div>
+
+      <div class="field" style="margin-top:12px">
+        <label class="label" data-i18n="set.rx_alert_after">Alert after (minutes)</label>
+        <input type="number" min="1" max="1440" class="input" id="ra-after" style="width:90px;text-align:center" value="10">
+      </div>
+
+      <div class="flex" style="margin-top:16px">
+        <button class="btn btn-primary" onclick="saveRxAlerts()">💾 <span data-i18n="common.save">Save</span></button>
+        <button class="btn" onclick="testRxAlerts()">🚀 <span data-i18n="set.maint_notify_test">Send test</span></button>
+        <span class="action-feedback" id="ra-fb"></span>
       </div>
     </div>
 
@@ -9179,7 +9613,7 @@ function switchTab(name, btn) {{
   document.getElementById('tab-' + name).classList.add('active');
   const tabBtn = btn || (typeof event !== 'undefined' && event.currentTarget) || null;
   if (tabBtn && tabBtn.closest) tabBtn.closest('.tab-btn').classList.add('active');
-  if (name === 'maintenance') {{ refreshLogs(); initApiLogToggle(); initMaintNotify(); loadFavLogos(); loadStreamInfo(); }}
+  if (name === 'maintenance') {{ refreshLogs(); initApiLogToggle(); initMaintNotify(); loadFavLogos(); loadStreamInfo(); loadInterfaces(); }}
   else {{
     if (_logPollTimer) {{ clearInterval(_logPollTimer); _logPollTimer = null; }}
     if (_apiLogPollTimer) {{ clearInterval(_apiLogPollTimer); _apiLogPollTimer = null; }}
@@ -9717,7 +10151,7 @@ function copyUrl(btn, url) {{
 }}
 
 // Logs beim Start laden wenn Maintenance-Tab aktiv
-if (document.getElementById('tab-maintenance').classList.contains('active')) {{ refreshLogs(); initApiLogToggle(); initMaintNotify(); loadFavLogos(); loadStreamInfo(); }}
+if (document.getElementById('tab-maintenance').classList.contains('active')) {{ refreshLogs(); initApiLogToggle(); initMaintNotify(); loadFavLogos(); loadStreamInfo(); loadInterfaces(); }}
 
 // ── Recording ─────────────────────────────────────────
 let _quickRecId = null;
@@ -9749,9 +10183,10 @@ function loadStreamInfo() {{
       const s = rx.stream;
       const isRec = !!rx.recording;
       const busy = rx.busy && s;
-      const dot = rx.locked ? 'var(--red)' : (isRec ? 'var(--red)' : (busy ? 'var(--amber)' : 'var(--green)'));
+      const dot = rx.locked ? 'var(--red)' : (isRec ? 'var(--red)' : (busy ? 'var(--amber)' : (rx.unhealthy ? 'var(--red)' : 'var(--green)')));
       const line = rx.locked ? '🔒 gesperrt'
-        : (busy ? _siEsc((isRec?'🔴 ':'') + (s.channel_name||'?') + ' · ' + (s.client_ip||'?')) : t('sm.no_stream'));
+        : (busy ? _siEsc((isRec?'🔴 ':'') + (s.channel_name||'?') + ' · ' + (s.client_ip||'?'))
+          : (rx.unhealthy ? _siEsc('⚠ ' + t('rx.unreachable') + ' ' + (rx.unreachable_sec ? new Date(Date.now() - rx.unreachable_sec*1000).toLocaleString([], {{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}}) : '?')) : t('sm.no_stream')));
       const plusBtn = busy ? `<button class="btn" style="font-size:10px;padding:2px 7px" onclick="toggleStreamDetail('${{rx.id}}')" title="${{t('sm.expand')}}" id="si-plus-${{rx.id}}">+</button>` : '';
       const killBtn = busy ? `<button onclick="killStreamInfo('${{rx.id}}')" title="${{t('sm.stop')}}" style="background:none;border:1px solid var(--red);color:var(--red);width:22px;height:22px;border-radius:4px;cursor:pointer;font-size:11px;display:inline-flex;align-items:center;justify-content:center">✕</button>` : '';
       let detail = '';
@@ -10563,6 +10998,7 @@ function mnGetDays() {{
   return Array.from(document.querySelectorAll('.mn-day.btn-primary')).map(b => parseInt(b.dataset.day));
 }}
 function initMaintNotify() {{
+  initRxAlerts();
   if (_mnInitDone) return;
   _mnInitDone = true;
   const nc = (ORIGINAL_CONFIG && ORIGINAL_CONFIG.maintenance_notifications) || {{}};
@@ -10595,6 +11031,97 @@ function testMaintNotify() {{
   const fb = document.getElementById('mn-fb');
   fb.textContent = 'Test wird gesendet…';
   apiPost('/api/maintenance/notify/test', {{}}).then(d => {{
+    fb.textContent = (d.ok ? '✓ ' : '✗ ') + (d.message || '');
+  }}).catch(() => {{ fb.textContent = '✗ Fehler'; }});
+}}
+
+let _raInitDone = false;
+function initRxAlerts() {{
+  if (_raInitDone || !document.getElementById('ra-enabled')) return;
+  _raInitDone = true;
+  const ac = (ORIGINAL_CONFIG && ORIGINAL_CONFIG.receiver_alerts) || {{}};
+  document.getElementById('ra-enabled').checked = (ac.enabled !== false);
+  document.getElementById('ra-url').value = ac.url || '';
+  document.getElementById('ra-method').value = (ac.method === 'GET') ? 'GET' : 'POST';
+  document.getElementById('ra-after').value = (ac.after_min != null) ? ac.after_min : 10;
+}}
+function saveRxAlerts() {{
+  const fb = document.getElementById('ra-fb');
+  fb.textContent = '…';
+  const payload = {{
+    enabled: document.getElementById('ra-enabled').checked,
+    url: document.getElementById('ra-url').value.trim(),
+    method: document.getElementById('ra-method').value,
+    after_min: parseInt(document.getElementById('ra-after').value) || 10,
+  }};
+  apiPost('/api/receiver-alerts', payload).then(d => {{
+    fb.textContent = d.ok ? '✓ Gespeichert' : ('✗ ' + (d.message || 'Fehler'));
+    if (d.ok && d.config) ORIGINAL_CONFIG.receiver_alerts = d.config;
+  }}).catch(() => {{ fb.textContent = '✗ Fehler'; }});
+}}
+function _ifEsc(s) {{ return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}})[c]); }}
+function _ifAgo(ts) {{
+  if (!ts) return '–';
+  const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
+  if (s < 90) return s + ' s';
+  if (s < 5400) return Math.round(s / 60) + ' min';
+  if (s < 172800) return Math.round(s / 3600) + ' h';
+  return Math.round(s / 86400) + ' d';
+}}
+function renderInterfaces(d) {{
+  const tb = document.querySelector('#if-table tbody');
+  const sum = document.getElementById('if-summary');
+  if (!tb) return;
+  if (!d || d.available === false) {{
+    tb.innerHTML = '<tr><td style="color:var(--muted)">' + _ifEsc(t('if.unavailable')) + '</td></tr>';
+    sum.textContent = '';
+    return;
+  }}
+  const col = {{ok:'var(--green,#3fb950)', warn:'var(--yellow,#d29922)', down:'var(--red,#f85149)', unknown:'var(--muted)'}};
+  const order = {{down:0, warn:1, unknown:2, ok:3}};
+  const probes = (d.probes || []).slice().sort((a, b) => (a.group || '').localeCompare(b.group || '') || 0);
+  let html = '<tr style="color:var(--muted);text-align:left"><th></th><th>' + t('if.col_group') + '</th><th>' + t('if.col_probe') + '</th><th>ms</th><th>' + t('if.col_detail') + '</th><th>' + t('if.col_since') + '</th></tr>';
+  for (const p of probes) {{
+    html += '<tr style="border-top:1px solid var(--border)">'
+      + '<td style="padding:4px"><span title="' + _ifEsc(p.state) + '" style="display:inline-block;width:9px;height:9px;border-radius:50%;background:' + (col[p.state] || col.unknown) + '"></span></td>'
+      + '<td style="padding:4px;white-space:nowrap">' + _ifEsc(p.group) + '</td>'
+      + '<td style="padding:4px;white-space:nowrap">' + _ifEsc(p.label) + '</td>'
+      + '<td style="padding:4px;font-family:monospace">' + (p.ms != null ? p.ms : '–') + '</td>'
+      + '<td style="padding:4px;font-family:monospace;word-break:break-word">' + _ifEsc(p.detail) + '</td>'
+      + '<td style="padding:4px;white-space:nowrap">' + _ifAgo(p.since) + '</td></tr>';
+  }}
+  tb.innerHTML = html;
+  const st = d.state || 'unknown';
+  sum.innerHTML = '<span style="color:' + (col[st] || col.unknown) + ';font-weight:600">● ' + _ifEsc(t('if.state_' + st)) + '</span>'
+    + (d.checked_at ? ' <span style="color:var(--muted)">· ' + t('if.checked') + ' ' + _ifAgo(d.checked_at) + '</span>' : '');
+}}
+function loadInterfaces() {{
+  fetch('/api/interfaces').then(r => r.json()).then(renderInterfaces).catch(() => {{}});
+}}
+function checkInterfaces() {{
+  const fb = document.getElementById('if-fb');
+  fb.textContent = t('if.checking');
+  apiPost('/api/interfaces/check', {{}}).then(d => {{
+    fb.textContent = d.ok ? '' : ('✗ ' + (d.message || ''));
+    if (d.interfaces) renderInterfaces(d.interfaces);
+  }}).catch(() => {{ fb.textContent = '✗ Fehler'; }});
+}}
+function streamTestInterface(kind) {{
+  if (!confirm(t('if.test_confirm'))) return;
+  const fb = document.getElementById('if-fb');
+  fb.textContent = t('if.testing');
+  apiPost('/api/interfaces/stream-test', {{kind: kind}}).then(d => {{
+    let msg = (d.ok ? '✓ ' : '✗ ') + (d.channel ? d.channel + ': ' : '') + (d.detail || '');
+    if (d.ttfb_ms != null) msg += ' · TTFB ' + d.ttfb_ms + ' ms';
+    if (d.kbps) msg += ' · ' + d.kbps + ' kbit/s';
+    fb.textContent = msg;
+  }}).catch(() => {{ fb.textContent = '✗ Fehler'; }});
+}}
+
+function testRxAlerts() {{
+  const fb = document.getElementById('ra-fb');
+  fb.textContent = 'Test wird gesendet…';
+  apiPost('/api/receiver-alerts/test', {{}}).then(d => {{
     fb.textContent = (d.ok ? '✓ ' : '✗ ') + (d.message || '');
   }}).catch(() => {{ fb.textContent = '✗ Fehler'; }});
 }}
@@ -11203,6 +11730,48 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"ok": ok, "message": msg})
             return
 
+        if parsed.path == "/api/receiver-alerts":
+            try:
+                ac = dict(RECEIVER_ALERT_DEFAULT)
+                existing = get_config().get("receiver_alerts", {})
+                if isinstance(existing, dict):
+                    ac.update(existing)
+                if "enabled" in data:
+                    ac["enabled"] = bool(data.get("enabled"))
+                if "after_min" in data:
+                    ac["after_min"] = max(1, min(1440, int(data.get("after_min") or 10)))
+                if "url" in data:
+                    ac["url"] = str(data.get("url") or "").strip()
+                if "method" in data:
+                    ac["method"] = "GET" if str(data.get("method")).upper() == "GET" else "POST"
+                cfg = get_config()
+                cfg["receiver_alerts"] = ac
+                ok = update_config(cfg)
+                self.send_json({"ok": ok, "config": get_receiver_alert_config()})
+            except Exception as e:
+                self.send_json({"ok": False, "message": str(e)})
+            return
+
+        if parsed.path == "/api/receiver-alerts/test":
+            rcv = next(iter(get_receivers()), None) or {"id": "test", "name": "Test"}
+            ok, msg = send_receiver_alert("receiver_down", rcv, time.time(), test=True)
+            self.send_json({"ok": ok, "message": msg})
+            return
+
+        if parsed.path == "/api/interfaces/check":
+            if _interface_monitor is None:
+                self.send_json({"ok": False, "message": "e2probe.py nicht gefunden"})
+                return
+            _interface_monitor.run_once()
+            self.send_json({"ok": True, "interfaces": interface_snapshot()})
+            return
+
+        if parsed.path == "/api/interfaces/stream-test":
+            kind = "openwebif" if data.get("kind") == "openwebif" else "plex"
+            res = interface_stream_test(kind, str(data.get("ref") or ""))
+            self.send_json(res)
+            return
+
         if parsed.path == "/api/epg/schedule":
             hour = data.get("hour")
             if hour is None or not (0 <= int(hour) <= 23):
@@ -11313,11 +11882,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         import time as _t
         _t0 = _t.time()
-        note_endpoint(classify_endpoint(self.path, "proxy"))
+        _probe = e2probe is not None and e2probe.is_probe_request(self.headers)
+        if not _probe:
+            note_endpoint(classify_endpoint(self.path, "proxy"))
         try:
             self._do_GET_inner()
             _dur = int((_t.time() - _t0) * 1000)
-            write_access_log("GET", self.path, self.client_address[0], 200, _dur)
+            if not _probe:
+                write_access_log("GET", self.path, self.client_address[0], 200, _dur)
         except (BrokenPipeError, ConnectionResetError):
             pass  # Client hat Verbindung getrennt — normal, kein Fehler
         except Exception as e:
@@ -11474,10 +12046,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             })
             return
 
+        if path == "/api/interfaces":
+            self.send_json(interface_snapshot())
+            return
+
         if path == "/api/health":
             # Schneller Health-Check für e2recorder (kein EPG-Overhead)
             receivers_health = []
             health = receiver_health_snapshot()
+            _isnap = interface_snapshot()
             for r in get_receivers():
                 if not r.get("enabled", True):
                     continue
@@ -11493,6 +12070,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     "online": not down,
                     "down":   down,
                     "fails":  _h.get("fails", 0),
+                    "unreachable_sec": _h.get("unreachable_sec", 0),
                     "busy":   state is not None,
                     "locked": locked,
                     "channel": state.get("channel_name", "") if state else "",
@@ -11504,6 +12082,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "receivers":   receivers_health,
                 "tuners_free": sum(1 for r in receivers_health
                                    if not r["busy"] and not r["locked"] and not r["down"]),
+                # Ergebnis der Schnittstellen-Probes (gecacht, kein Zusatz-Request)
+                "interfaces_state": _isnap["state"],
+                "interfaces_down": _isnap["down"],
             })
             return
 
@@ -11532,6 +12113,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     "online": is_receiver_online(r["id"]),
                     "down": _h.get("down", False),
                     "fails": _h.get("fails", 0),
+                    "unhealthy": _h.get("unhealthy", False),
+                    "unreachable_sec": _h.get("unreachable_sec", 0),
+                    "unreachable_since": _h.get("unreachable_since", ""),
                     "stream": stream_info_public(state),
                     "recording": rec_by_receiver.get(r["id"]),
                 })
@@ -12347,22 +12931,30 @@ def _owif_metadata_receiver():
 
     Bevorzugt den konfigurierten metadata_receiver, sonst den Default-Receiver,
     sonst den ersten aktivierten. Gesperrte Receiver sind ok (nur Metadaten, kein
-    Tuner nötig)."""
+    Tuner nötig).
+
+    Ausgefallene Receiver (Circuit Breaker / Fehlerserie) werden übersprungen:
+    eine "halb tote" Default-Box (TCP offen, HTTP hängt) ließ sonst jede
+    EPG-/Bouquet-Anfrage der Apps 20 s in den Timeout laufen. Sind alle
+    Kandidaten ausgefallen, gilt wieder die konfigurierte Reihenfolge."""
     receivers = get_receivers()
     if not receivers:
         return None
     pref = get_owif_config().get("metadata_receiver", "auto")
+    ordered = []
     if pref and pref != "auto":
-        for r in receivers:
-            if r["id"] == pref and r.get("enabled", True):
-                return r
-    for r in receivers:
-        if r.get("default") and r.get("enabled", True):
+        ordered += [r for r in receivers if r["id"] == pref and r.get("enabled", True)]
+    ordered += [r for r in receivers if r.get("default") and r.get("enabled", True)]
+    ordered += [r for r in receivers if r.get("enabled", True)]
+    if not ordered:
+        return receivers[0]
+    for r in ordered:
+        if not is_receiver_unhealthy(r["id"]):
+            if r is not ordered[0]:
+                log.debug(f"OpenWebif: Metadaten-Receiver '{ordered[0]['id']}' ausgefallen "
+                          f"— weiche auf '{r['id']}' aus")
             return r
-    for r in receivers:
-        if r.get("enabled", True):
-            return r
-    return receivers[0]
+    return ordered[0]
 
 
 # ── Synthetisches "Favoriten"-Bouquet (arrangierte e2proxy-Favoriten) ──────
@@ -12867,7 +13459,8 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
-        note_endpoint(classify_endpoint(self.path, "openwebif"))
+        if not (e2probe is not None and e2probe.is_probe_request(self.headers)):
+            note_endpoint(classify_endpoint(self.path, "openwebif"))
         try:
             rest = self._rest()
             low = rest.lower()
@@ -12977,6 +13570,8 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
         p = urllib.parse.urlparse(self.path).path
         noisy = ("/picon" in p or "/logo" in p or
                  p.endswith((".png", ".jpg", ".jpeg", ".gif", ".ico", ".js", ".css")))
+        if e2probe is not None and e2probe.is_probe_request(self.headers):
+            noisy = True
         (log.debug if noisy else log.info)(
             f"OpenWebif PROXY [{status}] {self.command} {self.path[:100]} "
             f"→ {r['id']} [{(self.headers.get('User-Agent', '') or '')[:36]}]")
@@ -13132,8 +13727,9 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             log.warning(f"OpenWebif Bouquet-Filter Fehler, reiche unverändert durch: {e}")
             out, out_ctype, n = raw, (ctype or "application/octet-stream"), -1
-        log.info(f"OpenWebif PROXY [{status}] GET {self.path[:60]} → {r['id']} "
-                 f"(Bouquets kuratiert: {n}) [{(ua or '')[:30]}]")
+        (log.debug if (ua or "").startswith("e2proxy-probe") else log.info)(
+            f"OpenWebif PROXY [{status}] GET {self.path[:60]} → {r['id']} "
+            f"(Bouquets kuratiert: {n}) [{(ua or '')[:30]}]")
         try:
             self.send_response(200)
             self.send_header("Content-Type", out_ctype)
@@ -13551,6 +14147,7 @@ def run():
     threading.Thread(target=usage_flush_loop, daemon=True, name="usage-flush").start()
     threading.Thread(target=_diag_watchdog_loop, daemon=True, name="diag-watchdog").start()
     threading.Thread(target=receiver_watchdog_loop, daemon=True, name="rx-watchdog").start()
+    start_interface_monitor()
     start_compression_scheduler()
 
     proxy_host = get_proxy_host()
@@ -13616,6 +14213,10 @@ if __name__ == "__main__":
             for p in problems:
                 print(f"  - {p}")
             sys.exit(1)
+        if e2probe is None:
+            print("WARN: e2probe.py nicht gefunden — Schnittstellen-Probes deaktiviert")
+        else:
+            print("e2probe OK — Schnittstellen-Probes verfügbar")
         print(f"WebUI self-check OK — internal version {INTERNAL_VERSION}")
         sys.exit(0)
     run()
