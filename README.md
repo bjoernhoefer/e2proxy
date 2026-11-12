@@ -492,6 +492,10 @@ for the old setup is the bare `python:3.11-slim`.
 switch in the package settings; GitHub has no API for it). The build job checks this right after
 pushing and fails with the settings link before any Pi is touched.
 
+**One-time onboarding of a Pi** (backup, image test, compose switch, deploy runner, first rollout,
+optional e2recorder migration): copy [`docs/prompts/onboard-pi-deploy.md`](docs/prompts/onboard-pi-deploy.md)
+into a local Copilot with SSH access to the Pi. It asks before every change and keeps a rollback ready.
+
 ## License
 
 MIT
