@@ -74,6 +74,24 @@ jobs:
             GIT_BRANCH=${{ github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # The Pis pull without credentials (pi-deploy runs `docker pull`), so fail here – before any
+      # deploy job – if the package is not public. GitHub offers no API to change package
+      # visibility; it is a one-time switch in the package settings.
+      - name: Verify the image is pullable anonymously
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          repo="${IMAGE#ghcr.io/}"
+          token="$(curl -sS "https://ghcr.io/token?scope=repository:${repo}:pull" | jq -r '.token // empty')"
+          code="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${token}" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json' \
+            "https://ghcr.io/v2/${repo}/manifests/${DIGEST}")"
+          if [ "$code" != 200 ]; then
+            echo "::error::${IMAGE}@${DIGEST} is not anonymously pullable (HTTP ${code}). Make the package public once: https://github.com/users/${OWNER}/packages/container/${APP_ID}/settings → Danger Zone → Change visibility → Public"
+            exit 1
+          fi
+          echo "::notice::${IMAGE} is public – the Pis can pull without login"
 
   targets:
     runs-on: ubuntu-latest

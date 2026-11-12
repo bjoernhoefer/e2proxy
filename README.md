@@ -484,7 +484,13 @@ the image locally, runs the selftest in a throw-away container and only then swa
 **Migration from the file-mount setup (≤ v4.9):** replace `~/e2proxy/docker-compose.e2proxy.yml`
 with the one from this repo (image instead of mounted `e2proxy.py`), keep `./data`, then
 `docker compose -f ~/e2proxy/docker-compose.e2proxy.yml up -d`. The old `e2proxy.py`,
-`e2probe.py` and `reload_e2proxy.sh` are no longer used.
+`e2probe.py` and `reload_e2proxy.sh` are no longer used. Do this **before** the first `pi-deploy`
+run: pi-deploy never touches the compose file, and its rollback re-tags the *previous* image, which
+for the old setup is the bare `python:3.11-slim`.
+
+**Registry access:** the Pis pull without credentials, so the GHCR package must be public (one-time
+switch in the package settings; GitHub has no API for it). The build job checks this right after
+pushing and fails with the settings link before any Pi is touched.
 
 ## License
 
