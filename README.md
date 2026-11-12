@@ -2,7 +2,7 @@
 
 **Enigma2 Streaming Proxy** — Stream satellite TV from Enigma2 receivers to any browser, Plex, Jellyfin, or Kodi.
 
-Single Python file, runs in Docker, manages two SAT receivers with automatic tuner allocation, EPG, recordings, and Plex DVR integration.
+Pure-stdlib Python package, runs in Docker on a Raspberry Pi, manages SAT receivers with automatic tuner allocation, EPG, recordings, an optional series recorder, and Plex DVR integration.
 
 ## Features
 
@@ -11,6 +11,7 @@ Single Python file, runs in Docker, manages two SAT receivers with automatic tun
 - **Plex DVR Integration** — HDHomeRun emulation with SSDP auto-discovery, no Threadfin needed
 - **EPG Browser** — 28-hour program guide as interactive timeline grid with TMDB artwork
 - **Recording System** — ffmpeg-based with Plex-compliant directory structure (`TV/Show/Season XX/`)
+- **Series Recorder (optional)** — integrated e2recorder: series rules (name/regex, keep-last), one-click *record once / record series / skip* in the EPG overview, managed in Settings → Recorder
 - **TVDB + TMDB** — Automatic series/episode detection, daily-show fallback numbering
 - **Shared Tuner** — Parallel recordings on the same channel without tuner conflicts
 - **Fast Switching** — Per-channel switch tuning (NoLatency probing, configurable zap wait) with self-learning probesize and zap/start statistics
@@ -31,7 +32,14 @@ The compose file lives in the repo as
 it never drifts from the deployed configuration:
 
 ```bash
-docker compose -f docker-compose.e2proxy.yml up -d
+docker compose -f docker-compose.e2proxy.yml up -d     # pulls ghcr.io/bjoernhoefer/e2proxy:latest (arm64)
+```
+
+The image contains ffmpeg and the `e2proxy` package; it is built and rolled out by CI
+(see [Deployment](#deployment)). For development without Docker:
+
+```bash
+E2PROXY_DATA_DIR=$(mktemp -d) python3 -m e2proxy        # http://localhost:8888
 ```
 
 The healthcheck deliberately targets `/api/health`, not `/api/status`: the status
@@ -48,6 +56,34 @@ Open http://your-server:8888 and configure your receivers in Settings.
 - `network_mode: host` (required for SSDP UDP multicast on port 1900)
 
 ## Architecture
+
+Code layout (one concern per module, see [`AGENTS.md`](AGENTS.md) for the full table):
+
+```
+e2proxy/
+  app.py            start-up wiring, --selfcheck
+  http_proxy.py     HTTP handler (legacy routes; extensions are dispatched first)
+  extensions.py     open interface: @route + Extension(name, start, enabled)
+  receivers.py …    tuner allocation, switching, streaming, EPG, recordings, OpenWebif, HDHomeRun
+  recorder/         optional series recorder (engine, matching, store, routes, ui)
+  webui/            server-rendered pages + JS self-check
+```
+
+### Extending e2proxy
+
+Optional features register routes instead of editing the handler; their routes return 404
+while the feature is disabled:
+
+```python
+from e2proxy import extensions
+extensions.register(extensions.Extension(name="foo", start=start_loops, enabled=lambda: is_on()))
+
+@extensions.route("GET", "/api/foo/items", "foo")   # path ending in "/" = prefix route
+def items(req):                                      # req.path / .query / .data / .arg("x")
+    return {"items": []}                             # dict→JSON, str→HTML, (payload, status)
+```
+
+Runtime picture:
 
 ```
 ┌──────────────┐     ┌──────────────┐
@@ -128,13 +164,10 @@ titles are resolved from the EPG cache at the time of viewing.
 
 ### WebUI internals (self-check + extraction boundary)
 
-All browser-facing code lives in one clearly delimited block in `e2proxy.py`, between
-the `# === WEBUI ===` / `# === END WEBUI ===` markers: the i18n engine (`I18N_JS`), base
-stylesheet (`CSS_BASE`), the shared page shell (`html_page`), and the page builders
-(`build_web_ui`, `build_help_ui`, `build_favorites_ui`, `build_epg_browser`,
-`build_settings_ui`). The block header documents the exact external symbols it depends
-on, so it can later be lifted into its own service/module as a clean cut. Keep new UI
-code inside these markers.
+All browser-facing code lives in the `e2proxy/webui/` package: the i18n engine (`I18N_JS`), base
+stylesheet (`CSS_BASE`), the shared page shell (`html_page`), and one module per page
+(`page_main`, `page_help`, `page_favorites`, `page_epg`, `page_settings`). Extension UI
+(e.g. `e2proxy/recorder/ui.py`) is injected into these pages and covered by the same checks.
 
 Because the UI markup/JS is embedded in Python f-strings, a stray escape (e.g. a literal
 `\n` inside a `'...'` JS string) can silently corrupt a whole `<script>` block and break
@@ -142,7 +175,7 @@ every tab/button on a page. A built-in **self-check** guards against this:
 
 ```bash
 # Validate all pages' embedded JavaScript without starting the server
-python3 e2proxy.py --selfcheck   # exit 0 = OK, exit 1 = broken (use as a pre-deploy gate)
+python3 -m e2proxy --selfcheck   # exit 0 = OK, exit 1 = broken (use as a pre-deploy gate)
 ```
 
 It renders every page and reports four classes of defect that have each caused a dead UI
@@ -164,14 +197,10 @@ site. Browser globals are allow-listed. Note that helper availability differs pe
 (`escHtml` exists on the main page but not on Settings), which is exactly what this catches.
 
 The same check runs automatically at startup and logs `WebUI self-check: OK` (or a loud
-`ERROR` listing the offending page/script/line). Use it as a **deploy gate** so a broken
-build can never replace a running one:
-
-```bash
-python3 -m py_compile e2proxy.py                    || exit 1   # Python syntax
-E2PROXY_DATA_DIR=$(mktemp -d) python3 e2proxy.py --selfcheck || exit 1   # WebUI
-cp e2proxy.py "$TARGET" && docker compose restart              # only now
-```
+`ERROR` listing the offending page/script/line). It is part of the CI gate and of the container
+selftest, so a broken build can never replace a running one. In addition `pytest`
+(`tests/test_webui.py`) feeds every inline script of every page through `node --check`,
+with the recorder both enabled and disabled.
 
 Static analysis has limits — it finds missing functions and broken syntax, not logic errors
 (e.g. a wrong API field name). A browser click-through remains the final stage.
@@ -180,8 +209,9 @@ Static analysis has limits — it finds missing functions and broken syntax, not
 
 - **Official version** (`VERSION`) follows major/minor and is only bumped when a Pull
   Request is opened.
-- **Internal build id** (`INTERNAL_VERSION = <VERSION>+<branch>.<seq>`) uniquely identifies
-  the deployed branch/state during testing. Bump `BUILD_SEQ` on every test rollout; it is
+- **Internal build id** (`INTERNAL_VERSION = <VERSION>+<branch>.<sha7>`) uniquely identifies
+  the deployed build. It is injected at image build time (`GIT_SHA`/`GIT_BRANCH` build args →
+  `E2PROXY_BUILD_SEQ`/`E2PROXY_BUILD_BRANCH`), local runs show `+local.dev`. It is
   reported by `/api/version`, printed in the startup log **and shown in the UI** (Settings →
   About, and the Help page header) so you always know exactly which build is running on a host.
 
@@ -298,9 +328,29 @@ e2proxy can impersonate an Enigma2 receiver on its **standard ports** so any nat
 
 **Dream Player setup:** add a device pointing at the e2proxy host IP, OpenWebif port `80`, streaming port `8001`, recordings/second web port `81`, no username/password. EPG, channels and recordings are pulled automatically.
 
-## Companion: e2recorder
+## Series Recorder (integrated e2recorder)
 
-[e2recorder](https://github.com/bjoernhoefer/e2recorder) is the automated recording scheduler that works with e2proxy. It monitors the EPG and triggers recordings via the `/api/record/start` endpoint.
+The former standalone [e2recorder](https://github.com/bjoernhoefer/e2recorder) is built in as an
+**optional** extension. It is off by default; enable it under **Settings → Recorder** (or
+`"recorder": {"enabled": true}` in `/data/config.json`). When disabled its API answers 404 and
+no background thread runs.
+
+- **EPG overview** – broadcasts are marked (planned ⏺, recording, done, skipped, matches a series
+  rule); the detail popup offers *record once*, *record series* and *skip/unskip*.
+- **Settings → Recorder** – pre/post buffer, late-start tolerance, scan interval and look-ahead,
+  stream profile, remote e2proxy instances (extra tuners); series table
+  (regex, keep-last, on/off) and planned/recent recordings.
+- **Behaviour** – EPG scan every `epg_scan_interval` s over `epg_lookahead_hours`; duplicates
+  (same series/channel, overlapping ≥ 60 s, also after EPG time shifts) are planned once; a
+  skipped airing stays skipped; back-to-back recordings start 2 min early; if no tuner is free it
+  waits up to `max_late_sec`, then fails/skips; `keep_last` deletes the oldest unprotected
+  recordings (`.ts` + `.nfo`); after a restart running recordings are re-attached or closed.
+- **API** – `/api/recorder/settings|status` (always), `/api/recorder/series[/<id>]`,
+  `/recordings[/<id>]`, `/event`, `/skip`, `/unskip`, `/protect`, `/scan`, `/epg-marks`, `/tmdb?q=`.
+
+**Migrating from the standalone e2recorder:** stop the old container, copy its `series.json` and
+`recordings.json` into `/data/recorder/` of e2proxy, enable the recorder. The `recorder_url`
+setting (announce to an external e2recorder) still works for setups that keep the old service.
 
 ## Stream Diagnostics (Grafana Loki)
 
@@ -403,31 +453,37 @@ sum by (kind) (count_over_time({container="e2proxy"} |= `DIAG event=ffmpeg_issue
 | `/data/tvdb_cache.json` | TVDB series cache |
 | `/data/logos/` | Channel logo cache |
 | `/data/custom_logos/` | Manually set favorite logos (uploaded/URL, PNG-converted) |
+| `/data/recorder/` | Recorder series rules + recordings (`series.json`, `recordings.json`) |
 
-## Update
+## Deployment
 
-Never copy an unverified file over a running deployment — run the self-check first and
-abort on failure, so a broken build cannot replace a working one:
+Rollouts are fully automated following the pi-ops standard
+([`bjoernhoefer/raspberrypi_management`](https://github.com/bjoernhoefer/raspberrypi_management)):
 
-```bash
-scp e2proxy.py user@server:~/e2proxy.py
-
-ssh user@server '
-  set -e
-  SC=$(mktemp -d)
-  python3 -m py_compile ~/e2proxy.py
-  E2PROXY_DATA_DIR="$SC" python3 ~/e2proxy.py --selfcheck
-  cp ~/e2proxy/e2proxy.py ~/e2proxy/e2proxy.py.bak.$(date +%Y%m%d-%H%M%S)
-  cp ~/e2proxy.py ~/e2proxy/e2proxy.py
-  docker compose -f ~/e2proxy/docker-compose.e2proxy.yml restart
-'
-
-# Verify — the build id must match the one you deployed
-curl -s http://server:8888/api/version
+```
+PR ──▶ test.yml (ruff · pytest · --selfcheck · docker build + selftest.py)
+main ─▶ build-deploy.yml: test ─▶ build arm64 image → ghcr.io/bjoernhoefer/e2proxy@sha256:…
+                          targets (deploy/targets.json) ─▶ deploy matrix, one job per Pi
+                              └─ self-hosted runner on the Pi: pi-deploy (guardrails, selftest, rollback)
 ```
 
-The build id is also visible in the UI under Settings → About and in the Help page header,
-so you can confirm a rollout without shell access.
+**Several Raspberry Pis:** every entry in [`deploy/targets.json`](deploy/targets.json) is one
+rollout target (`host`, `runner_label`, `deploy_user`, `enabled`). To add a Pi: register the app
+for that host in the pi-ops inventory, install a deploy runner with label
+`deploy-e2proxy-<host>`, add the entry. A failing Pi does not block the others. *Run workflow*
+(`workflow_dispatch`) accepts `hosts` = `all`, `none` or `host1,host2`.
+
+Verify a rollout: `curl -s http://<pi>:8888/api/version` (build id = git sha), also shown under
+Settings → About and in the Help page header.
+
+**Emergency path** (CI unavailable): on the Pi, in a checkout, `deploy/manual-deploy.sh` builds
+the image locally, runs the selftest in a throw-away container and only then swaps the service
+(prints the rollback command).
+
+**Migration from the file-mount setup (≤ v4.9):** replace `~/e2proxy/docker-compose.e2proxy.yml`
+with the one from this repo (image instead of mounted `e2proxy.py`), keep `./data`, then
+`docker compose -f ~/e2proxy/docker-compose.e2proxy.yml up -d`. The old `e2proxy.py`,
+`e2probe.py` and `reload_e2proxy.sh` are no longer used.
 
 ## License
 

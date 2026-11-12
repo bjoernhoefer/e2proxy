@@ -94,6 +94,15 @@ def build_help_ui():
       <div style="display:flex;flex-direction:column;gap:12px">
 
         <div style="border-left:3px solid var(--accent);padding-left:14px">
+          <b style="color:var(--accent);font-family:monospace;font-size:11px">v5.0</b>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-11-12</span>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">Modulare Architektur · integrierter Serien-Recorder · automatische Pi-Rollouts</span>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)"><b>Modular:</b> Die 14&nbsp;000-Zeilen-Datei <code>e2proxy.py</code> ist jetzt das Paket <code>e2proxy/</code> (ein Modul je Aufgabe, Start mit <code>python -m e2proxy</code>). Neue Funktionen docken über die Erweiterungs-Schnittstelle <code>e2proxy.extensions</code> an; Verhalten aller Seiten und APIs unverändert.<br>
+          <b>Recorder (optional):</b> e2recorder ist integriert – <b>Einstellungen → Recorder</b> aktiviert ihn; im EPG werden geplante/laufende/fertige Aufnahmen markiert, mit „Einmal aufnehmen“, „Serie aufnehmen“ und „Überspringen“ im Detail-Popup. Ausgeschaltet kostet er nichts. Migration: <code>series.json</code>/<code>recordings.json</code> nach <code>/data/recorder/</code> kopieren.<br>
+          <b>Rollout:</b> Fertiges arm64-Image mit ffmpeg (kein <code>apt-get</code> mehr bei jedem Start), Tests + Selbsttest in CI, automatische Verteilung auf einen oder mehrere Raspberry Pis über <code>pi-deploy</code> mit Rollback. Build-ID = Git-Commit.</div>
+        </div>
+
+        <div style="border-left:3px solid var(--accent);padding-left:14px">
           <b style="color:var(--accent);font-family:monospace;font-size:11px">v4.9</b>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-11-06</span>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">Schnittstellen-Health-Probes · schnelleres Zap-Failover</span>
@@ -101,8 +110,8 @@ def build_help_ui():
           <b>Schnelleres Failover beim Umschalten:</b> Ein bereits als ausgefallen bekannter Receiver wird bei der Tuner-Wahl übersprungen bzw. nur einmal (statt dreimal) versucht — Plex bekam vorher erst nach ~38&nbsp;s einen Stream und brach mit „Sender konnte nicht eingestellt werden“ ab.</div>
         </div>
 
-        <div style="border-left:3px solid var(--accent);padding-left:14px">
-          <b style="color:var(--accent);font-family:monospace;font-size:11px">v4.8</b>
+        <div style="border-left:3px solid var(--border);padding-left:14px">
+          <b style="font-family:monospace;font-size:11px">v4.8</b>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-11-06</span>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">Eingefrorene Receiver: OpenWebif-Ausweichen · Ausfall-Alarm</span>
           <div style="font-size:11px;margin-top:4px;color:var(--muted)"><b>OpenWebif-Emulation weicht toten Boxen aus:</b> Metadaten-/EPG-Anfragen der Apps gingen immer an den Default-Receiver. War dieser eingefroren (Ping ok, HTTP hängt), lief jede Anfrage 20&nbsp;s in den Timeout — die Apps wirkten „hängend“. Ausgefallene Receiver (Circuit Breaker offen oder Fehlerserie) werden jetzt übersprungen; der Default bleibt unverändert und wird automatisch wieder genutzt, sobald er antwortet.<br>
