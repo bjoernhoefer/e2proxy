@@ -9,6 +9,6 @@ import time
 
 VERSION = "4.9"
 BUILD_BRANCH = os.environ.get("E2PROXY_BUILD_BRANCH", "local")
-BUILD_SEQ = os.environ.get("E2PROXY_BUILD_SEQ", "dev")
+BUILD_SEQ = os.environ.get("E2PROXY_BUILD_SEQ", "dev")[:7]  # CI passes the full git sha
 INTERNAL_VERSION = f"{VERSION}+{BUILD_BRANCH.split('/')[-1]}.{BUILD_SEQ}"
 START_TIME = time.time()  # process start, reported as uptime

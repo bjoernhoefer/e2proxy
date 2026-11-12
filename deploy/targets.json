@@ -1,0 +1,11 @@
+{
+  "_comment": "Rollout targets for build-deploy.yml. One entry per Raspberry Pi. runner_label must match the deploy runner installed on that host (raspberrypi_management/scripts/install-deploy-runner.sh). Set enabled=false to pause a host.",
+  "targets": [
+    {
+      "host": "wien-streamer",
+      "runner_label": "deploy-e2proxy",
+      "deploy_user": "pi",
+      "enabled": true
+    }
+  ]
+}

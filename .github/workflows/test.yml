@@ -1,0 +1,46 @@
+# pi-ops-template: test v1 (APP-OWNED – extend freely)
+# Source: bjoernhoefer/raspberrypi_management · templates/app/.github/workflows/test.yml
+# Runs on GitHub-hosted runners only – never add a self-hosted job to this file (it has a PR trigger).
+name: test
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # APP-SPECIFIC: lint, unit/regression/HTTP tests, embedded-JS parse check (node), WebUI self-check
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install test tools
+        run: pip install --quiet pytest ruff
+      - name: Lint
+        run: ruff check e2proxy tests selftest.py deploy
+      - name: Unit + regression tests
+        run: pytest -q
+      - name: WebUI self-check
+        run: E2PROXY_DATA_DIR="$(mktemp -d)" python -m e2proxy --selfcheck
+      # REQUIRED by the standard: the image builds and its selftest passes (same check pi-deploy runs on the Pi)
+      - name: Build image (amd64, smoke)
+        run: docker build -t app:ci .
+      - name: Selftest in container
+        run: |
+          docker run -d --name app-ci app:ci
+          sleep 5
+          docker exec app-ci sh -c "${SELFTEST_CMD}"
+        env:
+          SELFTEST_CMD: python3 /app/selftest.py   # same as `selftest:` in inventory/apps.yml
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs app-ci 2>&1 | tail -100 || true
