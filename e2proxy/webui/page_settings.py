@@ -8,6 +8,7 @@ from e2proxy.config import get_config, get_owif_config, is_receiver_locked
 from e2proxy.recordings import get_recordings_config
 from e2proxy.compression import get_compression_config
 from e2proxy.webui.base import html_page
+from e2proxy.recorder import ui as recorder_ui
 
 def build_settings_ui():
     cfg = get_config()
@@ -257,6 +258,7 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
     <button class="tab-btn" onclick="switchTab('maintenance', this)">🔧 <span data-i18n="set.tab_maint">Maintenance</span></button>
     <button class="tab-btn" onclick="switchTab('epg', this)">📅 EPG</button>
     <button class="tab-btn" onclick="switchTab('recording', this)">📹 <span data-i18n="set.tab_rec">Recordings</span></button>
+    {recorder_ui.SETTINGS_TAB_BUTTON}
     <button class="tab-btn" onclick="switchTab('usage', this)">📊 <span data-i18n="set.tab_usage">Auswertung</span></button>
     <button class="tab-btn" onclick="switchTab('help', this)">📖 <span data-i18n="set.tab_api">API</span> / <span data-i18n="nav.help">Help</span></button>
   </div>
@@ -659,6 +661,7 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
   </div>
 
   <!-- ── TAB: AUSWERTUNG / USAGE ──────────────────── -->
+{recorder_ui.SETTINGS_PANEL}
   <div class="tab-panel" id="tab-usage">
 
     <div class="card">
@@ -1317,6 +1320,7 @@ function switchTab(name, btn) {{
   }}
   if (name === 'recording') {{ loadTunerStatus(); loadRecordingStatus(); loadRecChannels(); loadCompressionStatus(); }}
   if (name === 'usage') {{ loadUsage(); loadSwitchStats(); }}
+  if (name === 'recorder') rcdLoad();
 }}
 
 // ── Compression UI ──────────────────────────────────────────────────────────
@@ -2924,6 +2928,7 @@ function resetFavLogo(btn) {{
     .catch(() => _favLogoResult(false));
 }}
 </script>
+{recorder_ui.SETTINGS_JS}
 """ 
     return html_page("Settings", body, css)
 

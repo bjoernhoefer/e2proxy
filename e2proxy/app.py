@@ -32,6 +32,8 @@ from e2proxy.openwebif import start_openwebif_server
 from e2proxy.interfaces import start_interface_monitor
 from e2proxy.webui.selfcheck import webui_selfcheck
 from e2proxy.http_proxy import ProxyHandler
+from e2proxy import extensions
+import e2proxy.recorder  # noqa: F401  (registers the optional recorder extension)
 
 # ── Main ──────────────────────────────────────────────────
 
@@ -120,6 +122,7 @@ def run():
     threading.Thread(target=receiver_watchdog_loop, daemon=True, name="rx-watchdog").start()
     start_interface_monitor()
     start_compression_scheduler()
+    extensions.start_all()   # optional components (recorder, ...) if enabled
 
     proxy_host = get_proxy_host()
     proxy_port = get_proxy_port()
@@ -167,8 +170,6 @@ def run():
         server.serve_forever()
     except KeyboardInterrupt:
         log.info("Gestoppt.")
-
-
 
 
 def selfcheck():

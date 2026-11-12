@@ -2,10 +2,15 @@
 from e2proxy.config import get_proxy_host, get_proxy_port
 from e2proxy.webui.i18n import I18N_JS
 from e2proxy.webui.base import CSS_BASE
+from e2proxy.recorder import is_enabled as recorder_enabled
+from e2proxy.recorder import ui as recorder_ui
 
 def build_epg_browser():
     proxy_host = get_proxy_host()
     proxy_port = get_proxy_port()
+    rcd_on = recorder_enabled()
+    rcd_detail = recorder_ui.epg_detail_html(rcd_on)
+    rcd_js = recorder_ui.epg_js(rcd_on)
 
     css = """
 /* EPG Browser */
@@ -110,6 +115,7 @@ def build_epg_browser():
       <b>Film:</b> Movies/&lt;Titel&gt; (&lt;Jahr&gt;)/
     </div>
   </div>
+{rcd_detail}
   <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
     <a id="d-tmdb-link" href="#" target="_blank" rel="noopener" data-i18n="epg.search_tmdb"
        style="font-family:monospace;font-size:10px;color:var(--accent2);text-decoration:none;border:1px solid var(--border);padding:3px 8px;border-radius:4px;display:none">
@@ -374,11 +380,13 @@ loadEpg();
 {CSS_BASE}
 html,body{{height:100%;overflow:hidden;}}
 {css}
+{recorder_ui.EPG_CSS}
 </style>
 {I18N_JS}
 </head>
 <body>
 {body}
+{rcd_js}
 <div class="toast" id="toast"></div>
 <script>
 function showToast(msg,type){{const t=document.getElementById('toast');t.textContent=msg;t.className='toast show'+(type?' '+type:'');setTimeout(()=>t.className='toast',3000);}}

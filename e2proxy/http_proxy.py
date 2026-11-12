@@ -152,6 +152,7 @@ from e2proxy.webui.page_epg import build_epg_browser
 from e2proxy.webui.page_settings import build_settings_ui
 from e2proxy import receivers
 from e2proxy import interfaces
+from e2proxy import extensions
 
 # ── HTTP Handler ──────────────────────────────────────────
 
@@ -212,6 +213,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             data = json.loads(body_data.decode("utf-8")) if body_data.strip() else {}
         except Exception as e:
             self.send_json({"ok": False, "message": f"JSON Fehler: {e}"})
+            return
+
+        if extensions.dispatch(self, "POST", data if isinstance(data, dict) else {}):
             return
 
         if parsed.path == "/api/config":
@@ -549,6 +553,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         self.send_json({"ok": False, "message": "Not found"}, 404)
 
+    def do_PUT(self):
+        if not extensions.dispatch(self, "PUT", extensions.read_json_body(self)):
+            self.send_json({"ok": False, "message": "Not found"}, 404)
+
     def do_DELETE(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/")
@@ -557,6 +565,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             data = json.loads(self.rfile.read(length)) if length > 0 else {}
         except Exception:
             data = {}
+
+        if extensions.dispatch(self, "DELETE", data if isinstance(data, dict) else {}):
+            return
 
         if path == "/api/recordings/delete":
             # Löscht eine Aufnahme-Datei (für e2recorder)
@@ -629,6 +640,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         path = parsed.path
         params = urllib.parse.parse_qs(parsed.query)
         client_ip = self.client_address[0]
+
+        if extensions.dispatch(self, "GET"):
+            return
 
         # ── Static Pages ──────────────────────────────────
         if path in ("/", ""):
