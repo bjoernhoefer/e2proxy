@@ -1,28 +1,15 @@
+# Runtime definition on the Pi (compose_dir /home/pi/e2proxy, see deploy/targets.json).
+# The image is built by CI; pi-deploy pulls <image>@<digest> and retags it as :latest.
 services:
   e2proxy:
-    image: python:3.11-slim
+    image: ghcr.io/bjoernhoefer/e2proxy:latest
     container_name: e2proxy
     restart: unless-stopped
-    network_mode: host          # nötig für SSDP (UDP Multicast 1900) + LAN-Receiver-Zugriff
+    network_mode: host          # required for SSDP (UDP multicast 1900) + LAN receiver access
+    mem_limit: 512m             # NOTE: not enforced on Pi OS without cgroup memory – pi-deploy watches RSS
     volumes:
-      - ./e2proxy.py:/app/e2proxy.py:ro       # Script read-only (live austauschbar)
-      - ./e2probe.py:/app/e2probe.py:ro       # Schnittstellen-Probes (optionales Modul)
-      - ./data:/data                          # Persistente Daten (config, EPG, Cache)
-      - /mnt/nvme/recordings:/mnt/nvme/recordings  # Aufnahmen (externer Mount)
-    working_dir: /app
-    command: >
-      bash -c "apt-get update -qq &&
-               apt-get install -y -q --no-install-recommends ffmpeg &&
-               python3 e2proxy.py"
+      - ./data:/data                                # config, EPG, cache, recorder state
+      - /mnt/nvme/recordings:/mnt/nvme/recordings   # recordings (external mount)
     environment:
-      - PYTHONUNBUFFERED=1
       - E2PROXY_DATA_DIR=/data
-    healthcheck:
-      # /api/health statt /api/status: der Status-Endpunkt probte jeden Receiver
-      # und lief bei einer haengenden Box in den Timeout -> Container faelschlich
-      # "unhealthy". /api/health antwortet ohne Receiver-Zugriff.
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8888/api/health', timeout=5)"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
+    # Healthcheck is baked into the image (/api/health, no receiver access).

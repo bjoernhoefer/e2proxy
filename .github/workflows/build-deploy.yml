@@ -1,0 +1,154 @@
+# pi-ops-template: build-deploy v1
+# Source:   bjoernhoefer/raspberrypi_management · templates/app/.github/workflows/build-deploy.yml
+# Standard: bjoernhoefer/raspberrypi_management · docs/standards/app-cicd.md
+#
+# Deviation from the template (⚠️ OFFEN: upstream to the standard): the deploy job runs as a
+# matrix over deploy/targets.json so the same image can be rolled out to several Raspberry Pis
+# (pattern from bjoernhoefer/ha_satimage). The per-host steps are unchanged from the template.
+# Adding a host = install its deploy runner + add an entry to deploy/targets.json.
+#
+# No pull_request trigger in this file: it contains a self-hosted job. PRs are tested by test.yml.
+name: build-deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      hosts:
+        description: "Rollout hosts: 'all' (enabled entries of deploy/targets.json), 'none', or comma-separated host ids"
+        default: all
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  APP_ID: e2proxy
+  IMAGE: ghcr.io/${{ github.repository_owner }}/e2proxy
+  DOCKERFILE: Dockerfile
+  CONTEXT: .
+
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=main
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.CONTEXT }}
+          file: ${{ env.DOCKERFILE }}
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            GIT_BRANCH=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # The Pis pull without credentials (pi-deploy runs `docker pull`), so fail here – before any
+      # deploy job – if the package is not public. GitHub offers no API to change package
+      # visibility; it is a one-time switch in the package settings.
+      - name: Verify the image is pullable anonymously
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          repo="${IMAGE#ghcr.io/}"
+          token="$(curl -sS "https://ghcr.io/token?scope=repository:${repo}:pull" | jq -r '.token // empty')"
+          code="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${token}" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json' \
+            "https://ghcr.io/v2/${repo}/manifests/${DIGEST}")"
+          if [ "$code" != 200 ]; then
+            echo "::error::${IMAGE}@${DIGEST} is not anonymously pullable (HTTP ${code}). Make the package public once: https://github.com/users/${OWNER}/packages/container/${APP_ID}/settings → Danger Zone → Change visibility → Public"
+            exit 1
+          fi
+          echo "::notice::${IMAGE} is public – the Pis can pull without login"
+
+  targets:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: resolve
+        env:
+          REQUESTED: ${{ inputs.hosts }}
+        run: python3 deploy/resolve_targets.py "${REQUESTED:-all}" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: [build, targets]
+    if: github.ref == 'refs/heads/main' && needs.targets.outputs.matrix != '[]'
+    name: deploy (${{ matrix.target.host }})
+    # Dedicated per-app runner per host, installed by raspberrypi_management/scripts/install-deploy-runner.sh
+    runs-on: [self-hosted, "${{ matrix.target.runner_label }}"]
+    permissions: {}
+    strategy:
+      fail-fast: false          # one broken Pi must not block the others
+      matrix:
+        target: ${{ fromJSON(needs.targets.outputs.matrix) }}
+    concurrency:
+      group: deploy-e2proxy-${{ matrix.target.host }}
+      cancel-in-progress: false
+    timeout-minutes: 20
+    steps:
+      # No checkout and no third-party actions on the Pi.
+      - name: Skip if superseded
+        id: superseded
+        env:
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          main_sha=$(git ls-remote --exit-code "https://github.com/${REPOSITORY}" refs/heads/main | cut -f1)
+          if [[ "$main_sha" != "$GITHUB_SHA" ]]; then
+            echo "::notice::Skipping superseded build $GITHUB_SHA (main is $main_sha)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Deploy via pi-deploy (guardrails, selftest, rollback)
+        if: steps.superseded.outputs.skip == 'false'
+        env:
+          DIGEST: ${{ needs.build.outputs.digest }}
+          DEPLOY_USER: ${{ matrix.target.deploy_user }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::Invalid image digest"; exit 1; }
+          [[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "::error::Invalid deploy user"; exit 1; }
+          rc=0
+          sudo -n -u "$DEPLOY_USER" /usr/local/bin/pi-deploy "$APP_ID" "${IMAGE}@${DIGEST}" "$GITHUB_SHA" || rc=$?
+          case "$rc" in
+            0)  echo "::notice::Deployed ${IMAGE}@${DIGEST}" ;;
+            75) echo "::error::Pi guardrail refused the rollout (RAM/CPU/temperature/disk/undervoltage) – nothing changed. Re-run later."; exit 1 ;;
+            *)  echo "::error::Rollout failed (rc=$rc) – pi-deploy rolled back. See 'journalctl -t pi-deploy' on the Pi."; exit 1 ;;
+          esac
