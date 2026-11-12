@@ -182,6 +182,30 @@ def test_record_happy_path(env):
     assert proxy.stopped == ["p0"]       # explicit stop frees the tuner
 
 
+
+def test_recording_that_dies_early_is_failed_not_done(env, tmp_path):
+    """A backend recording that stops long before the broadcast ends (ffmpeg crash,
+    receiver lost) was reported as 'done' and counted for keep_last."""
+    rec, proxy, clock, _ = env
+    s = rec.add_series("Tatort", REF, keep_last=1)
+    good = tmp_path / "good.ts"
+    good.write_text("x")
+    rec.recs.upsert({"id": "old", "serie_id": s["id"], "status": "done", "start_ts": 0,
+                     "filepath": str(good), "channel_ref": REF})
+    r = rec.plan(s, ev(T0 + 60))
+    clock.t = T0 + 60
+    orig = proxy.__call__
+
+    def api(url, method="GET", body=None, timeout=10):   # backend recording dies at once
+        out = orig(url, method, body, timeout)
+        proxy.running = {k: False for k in proxy.running}
+        return out
+    rec.api = api
+    rec.record(r["id"])
+    out = rec.recs.get(r["id"])
+    assert out["status"] == "failed" and "vorzeitig" in out["error"]
+    assert good.exists()
+
 def test_record_fails_without_tuner(env):
     rec, proxy, clock, _ = env
     proxy.free = 0

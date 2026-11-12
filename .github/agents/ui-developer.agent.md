@@ -12,7 +12,7 @@ Principles already established in this UI – keep them:
 - Settings = tabs (`switchTab`); each feature gets its own tab; save buttons fetch fresh config
   before POSTing.
 - Optional features add nothing visible when disabled.
-- Compact, information-dense cards; no external CSS/JS/CDN (offline LAN use).
+- Compact, information-dense cards; add no new external CSS/JS/CDN dependencies (LAN use; the existing web font degrades gracefully offline).
 
 Process:
 1. Before a major UI change, render it (`python -m e2proxy` + Playwright/browser screenshot in dark

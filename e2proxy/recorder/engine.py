@@ -424,6 +424,13 @@ class Recorder:
             size = os.path.getsize(rec.get("filepath") or "")
         except OSError:
             pass
+        # Ended well before the broadcast did (ffmpeg/receiver died, backend lost):
+        # a partial file must not count as an episode for keep_last.
+        if self.clock() < rec["stop_ts"] - 60:
+            self.recs.update(rec["id"], status="failed", finished_at=_now_iso(), filesize=size,
+                             error="Aufnahme vorzeitig beendet" + (" (Backend nicht erreichbar)" if err else ""))
+            log.warning(f"Recorder: '{rec['title']}' vorzeitig beendet ({size // 1048576} MB)")
+            return
         self.recs.update(rec["id"], status="done", finished_at=_now_iso(), filesize=size)
         log.info(f"Recorder: fertig '{rec['title']}' ({size // 1048576} MB)")
 

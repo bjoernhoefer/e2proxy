@@ -344,7 +344,8 @@ no background thread runs.
   (same series/channel, overlapping ≥ 60 s, also after EPG time shifts) are planned once; a
   skipped airing stays skipped; back-to-back recordings start 2 min early; if no tuner is free it
   waits up to `max_late_sec`, then fails/skips; `keep_last` deletes the oldest unprotected
-  recordings (`.ts` + `.nfo`); after a restart running recordings are re-attached or closed.
+  recordings (`.ts` + `.nfo`); a recording that ends well before the broadcast is marked
+  *failed* (partial file kept, never counted for keep-last); after a restart running recordings are re-attached or closed.
 - **API** – `/api/recorder/settings|status` (always), `/api/recorder/series[/<id>]`,
   `/recordings[/<id>]`, `/event`, `/skip`, `/unskip`, `/protect`, `/scan`, `/epg-marks`, `/tmdb?q=`.
 

@@ -635,7 +635,7 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
           <tr>
             <td style="color:var(--muted);font-size:11px;vertical-align:top">Player-Overrides<br>(User-Agent)</td>
             <td>
-              <textarea class="input" id="owif-ua" placeholder="ExoPlayer =&gt; remux-ac3&#10;VLC =&gt; pass" style="width:100%;max-width:420px;height:70px;font-family:monospace;font-size:11px">{owif_ua_text}</textarea>
+              <textarea class="input" id="owif-ua" placeholder="ExoPlayer =&gt; remux-ac3&#10;VLC =&gt; pass" style="width:100%;max-width:420px;min-height:0;height:70px;font-family:monospace;font-size:11px">{owif_ua_text}</textarea>
               <div style="font-size:10px;color:var(--muted)">Je Zeile: <code>User-Agent-Text =&gt; Profil-ID</code>. Erster Treffer (case-insensitive) gewinnt. Für Player, die kein rohes TS können.</div>
             </td>
           </tr>

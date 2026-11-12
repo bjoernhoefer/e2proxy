@@ -73,7 +73,7 @@ SETTINGS_PANEL = I18N_PATCH + r"""
           <td><input class="input" id="rcd-profile" style="width:160px;font-family:monospace;font-size:11px">
             <span style="color:var(--muted);font-size:10px" data-i18n="rcd.profile_hint">empty = recording default</span></td></tr>
         <tr><td style="color:var(--muted);font-size:11px" data-i18n="rcd.remote">Further e2proxies</td>
-          <td><textarea class="input" id="rcd-remote" rows="2" style="width:100%;max-width:400px;font-family:monospace;font-size:11px" placeholder="http://192.168.1.20:8888"></textarea>
+          <td><textarea class="input" id="rcd-remote" rows="2" style="width:100%;max-width:400px;min-height:0;height:56px;font-family:monospace;font-size:11px" placeholder="http://192.168.1.20:8888"></textarea>
             <div style="color:var(--muted);font-size:10px" data-i18n="rcd.remote_hint">one URL per line</div></td></tr>
       </tbody></table>
       <div style="display:flex;gap:8px;align-items:center;margin-top:10px">
