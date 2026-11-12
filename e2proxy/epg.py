@@ -453,6 +453,19 @@ def run_epg_update(triggered_by="manual"):
         with epg_run_lock:
             epg_run_state["progress"] = 20
 
+        # Kein einziges Event (Box aus, Netz weg): vorhandenes EPG behalten statt
+        # es durch ein leeres XMLTV zu ersetzen — sonst ist der Guide bis zum
+        # nächsten erfolgreichen Lauf leer (Startup-Run mit ausgeschalteter Box).
+        if not any(merged.values()) and not rytec_progs:
+            with epg_cache_lock:
+                have_old = "<programme" in (epg_cache.get("xml") or "")
+            if have_old:
+                _epg_log("No EPG data received — keeping previous EPG")
+                with epg_run_lock:
+                    epg_run_state["phase"] = "Abgeschlossen"
+                    epg_run_state["last_result"] = "no data — previous EPG kept"
+                return False
+
         # ── Phase 4: XMLTV zusammenbauen ────────────────────
         with epg_run_lock:
             epg_run_state["phase"] = "XMLTV erzeugen"

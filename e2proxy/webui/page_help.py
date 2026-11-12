@@ -99,7 +99,8 @@ def build_help_ui():
           <span style="color:var(--muted);font-size:10px;margin-left:8px">Modulare Architektur · integrierter Serien-Recorder · automatische Pi-Rollouts</span>
           <div style="font-size:11px;margin-top:4px;color:var(--muted)"><b>Modular:</b> Die 14&nbsp;000-Zeilen-Datei <code>e2proxy.py</code> ist jetzt das Paket <code>e2proxy/</code> (ein Modul je Aufgabe, Start mit <code>python -m e2proxy</code>). Neue Funktionen docken über die Erweiterungs-Schnittstelle <code>e2proxy.extensions</code> an; Verhalten aller Seiten und APIs unverändert.<br>
           <b>Recorder (optional):</b> e2recorder ist integriert – <b>Einstellungen → Recorder</b> aktiviert ihn; im EPG werden geplante/laufende/fertige Aufnahmen markiert, mit „Einmal aufnehmen“, „Serie aufnehmen“ und „Überspringen“ im Detail-Popup. Ausgeschaltet kostet er nichts. Migration: <code>series.json</code>/<code>recordings.json</code> nach <code>/data/recorder/</code> kopieren.<br>
-          <b>Rollout:</b> Fertiges arm64-Image mit ffmpeg (kein <code>apt-get</code> mehr bei jedem Start), Tests + Selbsttest in CI, automatische Verteilung auf einen oder mehrere Raspberry Pis über <code>pi-deploy</code> mit Rollback. Build-ID = Git-Commit.</div>
+          <b>Rollout:</b> Fertiges arm64-Image mit ffmpeg (kein <code>apt-get</code> mehr bei jedem Start), Tests + Selbsttest in CI, automatische Verteilung auf einen oder mehrere Raspberry Pis über <code>pi-deploy</code> mit Rollback. Build-ID = Git-Commit.<br>
+          <b>EPG bleibt erhalten:</b> Liefert ein EPG-Lauf gar keine Daten (z.&nbsp;B. Box beim Start aus), bleibt das vorhandene EPG stehen, statt durch ein leeres ersetzt zu werden.</div>
         </div>
 
         <div style="border-left:3px solid var(--accent);padding-left:14px">

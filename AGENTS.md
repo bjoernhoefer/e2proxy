@@ -73,6 +73,7 @@ Read it via `gh api repos/bjoernhoefer/raspberrypi_management/contents/docs/stan
 | Transcoding | ffmpeg with libx264 + aac works in the image | selftest `transcode` |
 | Tuner sharing | a tuner is freed only by its last user; stale epochs ignored | `tests/test_core.py` |
 | OpenWebif | `e2length` is `MIN:SS` | `tests/test_core.py` |
+| EPG | a run without any data keeps the previous EPG | `tests/test_core.py` |
 | Package | every module imports standalone (no import-order cycles) | `tests/test_package.py` |
 | Recorder | optional; API 404 when off; dedupe, skip, keep-last, recovery | `tests/test_recorder.py`, `tests/test_http.py` |
 | Rollout targets | `deploy/targets.json` valid, input sanitised | `tests/test_deploy.py` |

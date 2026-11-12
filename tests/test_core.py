@@ -48,3 +48,22 @@ def test_stale_release_does_not_kill_new_session():
     receivers.release_receiver("rx1", old)
     assert receivers._receiver_state["rx1"]["epoch"] == new
     receivers.release_receiver("rx1", new)
+
+
+def test_failed_epg_run_keeps_previous_epg(monkeypatch):
+    """v5.0: a run with the receiver off (e.g. at start-up) replaced a valid EPG
+    cache with an empty XMLTV – the guide stayed blank until the next good run."""
+    from e2proxy import epg
+    old = '<tv><programme start="x" channel="c"><title>Tatort</title></programme></tv>'
+    monkeypatch.setitem(epg.epg_cache, "xml", old)
+    monkeypatch.setattr(epg, "load_favorites", lambda: [{"ref": "1:0:1:A:", "name": "A"}])
+    monkeypatch.setattr(epg, "get_receivers", lambda: [{"id": "rx1", "name": "rx1"}])
+    monkeypatch.setattr(epg, "is_receiver_usable", lambda r: True)
+    monkeypatch.setattr(epg, "is_receiver_unhealthy", lambda rid: False)
+    monkeypatch.setattr(epg, "fetch_epg_events_from_receiver", lambda rx, refs: {})
+    monkeypatch.setattr(epg, "zap_and_fetch_epg", lambda rx, ref, wait_sec=30: [])
+    monkeypatch.setattr(epg, "fetch_rytec_epg", lambda: {})
+    saved = []
+    monkeypatch.setattr(epg, "save_epg_to_disk", saved.append)
+    assert epg.run_epg_update("startup") is False
+    assert epg.epg_cache["xml"] == old and saved == []
