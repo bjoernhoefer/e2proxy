@@ -47,3 +47,20 @@ def test_recorder_api_toggle(server, monkeypatch):
     finally:
         http(server + "/api/recorder/settings", "POST", {"enabled": False})
     assert http(server + "/api/recorder/series")[0] == 404
+
+
+def test_recording_stream_not_counted_in_usage(server, monkeypatch):
+    """v5.1: the recorder's own ffmpeg (/stream?preacquired=…) showed up as a
+    'ffmpeg/Lavf' device in the usage report – only real viewers count."""
+    from e2proxy import http_proxy, receivers
+    booked = []
+    monkeypatch.setattr(http_proxy, "record_usage_session", lambda *a, **k: booked.append(a))
+    monkeypatch.setattr(http_proxy, "do_zap", lambda *a, **k: False)
+    monkeypatch.setattr(http_proxy, "get_device_profile", lambda name: None)
+    monkeypatch.setattr(http_proxy, "get_transcode_profile", lambda name: {"codec": "pass"})
+    epoch = receivers.acquire_receiver("rx1", "127.0.0.1", service_ref="1:0:1:A:")
+    try:
+        status, _ = http(server + "/stream?ref=1:0:1:A:&profile=pass&preacquired=rx1")
+        assert status == 502 and booked == []
+    finally:
+        receivers.release_receiver("rx1", epoch)
