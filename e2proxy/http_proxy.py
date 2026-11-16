@@ -681,7 +681,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             ref = params.get("ref", [""])[0]
             if ref:
                 # Zappt im Hintergrund vor
-                rid_pre = get_free_receiver()
+                rid_pre = get_free_receiver(purpose="stream")
                 if rid_pre:
                     threading.Thread(
                         target=do_zap, args=(rid_pre, ref), daemon=True
@@ -1538,7 +1538,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     },
                 }
                 with receiver_lock:
-                    rid = get_free_receiver(receiver_pref if receiver_pref != "auto" else None)
+                    rid = get_free_receiver(receiver_pref if receiver_pref != "auto" else None,
+                                            purpose="stream")
                     if rid:
                         rcv_epoch = acquire_receiver(rid, **acquire_kwargs)
                 if not rid:

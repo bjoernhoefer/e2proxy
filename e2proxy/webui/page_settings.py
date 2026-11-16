@@ -78,6 +78,8 @@ def build_settings_ui():
         if is_receiver_locked(r):
             enabled += ' <span class="tag red">🔒 gesperrt</span>'
         default = '<span class="tag amber">default</span>' if r.get("default") else ""
+        role_stream = '<span class="tag green">stream</span>' if r.get("stream") else ""
+        role_record = '<span class="tag red">record</span>' if r.get("record") else ""
         r_json = json.dumps(r).replace('"', '&quot;')
         rx_rows += f'''<tr>
           <td><span class="tag">{r['id']}</span></td>
@@ -87,6 +89,8 @@ def build_settings_ui():
           <td>{r.get('stream_port', 8001)}</td>
           <td>{enabled}</td>
           <td>{default}</td>
+          <td data-rx-role="stream">{role_stream}</td>
+          <td data-rx-role="record">{role_record}</td>
           <td style="white-space:nowrap">
             <button class="btn" onclick='editReceiver({r_json})' style="font-size:10px;padding:3px 7px">✎</button>
             <button class="btn btn-danger" onclick='deleteReceiver("{r['id']}")' style="font-size:10px;padding:3px 7px">✕</button>
@@ -482,7 +486,7 @@ textarea.input{min-height:380px;resize:vertical;font-size:11px;line-height:1.5;}
     <div class="card">
       <div class="card-title">📡 <span data-i18n="set.receivers_card">Receivers</span></div>
       <table class="table" id="rx-table">
-        <thead><tr><th>ID</th><th>Name</th><th>IP</th><th>Port</th><th>Stream-Port</th><th>Status</th><th>Default</th><th></th></tr></thead>
+        <thead><tr><th>ID</th><th>Name</th><th>IP</th><th>Port</th><th>Stream-Port</th><th>Status</th><th>Default</th><th title="Bevorzugter Receiver für Live-Streams">Stream</th><th title="Bevorzugter Receiver für Aufnahmen">Record</th><th></th></tr></thead>
         <tbody id="rx-tbody">{rx_rows}</tbody>
       </table>
       <div class="flex" style="margin-top:10px">
@@ -2379,9 +2383,11 @@ function addReceiver() {{
     {{key:'enabled', label:'Aktiv', type:'checkbox', value:true}},
     {{key:'locked', label:'Gesperrt (Tuner nicht verwenden)', type:'checkbox', value:false}},
     {{key:'default', label:'Default-Receiver', type:'checkbox', value:false}},
+    {{key:'stream', label:'Stream – Default-Receiver für Live-Streams', type:'checkbox', value:false}},
+    {{key:'record', label:'Record – Default-Receiver für Aufnahmen', type:'checkbox', value:false}},
   ], async () => {{
-    const rx = {{id:getVal('id'),name:getVal('name'),ip:getVal('ip'),port:parseInt(getVal('port')),stream_port:parseInt(getVal('stream_port')),enabled:getVal('enabled',true),locked:getVal('locked',false),default:getVal('default',true)}};
-    await patchConfig(cfg => cfg.receivers.push(rx));
+    const rx = {{id:getVal('id'),name:getVal('name'),ip:getVal('ip'),port:parseInt(getVal('port')),stream_port:parseInt(getVal('stream_port')),enabled:getVal('enabled',true),locked:getVal('locked',true),default:getVal('default',true),stream:getVal('stream',true),record:getVal('record',true)}};
+    await patchConfig(cfg => {{ cfg.receivers.push(rx); applyReceiverRoles(cfg, rx); }});
   }});
 }}
 
@@ -2394,11 +2400,23 @@ function editReceiver(r) {{
     {{key:'enabled', label:'Aktiv', type:'checkbox', value:r.enabled!==false}},
     {{key:'locked', label:'Gesperrt (Tuner nicht verwenden)', type:'checkbox', value:!!r.locked}},
     {{key:'default', label:'Default-Receiver', type:'checkbox', value:!!r.default}},
+    {{key:'stream', label:'Stream – Default-Receiver für Live-Streams', type:'checkbox', value:!!r.stream}},
+    {{key:'record', label:'Record – Default-Receiver für Aufnahmen', type:'checkbox', value:!!r.record}},
   ], async () => {{
     await patchConfig(cfg => {{
       const idx = cfg.receivers.findIndex(x=>x.id===r.id);
-      if (idx>=0) cfg.receivers[idx] = {{...cfg.receivers[idx], name:getVal('name'), ip:getVal('ip'), port:parseInt(getVal('port')), stream_port:parseInt(getVal('stream_port')), enabled:getVal('enabled',true), locked:getVal('locked',false), default:getVal('default',true)}};
+      if (idx>=0) {{
+        cfg.receivers[idx] = {{...cfg.receivers[idx], name:getVal('name'), ip:getVal('ip'), port:parseInt(getVal('port')), stream_port:parseInt(getVal('stream_port')), enabled:getVal('enabled',true), locked:getVal('locked',true), default:getVal('default',true), stream:getVal('stream',true), record:getVal('record',true)}};
+        applyReceiverRoles(cfg, cfg.receivers[idx]);
+      }}
     }});
+  }});
+}}
+
+// Stream/Record sind Rollen: höchstens ein Receiver je Rolle.
+function applyReceiverRoles(cfg, rx) {{
+  ['stream', 'record'].forEach(role => {{
+    if (rx[role]) cfg.receivers.forEach(o => {{ if (o.id !== rx.id) o[role] = false; }});
   }});
 }}
 

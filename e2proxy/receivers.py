@@ -140,8 +140,12 @@ def receiver_health_snapshot():
     return out
 
 
-def get_free_receiver(preferred_id=None, exclude=None):
+def get_free_receiver(preferred_id=None, exclude=None, purpose=None):
     """Gibt ID des ersten freien Receivers zurück. Bevorzugt preferred_id.
+
+    ``purpose`` ("stream" | "record") bevorzugt den in den Einstellungen als
+    Stream- bzw. Record-Receiver markierten Tuner (Flag gleichen Namens) noch
+    vor dem Default-Receiver; ist er belegt/gesperrt, gilt die übliche Reihenfolge.
 
     Receiver, für die der Circuit Breaker offen ist, werden übersprungen. Sind
     ALLE Kandidaten als down markiert, wird trotzdem einer zurückgegeben — eine
@@ -151,10 +155,12 @@ def get_free_receiver(preferred_id=None, exclude=None):
     with receiver_lock:
         receivers = get_receivers()
 
-        # Prioritätsreihenfolge: preferred → default → Rest
+        # Prioritätsreihenfolge: preferred → Rolle (stream/record) → default → Rest
         ordered = []
         if preferred_id and preferred_id != "auto":
             ordered += [r for r in receivers if r["id"] == preferred_id]
+        if purpose in ("stream", "record"):
+            ordered += [r for r in receivers if r.get(purpose)]
         ordered += [r for r in receivers if r.get("default")]
         ordered += receivers
 
@@ -544,7 +550,8 @@ def do_zap(rid, service_ref, channel_name=None):
 
 
 def zap_with_failover(rid, epoch, service_ref, channel_name,
-                      acquire_kwargs, preferred_id=None, source="Stream"):
+                      acquire_kwargs, preferred_id=None, source="Stream",
+                      purpose="stream"):
     """Zappt den Receiver — weicht bei Ausfall auf einen anderen Tuner aus.
 
     Bisher beendete ein fehlgeschlagener Zap den Request sofort mit 502. Hing die
@@ -566,7 +573,7 @@ def zap_with_failover(rid, epoch, service_ref, channel_name,
 
         # Nächsten gesunden Tuner suchen und atomar belegen
         with receiver_lock:
-            nxt = get_free_receiver(preferred_id, exclude=tried)
+            nxt = get_free_receiver(preferred_id, exclude=tried, purpose=purpose)
             nxt_epoch = acquire_receiver(nxt, **acquire_kwargs) if nxt else None
 
         if not nxt:

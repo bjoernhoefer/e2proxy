@@ -166,7 +166,7 @@ def start_recording(service_ref, title, duration=None, profile=None,
                     log.info(f"Shared tuner: Receiver '{rid}' already streaming {service_ref}")
                     break
         if not rid:
-            rid = get_free_receiver()
+            rid = get_free_receiver(purpose="record")
             if rid:
                 rcv_epoch = acquire_receiver(
                     rid, client_ip, service_ref, title or "Aufnahme",
