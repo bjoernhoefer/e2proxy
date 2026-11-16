@@ -1618,11 +1618,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 log.error(f"STREAM ERROR: {e}")
             finally:
                 # Nutzung erfassen, BEVOR der Receiver-State verworfen wird
-                # (dort stehen Startzeit und übertragene Bytes).
+                # (dort stehen Startzeit und übertragene Bytes). Reine Aufnahmen
+                # (preacquired = ffmpeg des Recorders) zählen nicht — nur echte
+                # Streaming-Clients gehören in die Statistik.
                 try:
                     _st = receivers._receiver_state.get(rid) or {}
                     _t0 = _st.get("started_ts")
-                    if _t0:
+                    if _t0 and not preacquired:
                         record_usage_session(
                             service_ref, channel_name, user_agent=ua,
                             client_ip=client_ip, profile=profile_name,

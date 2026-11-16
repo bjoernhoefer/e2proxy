@@ -13,10 +13,10 @@ Pure-stdlib Python package, runs in Docker on a Raspberry Pi, manages SAT receiv
 - **Recording System** — ffmpeg-based with Plex-compliant directory structure (`TV/Show/Season XX/`)
 - **Series Recorder (optional)** — integrated e2recorder: series rules (name/regex, keep-last), one-click *record once / record series / skip* in the EPG overview, managed in Settings → Recorder
 - **TVDB + TMDB** — Automatic series/episode detection, daily-show fallback numbering
-- **Shared Tuner** — Parallel recordings on the same channel without tuner conflicts
+- **Shared Tuner** — Parallel recordings on the same channel without tuner conflicts; recordings and live viewers share one reference-counted tuner, so a recording ending never cuts off someone still watching (and vice versa)
 - **Fast Switching** — Per-channel switch tuning (NoLatency probing, configurable zap wait) with self-learning probesize and zap/start statistics
 - **Switch Analysis** — An *Analyze* button turns the collected zap/start statistics into concrete per-channel tuning suggestions (tighten flaky channels, loosen reliable ones), shown as a preview before you apply them
-- **Usage Report** — Aggregated statistics on which device streams most, which channel is watched most, which programmes are worth recording, and which interfaces are used
+- **Usage Report** — Aggregated statistics on which device streams most, which channel is watched most, which programmes are worth recording, and which interfaces are used (only real streaming clients count – pure recordings are not booked)
 - **Tuner Lock** — Temporarily lock a tuner in Settings so e2proxy won't use it (handy in exceptional situations)
 - **Favorites** — Drag & drop channel ordering with group/category assignments
 - **Editable Logos** — Set a custom logo per favorite (upload or URL), auto-converted to PNG via ffmpeg
