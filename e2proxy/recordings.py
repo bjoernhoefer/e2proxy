@@ -341,9 +341,6 @@ def start_recording(service_ref, title, duration=None, profile=None,
                           f"Datei ({final_size} Bytes)")
             _finish_recording(rec_id)
 
-    wt = threading.Thread(target=watchdog, daemon=True)
-    wt.start()
-
     rec = {
         "id": rec_id,
         "service_ref": service_ref,
@@ -364,6 +361,11 @@ def start_recording(service_ref, title, duration=None, profile=None,
     }
     with _active_recordings_lock:
         _active_recordings[rec_id] = rec
+    # Erst registrieren, dann den Watchdog starten: endet ffmpeg sofort, räumte
+    # der Watchdog sonst vor der Registrierung auf – die Aufnahme blieb ewig
+    # "laufend" und der Tuner belegt.
+    wt = threading.Thread(target=watchdog, daemon=True)
+    wt.start()
 
     # KEIN acquire_receiver() hier — die Referenz wurde oben bereits gezählt.
     log.info(f"Recording started: {rec_id} — {title} → {filepath} (shared={shared_tuner})")

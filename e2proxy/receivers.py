@@ -144,8 +144,8 @@ def get_free_receiver(preferred_id=None, exclude=None, purpose=None):
     """Gibt ID des ersten freien Receivers zurück. Bevorzugt preferred_id.
 
     ``purpose`` ("stream" | "record") bevorzugt den in den Einstellungen als
-    Stream- bzw. Record-Receiver markierten Tuner (Flag gleichen Namens) noch
-    vor dem Default-Receiver; ist er belegt/gesperrt, gilt die übliche Reihenfolge.
+    Stream- bzw. Record-Receiver markierten Tuner (Flag gleichen Namens); ist er
+    belegt/gesperrt/ausgefallen, folgen die übrigen Receiver in Config-Reihenfolge.
 
     Receiver, für die der Circuit Breaker offen ist, werden übersprungen. Sind
     ALLE Kandidaten als down markiert, wird trotzdem einer zurückgegeben — eine
@@ -155,13 +155,12 @@ def get_free_receiver(preferred_id=None, exclude=None, purpose=None):
     with receiver_lock:
         receivers = get_receivers()
 
-        # Prioritätsreihenfolge: preferred → Rolle (stream/record) → default → Rest
+        # Prioritätsreihenfolge: preferred → Rolle (stream/record) → Rest
         ordered = []
         if preferred_id and preferred_id != "auto":
             ordered += [r for r in receivers if r["id"] == preferred_id]
         if purpose in ("stream", "record"):
             ordered += [r for r in receivers if r.get(purpose)]
-        ordered += [r for r in receivers if r.get("default")]
         ordered += receivers
 
         free, healthy = [], []

@@ -116,7 +116,7 @@ Runtime picture:
 
 First-time setup via the web UI at `http://your-server:8888/settings`:
 
-1. **Receivers** — Add your Enigma2 receiver IPs (port 80 for web, 8001 for streaming). Each receiver can be locked to temporarily exclude its tuner from use. Mark one receiver as **Stream** (preferred tuner for live streams) and one as **Record** (preferred tuner for recordings, incl. the series recorder); each role belongs to at most one receiver. If that receiver is busy, locked or down, allocation falls back to the **Default** receiver, then any other free one.
+1. **Receivers** — Add your Enigma2 receiver IPs (port 80 for web, 8001 for streaming). Each receiver can be locked to temporarily exclude its tuner from use. Mark one receiver as **Stream** (preferred tuner for live streams) and one as **Record** (preferred tuner for recordings, incl. the series recorder); each role belongs to at most one receiver. If that receiver is busy, locked or down, any other free receiver is used (config order). OpenWebif metadata comes from the Stream receiver unless a metadata receiver is set. The pre-5.3 **Default** flag is migrated automatically (it takes over Stream/Record if unassigned) and removed.
 2. **Favorites** — Select channels for EPG and Plex DVR lineup
 3. **EPG Schedule** — Set the daily EPG update time (default: 3:00 AM)
 4. **TMDB API Key** — Optional, for poster artwork in EPG
