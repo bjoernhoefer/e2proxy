@@ -72,6 +72,7 @@ Read it via `gh api repos/bjoernhoefer/raspberrypi_management/contents/docs/stan
 | WebUI | every page renders; all inline JS parses; no undefined handlers | `tests/test_webui.py` (node), `--selfcheck`, selftest `ui`/`webui-selfcheck` |
 | Transcoding | ffmpeg with libx264 + aac works in the image | selftest `transcode` |
 | Tuner sharing | a tuner is freed only by its last user; stale epochs ignored | `tests/test_core.py` |
+| Receiver roles | Stream/Record receiver preferred for its task, one per role, fallback default → rest | `tests/test_core.py`, `tests/test_http.py`, `tests/test_webui.py` (node click test) |
 | OpenWebif | `e2length` is `MIN:SS` | `tests/test_core.py` |
 | EPG | a run without any data keeps the previous EPG | `tests/test_core.py` |
 | Package | every module imports standalone (no import-order cycles) | `tests/test_package.py` |

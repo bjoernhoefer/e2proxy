@@ -69,7 +69,7 @@ def _fake_recording_env(monkeypatch, tmp_path, free="rx1"):
     monkeypatch.setattr(recordings, "get_receivers", lambda: [rx])
     monkeypatch.setattr(recordings, "is_receiver_usable", lambda r: True)
     monkeypatch.setattr(recordings, "get_receiver_by_id", lambda rid: rx)
-    monkeypatch.setattr(recordings, "get_free_receiver", lambda *a: free)
+    monkeypatch.setattr(recordings, "get_free_receiver", lambda *a, **k: free)
     monkeypatch.setattr(recordings, "classify_recording", lambda *a, **k: {"kind": "movie"})
     monkeypatch.setattr(recordings, "verify_recording_metadata", lambda *a, **k: None)
     monkeypatch.setattr(recordings, "build_recording_path",
@@ -124,3 +124,39 @@ def test_failed_epg_run_keeps_previous_epg(monkeypatch):
     monkeypatch.setattr(epg, "save_epg_to_disk", saved.append)
     assert epg.run_epg_update("startup") is False
     assert epg.epg_cache["xml"] == old and saved == []
+
+
+def test_free_receiver_prefers_stream_and_record_roles(monkeypatch):
+    """v5.2: the Stream / Record receivers from Settings → Configuration win
+    over the default receiver for their task; busy/locked → normal order."""
+    rxs = [{"id": "a", "default": True}, {"id": "b", "stream": True},
+           {"id": "c", "record": True}]
+    monkeypatch.setattr(receivers, "get_receivers", lambda: rxs)
+    monkeypatch.setattr(receivers, "_receiver_state", {"a": None, "b": None, "c": None})
+    monkeypatch.setattr(receivers, "is_receiver_unhealthy", lambda rid: False)
+    assert receivers.get_free_receiver() == "a"
+    assert receivers.get_free_receiver(purpose="stream") == "b"
+    assert receivers.get_free_receiver(purpose="record") == "c"
+    assert receivers.get_free_receiver("c", purpose="stream") == "c"   # explicit pref first
+    receivers._receiver_state["b"] = {"epoch": 1}                        # stream box busy
+    assert receivers.get_free_receiver(purpose="stream") == "a"
+    rxs[2]["locked"] = True                                              # record box locked
+    assert receivers.get_free_receiver(purpose="record") == "a"
+
+
+def test_recording_allocates_record_receiver(monkeypatch, tmp_path):
+    from e2proxy import recordings
+    seen = []
+
+    def fake_free(*a, **k):
+        seen.append(k.get("purpose"))
+        return None
+    monkeypatch.setattr(recordings, "get_receivers", lambda: [])
+    monkeypatch.setattr(recordings, "get_free_receiver", fake_free)
+    monkeypatch.setattr(recordings, "get_recordings_config",
+                        lambda: {"path": str(tmp_path), "profile": "pass", "max_duration": 60})
+    try:
+        recordings.start_recording("1:0:1:1:1:1:1:0:0:0:", "X")
+    except RuntimeError:
+        pass
+    assert seen == ["record"]

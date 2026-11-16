@@ -39,6 +39,8 @@ def check_ui():
     for path in ("/", "/settings", "/epg-browser"):
         status, body = get(path, timeout=15)
         assert status == 200 and "</html>" in body.lower(), f"{path}: {status}"
+        if path == "/settings":   # v5.2: receiver roles Stream / Record configurable
+            assert "applyReceiverRoles" in body and ">Record</th>" in body, "receiver roles missing"
 
 
 def check_webui_selfcheck():

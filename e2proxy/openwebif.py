@@ -1079,7 +1079,7 @@ class OpenWebifHandler(http.server.BaseHTTPRequestHandler):
                     shared = True
                     break
             if not rid:
-                rid = get_free_receiver()
+                rid = get_free_receiver(purpose="stream")
             if rid:
                 if shared:
                     # Mitzählen! Sonst gibt der zuerst endende Stream den Tuner frei,

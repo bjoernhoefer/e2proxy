@@ -54,7 +54,7 @@ def build_help_ui():
 
     <div class="help-card">
       <div class="help-card-title">⚙ <span data-i18n="nav.settings">Settings</span></div>
-      <p data-i18n-html="1" data-i18n="help.settings_desc"><b>Configuration:</b> Receivers, transcode profiles, device profiles, TMDB API key, e2recorder URL.<br>
+      <p data-i18n-html="1" data-i18n="help.settings_desc"><b>Configuration:</b> Receivers (incl. default receiver for Stream / Record), transcode profiles, device profiles, TMDB API key, e2recorder URL.<br>
       <b>Maintenance:</b> Live logs, level control (DEBUG/INFO/WARNING/ERROR) without restart, 500-entry RAM buffer.<br>
       <b>EPG:</b> Manual run, schedule, run history as bar chart, outlier detection.<br>
       <b>Recordings:</b> Path, profile, watchdog, Plex token (via plex.tv login), Plex section multi-select.</p>
@@ -93,6 +93,13 @@ def build_help_ui():
       <div class="help-card-title">📋 Changelog</div>
       <div style="display:flex;flex-direction:column;gap:12px">
 
+        <div style="border-left:3px solid var(--accent);padding-left:14px">
+          <b style="color:var(--accent);font-family:monospace;font-size:11px">v5.2</b>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-11-16</span>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">Default-Receiver für Streams und Aufnahmen</span>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)"><b>Stream / Record je Receiver:</b> Unter <b>Einstellungen → Konfiguration → Receivers</b> lässt sich pro Receiver festlegen, ob er der Default für <b>Stream</b> (Live-Streams: Web, Plex/HDHomeRun, OpenWebif/Dream Player) und/oder für <b>Record</b> (Aufnahmen inkl. Recorder) ist – je Rolle höchstens ein Receiver; wird ein anderer markiert, verliert der bisherige die Rolle. Warum: So bleibt z.&nbsp;B. ein Tuner für Aufnahmen reserviert, während Live-TV auf dem anderen läuft. Ist der Rollen-Receiver belegt, gesperrt oder ausgefallen, gilt wie bisher Default-Receiver → übrige Receiver. Ein explizit gewählter Receiver im Device-Profil hat weiter Vorrang.<br>
+          <b>Bearbeiten sperrte den Receiver – behoben:</b> Beim Speichern im Receiver-Dialog wurde „Gesperrt“ aus dem Checkbox-Wert (<code>"on"</code>) statt aus dem Häkchen gelesen; jeder bearbeitete Receiver war danach gesperrt.</div>
+        </div>
         <div style="border-left:3px solid var(--accent);padding-left:14px">
           <b style="color:var(--accent);font-family:monospace;font-size:11px">v5.1</b>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-11-16</span>

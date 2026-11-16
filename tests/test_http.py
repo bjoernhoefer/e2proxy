@@ -64,3 +64,28 @@ def test_recording_stream_not_counted_in_usage(server, monkeypatch):
         assert status == 502 and booked == []
     finally:
         receivers.release_receiver("rx1", epoch)
+
+
+def test_stream_requests_ask_for_stream_receiver(server, monkeypatch):
+    """v5.2: live streams allocate with purpose="stream" (Settings → Receivers → Stream)."""
+    import e2proxy.http_proxy as hp
+    seen = []
+    monkeypatch.setattr(hp, "get_free_receiver", lambda *a, **k: seen.append(k.get("purpose")))
+    status, _ = http(server + "/prezap?ref=1:0:1:1:1:1:1:0:0:0:")
+    assert status == 200 and seen == ["stream"]
+
+
+def test_config_roundtrip_keeps_receiver_roles(server):
+    _, body = http(server + "/api/config")
+    cfg = json.loads(body)
+    cfg["receivers"][0].update(stream=True, record=True)
+    assert json.loads(http(server + "/api/config", "POST", cfg)[1])["ok"]
+    try:
+        rx = json.loads(http(server + "/api/config")[1])["receivers"][0]
+        assert rx["stream"] is True and rx["record"] is True
+        _, page = http(server + "/settings")
+        assert '<td data-rx-role="stream"><span class="tag green">stream</span></td>' in page
+        assert '<td data-rx-role="record"><span class="tag red">record</span></td>' in page
+    finally:
+        cfg["receivers"][0].update(stream=False, record=False)
+        http(server + "/api/config", "POST", cfg)
