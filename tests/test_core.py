@@ -50,6 +50,63 @@ def test_stale_release_does_not_kill_new_session():
     receivers.release_receiver("rx1", new)
 
 
+def _fake_recording_env(monkeypatch, tmp_path, free="rx1"):
+    import io
+    import time
+    from e2proxy import recordings
+
+    class _Proc:
+        pid = 1
+        stderr = io.StringIO("")
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    rx = {"id": "rx1", "name": "rx1", "ip": "127.0.0.9"}
+    monkeypatch.setattr(recordings, "get_receivers", lambda: [rx])
+    monkeypatch.setattr(recordings, "is_receiver_usable", lambda r: True)
+    monkeypatch.setattr(recordings, "get_receiver_by_id", lambda rid: rx)
+    monkeypatch.setattr(recordings, "get_free_receiver", lambda *a: free)
+    monkeypatch.setattr(recordings, "classify_recording", lambda *a, **k: {"kind": "movie"})
+    monkeypatch.setattr(recordings, "verify_recording_metadata", lambda *a, **k: None)
+    monkeypatch.setattr(recordings, "build_recording_path",
+                        lambda *a, **k: str(tmp_path / "rec.ts"))
+    monkeypatch.setattr(recordings, "build_nfo", lambda *a, **k: None)
+    monkeypatch.setattr(recordings, "get_recordings_config",
+                        lambda: {"path": str(tmp_path), "profile": "pass", "max_duration": 60})
+    monkeypatch.setattr(recordings._subprocess, "Popen", lambda *a, **k: _Proc())
+
+    def run_and_wait(ref):
+        rec_id = recordings.start_recording(ref, "Das perfekte Dinner")[0]
+        deadline = time.time() + 5
+        while rec_id in recordings._active_recordings and time.time() < deadline:
+            time.sleep(0.02)
+        assert rec_id not in recordings._active_recordings
+    return run_and_wait
+
+
+def test_recording_end_keeps_live_viewer_on_shared_tuner(monkeypatch, tmp_path):
+    """v5.x: the end of the last recording on a shared tuner force-killed the
+    receiver – the Dream Player watching the same channel lost its stream."""
+    receivers._init_receiver_state()
+    viewer = receivers.acquire_receiver("rx1", "10.0.0.5", service_ref="1:0:1:A:")
+    _fake_recording_env(monkeypatch, tmp_path, free=None)("1:0:1:A:")
+    st = receivers._receiver_state["rx1"]
+    assert st is not None and st["epoch"] == viewer and st["users"] == 1
+    receivers.release_receiver("rx1", viewer)
+    assert receivers._receiver_state["rx1"] is None
+
+
+def test_recording_on_own_tuner_is_released_at_end(monkeypatch, tmp_path):
+    receivers._init_receiver_state()
+    receivers._receiver_state["rx1"] = None
+    _fake_recording_env(monkeypatch, tmp_path)("1:0:1:B:")
+    assert receivers._receiver_state["rx1"] is None
+
+
 def test_failed_epg_run_keeps_previous_epg(monkeypatch):
     """v5.0: a run with the receiver off (e.g. at start-up) replaced a valid EPG
     cache with an empty XMLTV – the guide stayed blank until the next good run."""

@@ -23,9 +23,11 @@ from e2proxy.channels import channel_cache, channel_cache_lock
 from e2proxy.logos import get_logo_for_epg
 from e2proxy.receivers import (
     acquire_receiver,
+    attach_receiver,
     get_free_receiver,
     kill_proc_robust,
-    kill_stream,
+    receiver_lock,
+    release_receiver,
     stream_info_public,
 )
 from e2proxy.metadata import (
@@ -144,92 +146,99 @@ def start_recording(service_ref, title, duration=None, profile=None,
     os.makedirs(rec_path, exist_ok=True)
 
     # Receiver holen — prüfe ob gewünschter Sender bereits läuft (Shared Tuner)
+    # Die Aufnahme hält eine EIGENE Referenz am Receiver (Zähler + Epoch) und gibt
+    # beim Ende nur diese frei. Früher riss das Ende der letzten Aufnahme den
+    # Receiver per kill_stream() hart los — samt Live-Zuschauer am Shared Tuner.
     shared_tuner = False
     rid = None
+    rcv_epoch = None
     ref_clean = service_ref.rstrip("/")
-    # Suche Receiver der bereits diesen Sender streamt
-    for r in get_receivers():
-        if not is_receiver_usable(r):
-            continue
-        state = receivers_mod._receiver_state.get(r["id"])
-        if state and state.get("service_ref", "").rstrip("/") == ref_clean:
-            rid = r["id"]
-            shared_tuner = True
-            log.info(f"Shared tuner: Receiver '{rid}' already streaming {service_ref}")
-            break
-    # Kein Shared Tuner — normaler freier Receiver
-    if not rid:
-        rid = get_free_receiver()
+    with receiver_lock:
+        for r in get_receivers():
+            if not is_receiver_usable(r):
+                continue
+            state = receivers_mod._receiver_state.get(r["id"])
+            if state and state.get("service_ref", "").rstrip("/") == ref_clean:
+                rcv_epoch = attach_receiver(r["id"], service_ref)
+                if rcv_epoch is not None:
+                    rid = r["id"]
+                    shared_tuner = True
+                    log.info(f"Shared tuner: Receiver '{rid}' already streaming {service_ref}")
+                    break
+        if not rid:
+            rid = get_free_receiver()
+            if rid:
+                rcv_epoch = acquire_receiver(
+                    rid, client_ip, service_ref, title or "Aufnahme",
+                    user_agent="e2proxy (Aufnahme)", profile=rec_profile,
+                    transcode={"active": True, "codec": "record",
+                               "label": f"Aufnahme ({rec_profile})"})
     if not rid:
         raise RuntimeError("Kein freier Receiver verfügbar")
 
-    # Receiver sofort acquiren um Race-Condition zu verhindern
-    # ABER: bei shared_tuner ist Receiver schon belegt → nicht doppelt acquiren
-    if not shared_tuner:
-        acquire_receiver(rid, client_ip, service_ref, title or "Aufnahme",
-                         user_agent="e2proxy (Aufnahme)", profile=rec_profile,
-                         transcode={"active": True, "codec": "record",
-                                    "label": f"Aufnahme ({rec_profile})"})
+    try:
+        # Stream-URL bauen:
+        # - shared_tuner: direkt vom Receiver (umgeht ref_lock 429, parallele Aufnahmen möglich)
+        # - normal: über e2proxy /stream Endpoint (mit Pre-Acquire Marker)
+        if shared_tuner:
+            receiver_obj = get_receiver_by_id(rid)
+            ref_enc_colon = urllib.parse.quote(service_ref, safe=":")
+            stream_url = f"http://{receiver_obj['ip']}:{receiver_obj.get('stream_port', 8001)}/{ref_enc_colon}"
+            log.info(f"Shared tuner: Recording uses receiver stream directly: {stream_url}")
+        else:
+            ref_enc = urllib.parse.quote(service_ref, safe="")
+            host = get_proxy_host()
+            port = get_proxy_port()
+            stream_url = f"http://{host}:{port}/stream?ref={ref_enc}&profile={rec_profile}&preacquired={rid}"
 
-    # Stream-URL bauen:
-    # - shared_tuner: direkt vom Receiver (umgeht ref_lock 429, parallele Aufnahmen möglich)
-    # - normal: über e2proxy /stream Endpoint (mit Pre-Acquire Marker)
-    if shared_tuner:
-        receiver_obj = get_receiver_by_id(rid)
-        ref_enc_colon = urllib.parse.quote(service_ref, safe=":")
-        stream_url = f"http://{receiver_obj['ip']}:{receiver_obj.get('stream_port', 8001)}/{ref_enc_colon}"
-        log.info(f"Shared tuner: Recording uses receiver stream directly: {stream_url}")
-    else:
-        ref_enc = urllib.parse.quote(service_ref, safe="")
-        host = get_proxy_host()
-        port = get_proxy_port()
-        stream_url = f"http://{host}:{port}/stream?ref={ref_enc}&profile={rec_profile}&preacquired={rid}"
+        # Klassifikation: Movie oder Serie? Caller-Override hat Vorrang vor TVDB.
+        classification = classify_recording(
+            title or "Recording",
+            episode_title=episode_title,
+            force_movie=(kind == "movie"),
+            force_series=(kind == "series"),
+            season_override=season,
+            episode_override=episode,
+            year_override=year,
+        )
+        log.info(
+            f"Klassifikation: {classification.get('kind')}" +
+            (f" ({classification.get('year')}, Quelle: {classification.get('year_source')})" if classification.get("kind") == "movie" else "") +
+            (f" S{classification.get('season')}E{classification.get('episode')}" if classification.get("kind") == "series" else "") +
+            (" (TVDB)" if classification.get("kind") == "series" and not classification.get("synthetic") else "") +
+            (" (Daily-Show, Datum-Nummerierung)" if classification.get("synthetic") else "")
+        )
 
-    # Klassifikation: Movie oder Serie? Caller-Override hat Vorrang vor TVDB.
-    classification = classify_recording(
-        title or "Recording",
-        episode_title=episode_title,
-        force_movie=(kind == "movie"),
-        force_series=(kind == "series"),
-        season_override=season,
-        episode_override=episode,
-        year_override=year,
-    )
-    log.info(
-        f"Klassifikation: {classification.get('kind')}" +
-        (f" ({classification.get('year')}, Quelle: {classification.get('year_source')})" if classification.get("kind") == "movie" else "") +
-        (f" S{classification.get('season')}E{classification.get('episode')}" if classification.get("kind") == "series" else "") +
-        (" (TVDB)" if classification.get("kind") == "series" and not classification.get("synthetic") else "") +
-        (" (Daily-Show, Datum-Nummerierung)" if classification.get("synthetic") else "")
-    )
+        # TMDB/EPG-Metadaten-Check vor der Aufnahme
+        verify_recording_metadata(title or "Recording", description, classification)
 
-    # TMDB/EPG-Metadaten-Check vor der Aufnahme
-    verify_recording_metadata(title or "Recording", description, classification)
+        # Fehlendes Artwork via TMDB-Poster auffüllen
+        if not image_url and classification.get("tmdb_poster"):
+            image_url = classification["tmdb_poster"]
 
-    # Fehlendes Artwork via TMDB-Poster auffüllen
-    if not image_url and classification.get("tmdb_poster"):
-        image_url = classification["tmdb_poster"]
+        # Plex-konformen Pfad bauen: Movies/<Titel>/<Datei>.ts oder TV/<Show>/Season XX/<Datei>.ts
+        filepath = build_recording_path(rec_path, title or "Aufnahme", classification, ext="ts")
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        filename = os.path.basename(filepath)
 
-    # Plex-konformen Pfad bauen: Movies/<Titel>/<Datei>.ts oder TV/<Show>/Season XX/<Datei>.ts
-    filepath = build_recording_path(rec_path, title or "Aufnahme", classification, ext="ts")
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    filename = os.path.basename(filepath)
-
-    # ffmpeg Kommando mit Metadata-Embedding
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", stream_url,
-        "-c", "copy",
-        "-t", str(int(max_dur)),
-        # Metadata einbetten
-        "-metadata", f"title={title or 'Aufnahme'}",
-        "-metadata", f"comment={description or ''}",
-        "-metadata", f"date={datetime.now().strftime('%Y-%m-%d')}",
-        "-metadata", "encoder=e2proxy",
-    ]
-    if image_url:
-        cmd += ["-metadata", f"artwork={image_url}"]
-    cmd.append(filepath)
+        # ffmpeg Kommando mit Metadata-Embedding
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", stream_url,
+            "-c", "copy",
+            "-t", str(int(max_dur)),
+            # Metadata einbetten
+            "-metadata", f"title={title or 'Aufnahme'}",
+            "-metadata", f"comment={description or ''}",
+            "-metadata", f"date={datetime.now().strftime('%Y-%m-%d')}",
+            "-metadata", "encoder=e2proxy",
+        ]
+        if image_url:
+            cmd += ["-metadata", f"artwork={image_url}"]
+        cmd.append(filepath)
+    except Exception:
+        release_receiver(rid, epoch=rcv_epoch)
+        raise
 
     rec_id = str(_uuid.uuid4())[:8]
 
@@ -241,6 +250,7 @@ def start_recording(service_ref, title, duration=None, profile=None,
             text=True
         )
     except FileNotFoundError:
+        release_receiver(rid, epoch=rcv_epoch)
         raise RuntimeError("ffmpeg nicht gefunden — bitte installieren: apt install ffmpeg")
 
     # Watchdog-Thread: überwacht Datenfluss (früher Abbruch bei 0-Byte/defektem
@@ -342,6 +352,7 @@ def start_recording(service_ref, title, duration=None, profile=None,
         "filepath": filepath,
         "profile": rec_profile,
         "receiver": rid,
+        "rcv_epoch": rcv_epoch,
         "shared_tuner": shared_tuner,
         "started": datetime.now().isoformat(),
         "duration": max_dur,
@@ -354,8 +365,7 @@ def start_recording(service_ref, title, duration=None, profile=None,
     with _active_recordings_lock:
         _active_recordings[rec_id] = rec
 
-    # KEIN acquire_receiver() hier — ffmpeg akquiriert über /stream selbst.
-    # Nur in der Recording-Liste merken damit _finish_recording() nichts doppelt macht.
+    # KEIN acquire_receiver() hier — die Referenz wurde oben bereits gezählt.
     log.info(f"Recording started: {rec_id} — {title} → {filepath} (shared={shared_tuner})")
 
     # NFO Metadaten schreiben mit Sender-Logo
@@ -395,26 +405,14 @@ def _finish_recording(rec_id):
     """Räumt nach Aufnahme auf."""
     with _active_recordings_lock:
         rec = _active_recordings.pop(rec_id, None)
-        # Prüfen ob noch andere Aufnahmen denselben Receiver/Sender nutzen
-        rid = rec.get("receiver") if rec else None
-        ref = rec.get("service_ref", "").rstrip("/") if rec else ""
-        still_shared = False
-        if rid:
-            for other in _active_recordings.values():
-                if other.get("receiver") == rid and other.get("service_ref", "").rstrip("/") == ref:
-                    still_shared = True
-                    break
     if not rec:
         return
     log.info(f"Recording stopped: {rec_id} — {rec['title']} → {rec['filepath']}")
-    # Receiver/Stream nur freigeben wenn KEINE andere Aufnahme denselben Stream nutzt
-    if rid and not still_shared:
-        try:
-            kill_stream(rid)
-        except Exception as e:
-            log.debug(f"kill_stream: {e}")
-    elif still_shared:
-        log.info(f"Receiver '{rid}' stays busy — another recording uses the same stream")
+    # Nur die eigene Referenz zurückgeben: der Receiver wird erst frei, wenn auch
+    # Live-Zuschauer und andere Aufnahmen am selben Tuner fertig sind.
+    rid = rec.get("receiver")
+    if rid:
+        release_receiver(rid, epoch=rec.get("rcv_epoch"))
     # Plex benachrichtigen (+ optionale Verifikation der Aufnahme-Datei)
     rcfg = get_recordings_config()
     if rcfg.get("plex_url") and rcfg.get("plex_token"):

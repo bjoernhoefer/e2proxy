@@ -94,6 +94,12 @@ def build_help_ui():
       <div style="display:flex;flex-direction:column;gap:12px">
 
         <div style="border-left:3px solid var(--accent);padding-left:14px">
+          <b style="color:var(--accent);font-family:monospace;font-size:11px">v5.1</b>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-11-16</span>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">Aufnahme-Ende beendet keine Live-Streams mehr</span>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)"><b>Live-Stream bricht bei Aufnahme-Ende ab – behoben:</b> Endete die letzte Aufnahme auf einem geteilten Tuner, riss e2proxy den Receiver hart los (<code>kill_stream</code>) – auch wenn der Dream Player denselben Sender noch live schaute. Grund: Aufnahmen zählten nicht sauber im Referenzzähler des Receivers. Jetzt hält jede Aufnahme eine eigene Referenz (eigener Tuner: <code>acquire</code>, geteilter Tuner: <code>attach</code>) und gibt beim Ende nur diese frei; der Tuner wird erst frei, wenn auch der letzte Zuschauer geht. Nebeneffekt: Endet der Live-Stream vor der Aufnahme, kann der Tuner der laufenden Aufnahme nicht mehr weggezappt werden.</div>
+        </div>
+        <div style="border-left:3px solid var(--accent);padding-left:14px">
           <b style="color:var(--accent);font-family:monospace;font-size:11px">v5.0</b>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-11-12</span>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">Modulare Architektur · integrierter Serien-Recorder · automatische Pi-Rollouts</span>
