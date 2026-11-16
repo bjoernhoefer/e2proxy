@@ -39,8 +39,9 @@ def check_ui():
     for path in ("/", "/settings", "/epg-browser"):
         status, body = get(path, timeout=15)
         assert status == 200 and "</html>" in body.lower(), f"{path}: {status}"
-        if path == "/settings":   # v5.2: receiver roles Stream / Record configurable
+        if path == "/settings":   # v5.2/5.3: only receiver roles Stream / Record
             assert "applyReceiverRoles" in body and ">Record</th>" in body, "receiver roles missing"
+            assert "<th>Default</th>" not in body, "legacy Default column still shown"
 
 
 def check_webui_selfcheck():

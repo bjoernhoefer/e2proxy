@@ -54,7 +54,7 @@ def build_help_ui():
 
     <div class="help-card">
       <div class="help-card-title">⚙ <span data-i18n="nav.settings">Settings</span></div>
-      <p data-i18n-html="1" data-i18n="help.settings_desc"><b>Configuration:</b> Receivers (incl. default receiver for Stream / Record), transcode profiles, device profiles, TMDB API key, e2recorder URL.<br>
+      <p data-i18n-html="1" data-i18n="help.settings_desc"><b>Configuration:</b> Receivers (roles Stream / Record), transcode profiles, device profiles, TMDB API key, e2recorder URL.<br>
       <b>Maintenance:</b> Live logs, level control (DEBUG/INFO/WARNING/ERROR) without restart, 500-entry RAM buffer.<br>
       <b>EPG:</b> Manual run, schedule, run history as bar chart, outlier detection.<br>
       <b>Recordings:</b> Path, profile, watchdog, Plex token (via plex.tv login), Plex section multi-select.</p>
@@ -93,6 +93,14 @@ def build_help_ui():
       <div class="help-card-title">📋 Changelog</div>
       <div style="display:flex;flex-direction:column;gap:12px">
 
+        <div style="border-left:3px solid var(--accent);padding-left:14px">
+          <b style="color:var(--accent);font-family:monospace;font-size:11px">v5.3</b>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-11-16</span>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">Nur noch Stream / Record – „Default“ entfällt</span>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)"><b>Zwei statt drei Einstellungen:</b> v5.2 zeigte neben <b>Stream</b> und <b>Record</b> weiter das alte Häkchen <b>Default</b>, das ebenfalls in die Tuner-Auswahl einging – drei sich überlappende Einstellungen. Jetzt gibt es pro Receiver nur noch <b>Stream</b> und <b>Record</b>. Tuner-Auswahl: Device-Profil-Receiver → Rollen-Receiver → übrige Receiver in Config-Reihenfolge. Metadaten/EPG für OpenWebif-Apps kommen (ohne eigenen Metadaten-Receiver) vom Stream-Receiver.<br>
+          <b>Migration:</b> Ein bisher als „Default“ markierter Receiver übernimmt beim Start automatisch Stream und Record, sofern diese Rollen noch nicht vergeben sind; das Flag <code>default</code> wird aus <code>config.json</code> entfernt.<br>
+          <b>Hängende Aufnahme bei sofort endendem ffmpeg – behoben:</b> Der Aufnahme-Watchdog startete, bevor die Aufnahme registriert war. Brach ffmpeg sofort ab (z.&nbsp;B. Receiver verweigert den Stream), räumte er zu früh auf – die Aufnahme blieb dauerhaft „laufend“ und hielt den Tuner belegt. Jetzt wird erst registriert, dann überwacht. (Gefunden über einen sporadisch roten Test.)</div>
+        </div>
         <div style="border-left:3px solid var(--accent);padding-left:14px">
           <b style="color:var(--accent);font-family:monospace;font-size:11px">v5.2</b>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-11-16</span>

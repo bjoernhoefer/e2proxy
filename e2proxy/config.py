@@ -12,6 +12,23 @@ from e2proxy.logs import log
 config_lock = threading.Lock()
 _config = {}
 
+def migrate_receiver_roles(cfg):
+    """Seit v5.2 gibt es nur die Rollen ``stream`` und ``record``. Das alte
+    Flag ``default`` übernimmt beide Rollen, sofern sie noch frei sind, und
+    wird dann entfernt. Rückgabe: True, wenn sich etwas geändert hat."""
+    rxs = cfg.get("receivers") or []
+    legacy = [r for r in rxs if "default" in r]
+    if not legacy:
+        return False
+    old = next((r for r in legacy if r["default"]), None)
+    if old:
+        for role in ("stream", "record"):
+            if not any(r.get(role) for r in rxs):
+                old[role] = True
+    for r in legacy:
+        del r["default"]
+    return True
+
 def load_config():
     global _config
     try:
@@ -19,7 +36,10 @@ def load_config():
             with open(CONFIG_FILE, 'r') as f:
                 _config = json.load(f)
                 log.info(f"Config loaded: {CONFIG_FILE}")
-                return
+            if migrate_receiver_roles(_config):
+                log.info("Config: Receiver-Flag 'default' → Rollen Stream/Record migriert")
+                save_config()
+            return
     except Exception as e:
         log.warning(f"Config laden fehlgeschlagen: {e}")
     # Default laden
@@ -48,6 +68,7 @@ def get_config():
 
 def update_config(new_config):
     global _config
+    migrate_receiver_roles(new_config)
     with config_lock:
         _config = new_config
         return save_config()

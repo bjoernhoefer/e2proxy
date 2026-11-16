@@ -54,12 +54,12 @@ _OWIF_SREF_CLEAN_RE = re.compile(r'^((?:[^:]*:){10})')
 def _owif_metadata_receiver():
     """Wählt den Receiver, der Metadaten/EPG-Anfragen beantwortet (Reverse-Proxy).
 
-    Bevorzugt den konfigurierten metadata_receiver, sonst den Default-Receiver,
+    Bevorzugt den konfigurierten metadata_receiver, sonst den Stream-Receiver,
     sonst den ersten aktivierten. Gesperrte Receiver sind ok (nur Metadaten, kein
     Tuner nötig).
 
     Ausgefallene Receiver (Circuit Breaker / Fehlerserie) werden übersprungen:
-    eine "halb tote" Default-Box (TCP offen, HTTP hängt) ließ sonst jede
+    eine "halb tote" Stream-Box (TCP offen, HTTP hängt) ließ sonst jede
     EPG-/Bouquet-Anfrage der Apps 20 s in den Timeout laufen. Sind alle
     Kandidaten ausgefallen, gilt wieder die konfigurierte Reihenfolge."""
     receivers = get_receivers()
@@ -69,7 +69,7 @@ def _owif_metadata_receiver():
     ordered = []
     if pref and pref != "auto":
         ordered += [r for r in receivers if r["id"] == pref and r.get("enabled", True)]
-    ordered += [r for r in receivers if r.get("default") and r.get("enabled", True)]
+    ordered += [r for r in receivers if r.get("stream") and r.get("enabled", True)]
     ordered += [r for r in receivers if r.get("enabled", True)]
     if not ordered:
         return receivers[0]

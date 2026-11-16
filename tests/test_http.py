@@ -89,3 +89,18 @@ def test_config_roundtrip_keeps_receiver_roles(server):
     finally:
         cfg["receivers"][0].update(stream=False, record=False)
         http(server + "/api/config", "POST", cfg)
+
+
+def test_config_post_drops_legacy_default_flag(server):
+    """v5.3: only Stream/Record exist; a posted "default" becomes the free roles."""
+    cfg = json.loads(http(server + "/api/config")[1])
+    cfg["receivers"][0].update(default=True, stream=False, record=False)
+    assert json.loads(http(server + "/api/config", "POST", cfg)[1])["ok"]
+    try:
+        rx = json.loads(http(server + "/api/config")[1])["receivers"][0]
+        assert "default" not in rx and rx["stream"] is True and rx["record"] is True
+        assert "<th>Default</th>" not in http(server + "/settings")[1]
+    finally:
+        cfg["receivers"][0].update(stream=False, record=False)
+        cfg["receivers"][0].pop("default", None)
+        http(server + "/api/config", "POST", cfg)

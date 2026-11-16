@@ -78,6 +78,16 @@ def _fake_recording_env(monkeypatch, tmp_path, free="rx1"):
     monkeypatch.setattr(recordings, "get_recordings_config",
                         lambda: {"path": str(tmp_path), "profile": "pass", "max_duration": 60})
     monkeypatch.setattr(recordings._subprocess, "Popen", lambda *a, **k: _Proc())
+    import threading
+    released = threading.Event()
+    orig_release = recordings.release_receiver
+
+    def release_and_signal(*a, **k):
+        try:
+            return orig_release(*a, **k)
+        finally:
+            released.set()
+    monkeypatch.setattr(recordings, "release_receiver", release_and_signal)
 
     def run_and_wait(ref):
         rec_id = recordings.start_recording(ref, "Das perfekte Dinner")[0]
@@ -85,6 +95,8 @@ def _fake_recording_env(monkeypatch, tmp_path, free="rx1"):
         while rec_id in recordings._active_recordings and time.time() < deadline:
             time.sleep(0.02)
         assert rec_id not in recordings._active_recordings
+        # the tuner is released right after the entry is popped – wait for it
+        assert released.wait(5)
     return run_and_wait
 
 
@@ -127,12 +139,12 @@ def test_failed_epg_run_keeps_previous_epg(monkeypatch):
 
 
 def test_free_receiver_prefers_stream_and_record_roles(monkeypatch):
-    """v5.2: the Stream / Record receivers from Settings → Configuration win
-    over the default receiver for their task; busy/locked → normal order."""
-    rxs = [{"id": "a", "default": True}, {"id": "b", "stream": True},
-           {"id": "c", "record": True}]
+    """v5.2/5.3: only Stream / Record steer the choice; busy/locked → config
+    order. A leftover ``default`` flag is ignored (v5.3: no third setting)."""
+    rxs = [{"id": "a"}, {"id": "b", "stream": True},
+           {"id": "c", "record": True}, {"id": "z", "default": True}]
     monkeypatch.setattr(receivers, "get_receivers", lambda: rxs)
-    monkeypatch.setattr(receivers, "_receiver_state", {"a": None, "b": None, "c": None})
+    monkeypatch.setattr(receivers, "_receiver_state", {"a": None, "b": None, "c": None, "z": None})
     monkeypatch.setattr(receivers, "is_receiver_unhealthy", lambda rid: False)
     assert receivers.get_free_receiver() == "a"
     assert receivers.get_free_receiver(purpose="stream") == "b"
@@ -160,3 +172,47 @@ def test_recording_allocates_record_receiver(monkeypatch, tmp_path):
     except RuntimeError:
         pass
     assert seen == ["record"]
+
+
+def test_legacy_default_flag_migrates_to_stream_and_record():
+    """v5.3: the old "default" flag becomes the free roles and is removed."""
+    from e2proxy.config import migrate_receiver_roles
+    cfg = {"receivers": [{"id": "a"}, {"id": "b", "default": True}]}
+    assert migrate_receiver_roles(cfg)
+    assert cfg["receivers"] == [{"id": "a"}, {"id": "b", "stream": True, "record": True}]
+    cfg = {"receivers": [{"id": "a", "record": True, "default": False},
+                         {"id": "b", "default": True}]}
+    assert migrate_receiver_roles(cfg)                     # record already taken → only stream
+    assert cfg["receivers"] == [{"id": "a", "record": True}, {"id": "b", "stream": True}]
+    assert not migrate_receiver_roles(cfg)                 # idempotent
+    assert not migrate_receiver_roles({})
+
+
+def test_owif_metadata_receiver_follows_stream_role(monkeypatch):
+    """v5.3: without a metadata receiver, OpenWebif metadata comes from the Stream
+    receiver (not from a removed "default" flag)."""
+    from e2proxy import openwebif
+    rxs = [{"id": "a", "default": True}, {"id": "b", "stream": True}]
+    monkeypatch.setattr(openwebif, "get_receivers", lambda: rxs)
+    monkeypatch.setattr(openwebif, "get_owif_config", lambda: {})
+    monkeypatch.setattr(openwebif, "is_receiver_unhealthy", lambda rid: False)
+    assert openwebif._owif_metadata_receiver()["id"] == "b"
+
+
+def test_instantly_dead_recording_is_not_left_running(monkeypatch, tmp_path):
+    """v5.3: the watchdog started before the recording was registered. If ffmpeg
+    died at once, cleanup ran first and the recording stayed "running" forever
+    with its tuner held. Threads run synchronously here to force that order."""
+    from e2proxy import recordings
+
+    class SyncThread:
+        def __init__(self, target, args=(), kwargs=None, daemon=None):
+            self.run = lambda: target(*args, **(kwargs or {}))
+
+        def start(self):
+            self.run()
+    receivers._init_receiver_state()
+    run = _fake_recording_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(recordings.threading, "Thread", SyncThread)
+    run("1:0:1:C:")
+    assert receivers._receiver_state["rx1"] is None
