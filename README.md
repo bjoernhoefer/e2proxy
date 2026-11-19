@@ -268,6 +268,22 @@ Static analysis has limits — it finds missing functions and broken syntax, not
 | `/lineup.json` | Channel lineup |
 | `/device.xml` | SSDP device descriptor |
 
+Plex lineup entries use the stable Enigma2 service reference as `GuideNumber`
+(the same ID used by XMLTV), rather than a number derived from the current
+favorite position. Adding or reordering favorites therefore cannot redirect an
+existing Plex channel to a different stream. After upgrading, refresh Plex's
+channel lineup and check its XMLTV channel mappings; a guide refresh alone
+updates programme data and may not rescan the tuner. Existing Plex mappings
+were created with the old numbers and may need to be remapped or the DVR
+recreated once. Plex compatibility with the new IDs and the exact migration
+procedure still need verification on a real Plex server. Plex may sort by
+channel number rather than the order in the lineup.
+
+Every PR runs HTTP-level HDHomeRun/XMLTV contract tests, including favorite
+reordering, removal and re-addition. These tests do not run Plex and cannot
+verify Plex's parsing, DVR migration or playback; those require a separate,
+isolated Plex test environment.
+
 ## Recording Structure
 
 ```
