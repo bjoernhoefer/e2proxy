@@ -12,7 +12,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
+from unittest.mock import patch
 
 BASE = os.environ.get("E2PROXY_SELFTEST_URL", "http://127.0.0.1:8888")
 
@@ -52,6 +54,24 @@ def check_webui_selfcheck():
     assert r.returncode == 0, (r.stdout + r.stderr)[-1500:]
 
 
+def check_plex_lineup():
+    from e2proxy import hdhr
+
+    refs = ["1:0:1:A:1:1:1:0:0:0:", "1:0:1:B:1:1:1:0:0:0:"]
+    channels = [{"name": name, "ref": ref} for name, ref in zip(("A", "B"), refs)]
+    with patch.object(hdhr, "get_channels", return_value=channels), \
+         patch.object(hdhr, "get_favorites", side_effect=[channels, channels[::-1]]), \
+         patch.object(hdhr, "get_proxy_host", return_value="localhost"), \
+         patch.object(hdhr, "get_proxy_port", return_value=8888):
+        first = hdhr.build_hdhr_lineup()
+        second = hdhr.build_hdhr_lineup()
+    for ref, row in zip(refs, first):
+        assert row["GuideNumber"] == hdhr.ref_to_channel_id(ref)
+        assert urllib.parse.parse_qs(urllib.parse.urlsplit(row["URL"]).query)["ref"] == [ref]
+    assert {row["GuideName"]: row["GuideNumber"] for row in first} == {
+        row["GuideName"]: row["GuideNumber"] for row in second}
+
+
 def check_transcode():
     """Same codec path as the H.264 stream profile, 2 s of test video in < 60 s."""
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
@@ -65,7 +85,7 @@ def check_transcode():
 
 
 def main():
-    checks = [("health", check_health), ("ui", check_ui),
+    checks = [("health", check_health), ("ui", check_ui), ("plex-lineup", check_plex_lineup),
               ("webui-selfcheck", check_webui_selfcheck), ("transcode", check_transcode)]
     failed = 0
     for name, fn in checks:

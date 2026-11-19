@@ -1,5 +1,8 @@
 """Unit tests for core helpers + regressions documented in the changelog."""
+import urllib.parse
+
 from e2proxy import receivers
+from e2proxy import hdhr
 from e2proxy.openwebif import _owif_fmt_length
 from e2proxy.probe import PROBE_UA, is_probe_request
 from e2proxy.switching import wilson_interval
@@ -25,6 +28,35 @@ def test_probe_requests_are_recognised():
     assert is_probe_request({"User-Agent": PROBE_UA + "/1"})
     assert not is_probe_request({"User-Agent": "Plex"})
     assert not is_probe_request(None)
+
+
+def test_plex_lineup_keeps_channel_ids_stable_when_favorites_change(monkeypatch):
+    """Plex GuideNumbers must identify services, not their current list position."""
+    refs = {
+        "Deluxe Music": "1:0:1:100:200:300:400000:0:0:0:",
+        "RTL Nitro": "1:0:1:101:200:300:400000:0:0:0:",
+        "New Channel": "1:0:1:102:200:300:400000:0:0:0:",
+    }
+    channels = [{"name": name, "ref": ref} for name, ref in refs.items()]
+    favorites = [{"name": name, "ref": refs[name]}
+                 for name in ("Deluxe Music", "RTL Nitro")]
+    monkeypatch.setattr(hdhr, "get_proxy_host", lambda: "proxy")
+    monkeypatch.setattr(hdhr, "get_proxy_port", lambda: 8888)
+    monkeypatch.setattr(hdhr, "get_channels", lambda: channels)
+    monkeypatch.setattr(hdhr, "get_favorites", lambda: favorites)
+
+    before = hdhr.build_hdhr_lineup_plex()
+    favorites[:] = [{"name": name, "ref": refs[name]}
+                    for name in ("RTL Nitro", "Deluxe Music", "New Channel")]
+    after = hdhr.build_hdhr_lineup_plex()
+
+    assert [row["GuideName"] for row in after] == [
+        "RTL Nitro", "Deluxe Music", "New Channel"
+    ]
+    for row in before + after:
+        ref = next(ref for name, ref in refs.items() if name == row["GuideName"])
+        assert row["GuideNumber"] == hdhr.ref_to_channel_id(ref)
+        assert f"ref={urllib.parse.quote(ref, safe='')}" in row["URL"]
 
 
 def test_shared_tuner_released_only_by_last_user():

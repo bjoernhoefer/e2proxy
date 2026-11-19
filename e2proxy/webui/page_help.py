@@ -94,6 +94,12 @@ def build_help_ui():
       <div style="display:flex;flex-direction:column;gap:12px">
 
         <div style="border-left:3px solid var(--accent);padding-left:14px">
+          <b style="color:var(--accent);font-family:monospace;font-size:11px">v5.3.1</b>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-11-19</span>
+          <span style="color:var(--muted);font-size:10px;margin-left:8px">Stabile Senderkennung für Plex</span>
+          <div style="font-size:11px;margin-top:4px;color:var(--muted)">Plex bekam bisher fortlaufende Sendernummern aus der aktuellen Favoriten-Reihenfolge. Beim Hinzufügen oder Umsortieren zeigte eine bestehende Nummer dadurch auf einen anderen Stream. Die Plex-Kennung basiert jetzt auf der stabilen Enigma2-Service-Referenz und stimmt mit der XMLTV-Sender-ID überein. Nach dem Upgrade Sendersuchlauf und Zuordnung in Plex prüfen; ein EPG-Refresh allein aktualisiert nicht unbedingt die Senderliste. Die Umstellung muss noch mit einem echten Plex-Server geprüft werden.</div>
+        </div>
+        <div style="border-left:3px solid var(--accent);padding-left:14px">
           <b style="color:var(--accent);font-family:monospace;font-size:11px">v5.3</b>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">2026-11-16</span>
           <span style="color:var(--muted);font-size:10px;margin-left:8px">Nur noch Stream / Record – „Default“ entfällt</span>

@@ -69,7 +69,8 @@ def build_hdhr_lineup():
 def build_hdhr_lineup_plex():
     """lineup.json fuer den /plex Endpoint.
     Nur Favoriten — verhindert verschluesselte Sender und reduziert Liste.
-    Verwendet profile=plex fuer chunked HTTP/1.1 Streaming.
+    Service-Referenzen bleiben als GuideNumber stabil, auch wenn Favoriten
+    hinzugefuegt oder umsortiert werden.
     """
     host = get_proxy_host()
     port = get_proxy_port()
@@ -81,14 +82,14 @@ def build_hdhr_lineup_plex():
     fav_order = {f["ref"]: i for i, f in enumerate(favs)}
     channels.sort(key=lambda ch: fav_order.get(ch["ref"], 9999))
     lineup = []
-    for idx, ch in enumerate(channels, start=1):
+    for ch in channels:
         ref_enc = urllib.parse.quote(ch["ref"], safe="")
         stream_url = (
             f"http://{host}:{port}/stream"
             f"?ref={ref_enc}&profile=plex"
         )
         lineup.append({
-            "GuideNumber": str(idx),   # Numerisch → Plex sortiert in unserer Reihenfolge
+            "GuideNumber": ref_to_channel_id(ch["ref"]),
             "GuideName":   ch["name"],
             "URL":         stream_url,
         })
