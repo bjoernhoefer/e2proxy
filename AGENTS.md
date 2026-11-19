@@ -74,7 +74,7 @@ Read it via `gh api repos/bjoernhoefer/raspberrypi_management/contents/docs/stan
 | Tuner sharing | a tuner is freed only by its last user; stale epochs ignored | `tests/test_core.py` |
 | Receiver roles | Stream/Record receiver preferred for its task, one per role, fallback → rest; legacy `default` flag migrated + removed | `tests/test_core.py`, `tests/test_http.py`, `tests/test_webui.py` (node click test) |
 | OpenWebif | `e2length` is `MIN:SS` | `tests/test_core.py` |
-| Plex lineup | service identifiers remain stable when favorites are reordered | `tests/test_core.py`, selftest `plex-lineup` |
+| Plex lineup | service identifiers, stream URLs and XMLTV associations remain stable across favorite changes | `tests/test_core.py`, `tests/test_plex_contract.py`, selftest `plex-lineup` |
 | EPG | a run without any data keeps the previous EPG | `tests/test_core.py` |
 | Package | every module imports standalone (no import-order cycles) | `tests/test_package.py` |
 | Recorder | optional; API 404 when off; dedupe, skip, keep-last, recovery | `tests/test_recorder.py`, `tests/test_http.py` |

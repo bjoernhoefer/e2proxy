@@ -279,6 +279,11 @@ recreated once. Plex compatibility with the new IDs and the exact migration
 procedure still need verification on a real Plex server. Plex may sort by
 channel number rather than the order in the lineup.
 
+Every PR runs HTTP-level HDHomeRun/XMLTV contract tests, including favorite
+reordering, removal and re-addition. These tests do not run Plex and cannot
+verify Plex's parsing, DVR migration or playback; those require a separate,
+isolated Plex test environment.
+
 ## Recording Structure
 
 ```
